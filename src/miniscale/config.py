@@ -35,7 +35,7 @@ class MiniScaleConfig:
             num_hidden_layers=1,
             num_attention_heads=4,
             num_key_value_heads=2,
-            max_position_embeddings=128,
+            max_position_embeddings=384,
         )
 
     def save(self, path: str | Path) -> None:
