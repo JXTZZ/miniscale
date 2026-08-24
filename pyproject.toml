@@ -1,14 +1,11 @@
 [project]
 name = "miniscale"
 version = "0.1.0"
-description = "Add your description here"
+description = "A from-scratch, testable pretrain-to-agent-RL learning stack"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "numpy>=2.3.4",
-    "pandas>=2.3.3",
     "torch==2.9.1",
-    "transformers>=4.57.1",
 ]
 
 [project.scripts]
