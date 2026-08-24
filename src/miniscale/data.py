@@ -29,8 +29,21 @@ class PretrainDataset(Dataset[dict[str, Tensor]]):
 
 
 class SFTDataset(Dataset[dict[str, Tensor]]):
-    def __init__(self, conversations: Sequence[Sequence[dict[str, str]]], tokenizer: ByteTokenizer) -> None:
-        self.examples = [tokenizer.encode_sft(messages) for messages in conversations]
+    def __init__(
+        self,
+        conversations: Sequence[Sequence[dict[str, str]]],
+        tokenizer: ByteTokenizer,
+        max_length: int | None = None,
+    ) -> None:
+        self.examples = []
+        for messages in conversations:
+            input_ids, labels = tokenizer.encode_sft(messages)
+            if max_length is not None:
+                # Keep the newest turns so the supervised assistant answer is not
+                # silently discarded when a byte-level example exceeds context.
+                input_ids = input_ids[-max_length:]
+                labels = labels[-max_length:]
+            self.examples.append((input_ids, labels))
 
     def __len__(self) -> int:
         return len(self.examples)
