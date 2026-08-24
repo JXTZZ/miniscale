@@ -10,19 +10,21 @@ from torch import Tensor
 import torch.nn.functional as F
 
 from miniscale.model import MiniScaleForCausalLM
-from miniscale.tokenizer import ByteTokenizer
-from .common import resolve_device, save_checkpoint, seed_everything
+from miniscale.data import load_jsonl_rows
+from miniscale.tokenizer import Tokenizer
+from .common import append_metric, resolve_device, save_checkpoint, seed_everything
 
 
 @dataclass(frozen=True, slots=True)
 class RLTask:
     prompt: str
-    answer: str
+    answer: str | tuple[str, ...]
 
 
 @dataclass(slots=True)
 class GRPOOptions:
     steps: int = 20
+    batch_size: int = 1
     group_size: int = 4
     max_new_tokens: int = 24
     learning_rate: float = 1e-5
@@ -33,6 +35,8 @@ class GRPOOptions:
     grad_clip: float = 1.0
     seed: int = 42
     device: str = "auto"
+    data_limit: int | None = 1000
+    log_every: int = 10
 
 
 def sequence_token_log_probs(
@@ -80,11 +84,21 @@ def grpo_objective(
 _NUMBER = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?(?![\w.])")
 
 
-def math_reward(completion: str, answer: str) -> float:
+def _normalized_number(value: str) -> float | str:
+    try:
+        return float(value)
+    except ValueError:
+        return value.lstrip("+")
+
+
+def math_reward(completion: str, answer: str | tuple[str, ...]) -> float:
     numbers = _NUMBER.findall(completion)
-    exact = bool(numbers) and numbers[-1].lstrip("+") == answer.lstrip("+")
+    expected = (answer,) if isinstance(answer, str) else answer
+    normalized_numbers = [_normalized_number(number) for number in numbers]
+    matched = sum(_normalized_number(item) in normalized_numbers for item in expected)
+    correctness = matched / len(expected) if expected else 0.0
     format_bonus = 0.05 if numbers else 0.0
-    return float(exact) + format_bonus - min(len(completion), 100) * 0.001
+    return correctness + format_bonus - min(len(completion), 100) * 0.001
 
 
 def _collate_rollouts(
@@ -109,7 +123,7 @@ def _collate_rollouts(
 @torch.no_grad()
 def collect_rollouts(
     model: MiniScaleForCausalLM,
-    tokenizer: ByteTokenizer,
+    tokenizer: Tokenizer,
     tasks: list[RLTask],
     options: GRPOOptions,
     device: torch.device,
@@ -143,7 +157,7 @@ def collect_rollouts(
 
 def run_grpo(
     model: MiniScaleForCausalLM,
-    tokenizer: ByteTokenizer,
+    tokenizer: Tokenizer,
     tasks: list[RLTask],
     output_dir: str | Path,
     options: GRPOOptions | None = None,
@@ -159,10 +173,14 @@ def run_grpo(
         parameter.requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=options.learning_rate)
     last: dict[str, float] = {}
-    for _ in range(options.steps):
+    metrics_path = Path(output_dir) / "grpo_metrics.jsonl"
+    task_cursor = 0
+    for step in range(1, options.steps + 1):
+        selected_tasks = [tasks[(task_cursor + index) % len(tasks)] for index in range(options.batch_size)]
+        task_cursor = (task_cursor + options.batch_size) % len(tasks)
         model.eval()
         input_ids, attention_mask, action_mask, rewards = collect_rollouts(
-            model, tokenizer, tasks, options, device
+            model, tokenizer, selected_tasks, options, device
         )
         with torch.no_grad():
             old_log_probs = sequence_token_log_probs(model, input_ids, attention_mask)
@@ -184,10 +202,39 @@ def run_grpo(
         torch.nn.utils.clip_grad_norm_(model.parameters(), options.grad_clip)
         optimizer.step()
         last = {
+            "step": float(step),
             "loss": float(loss.detach()),
             "reward_mean": float(rewards.mean()),
             "reward_max": float(rewards.max()),
             **{name: float(value.detach()) for name, value in stats.items()},
         }
+        if step == 1 or step % options.log_every == 0 or step == options.steps:
+            append_metric(metrics_path, last)
+            print(f"grpo step={step} loss={last['loss']:.4f} reward={last['reward_mean']:.4f}")
     checkpoint = save_checkpoint(Path(output_dir) / "rl.pt", model, stage="grpo", step=options.steps, metrics=last)
-    return {**last, "checkpoint": str(checkpoint), "device": str(device)}
+    return {**last, "checkpoint": str(checkpoint), "metrics": str(metrics_path), "device": str(device)}
+
+
+def load_rl_tasks(data_path: str | Path, limit: int | None = None) -> list[RLTask]:
+    tasks: list[RLTask] = []
+    for row in load_jsonl_rows(data_path, limit):
+        messages = row.get("conversations")
+        if not isinstance(messages, list):
+            continue
+        users = [str(message.get("content") or "") for message in messages if message.get("role") == "user"]
+        ground_truth = row.get("gt")
+        answers = tuple(str(item) for item in ground_truth) if isinstance(ground_truth, list) else ()
+        if users and answers:
+            tasks.append(RLTask(users[-1], answers))
+    return tasks
+
+
+def run_grpo_jsonl(
+    model: MiniScaleForCausalLM,
+    tokenizer: Tokenizer,
+    data_path: str | Path,
+    output_dir: str | Path,
+    options: GRPOOptions | None = None,
+) -> dict[str, float | str]:
+    options = options or GRPOOptions()
+    return run_grpo(model, tokenizer, load_rl_tasks(data_path, options.data_limit), output_dir, options)

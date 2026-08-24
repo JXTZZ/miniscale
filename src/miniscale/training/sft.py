@@ -6,10 +6,10 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from miniscale.data import SFTDataset, collate_lm_batch
+from miniscale.data import JsonlSFTDataset, SFTDataset, collate_lm_batch
 from miniscale.model import MiniScaleForCausalLM
-from miniscale.tokenizer import ByteTokenizer
-from .common import infinite_batches, resolve_device, save_checkpoint, seed_everything
+from miniscale.tokenizer import ByteTokenizer, Tokenizer
+from .common import append_metric, infinite_batches, resolve_device, save_checkpoint, seed_everything
 
 
 @dataclass(slots=True)
@@ -21,6 +21,9 @@ class SFTOptions:
     grad_clip: float = 1.0
     seed: int = 42
     device: str = "auto"
+    gradient_accumulation_steps: int = 1
+    log_every: int = 10
+    num_workers: int = 0
 
 
 def run_sft(
@@ -67,3 +70,45 @@ def run_sft(
         metrics=metrics,
     )
     return {**metrics, "checkpoint": str(checkpoint), "device": str(device)}
+
+
+def run_sft_jsonl(
+    model: MiniScaleForCausalLM,
+    tokenizer: Tokenizer,
+    data_path: str | Path,
+    output_dir: str | Path,
+    options: SFTOptions,
+) -> dict[str, float | str]:
+    seed_everything(options.seed)
+    device = resolve_device(options.device)
+    model.to(device).train()
+    dataset = JsonlSFTDataset(data_path, tokenizer, model.config.max_position_embeddings)
+    loader = DataLoader(
+        dataset, batch_size=options.batch_size, num_workers=options.num_workers,
+        collate_fn=lambda rows: collate_lm_batch(rows, tokenizer.pad_token_id),
+    )
+    batches = iter(infinite_batches(loader))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=options.learning_rate, weight_decay=options.weight_decay)
+    output = Path(output_dir)
+    metrics_path = output / "sft_metrics.jsonl"
+    last_loss = float("nan")
+    for step in range(1, options.steps + 1):
+        optimizer.zero_grad(set_to_none=True)
+        losses: list[float] = []
+        for _ in range(options.gradient_accumulation_steps):
+            batch = {name: value.to(device) for name, value in next(batches).items()}
+            result = model(**batch)
+            if result.loss is None:
+                raise RuntimeError("model did not return an SFT loss")
+            (result.loss / options.gradient_accumulation_steps).backward()
+            losses.append(float(result.loss.detach()))
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), options.grad_clip)
+        optimizer.step()
+        last_loss = sum(losses) / len(losses)
+        if step == 1 or step % options.log_every == 0 or step == options.steps:
+            metric = {"stage": "sft", "step": step, "train_loss": last_loss, "grad_norm": float(grad_norm)}
+            append_metric(metrics_path, metric)
+            print(metric, flush=True)
+    metrics = {"loss": last_loss}
+    checkpoint = save_checkpoint(output / "sft.pt", model, stage="sft", step=options.steps, metrics=metrics)
+    return {**metrics, "checkpoint": str(checkpoint), "metrics": str(metrics_path), "device": str(device)}

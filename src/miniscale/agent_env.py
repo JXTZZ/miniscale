@@ -11,7 +11,8 @@ import re
 class CalculatorTask:
     question: str
     expression: str
-    answer: str
+    answer: str | tuple[str, ...]
+    system_prompt: str | None = None
 
 
 _BINARY_OPERATORS = {
@@ -55,7 +56,7 @@ def parse_tool_call(text: str) -> str | None:
         payload = json.loads(match.group(1))
     except json.JSONDecodeError:
         return None
-    if payload.get("name", "calculator") != "calculator":
+    if payload.get("name", "calculator") not in {"calculator", "calculate_math"}:
         return None
     arguments = payload.get("arguments", payload)
     expression = arguments.get("expression") if isinstance(arguments, dict) else None
@@ -89,5 +90,16 @@ class CalculatorEnv:
 
     def reward(self, final_answer: str) -> float:
         numbers = re.findall(r"(?<![\w.])-?\d+(?:\.\d+)?(?![\w.])", final_answer)
-        exact = bool(numbers) and numbers[-1] == self.task.answer
-        return float(exact) + 0.2 * min(self.valid_calls, 1) - 0.1 * self.invalid_calls
+        expected = (self.task.answer,) if isinstance(self.task.answer, str) else self.task.answer
+
+        def normalize(value: str) -> float | str:
+            try:
+                return float(value)
+            except ValueError:
+                return value.lstrip("+")
+
+        normalized_numbers = [normalize(number) for number in numbers]
+        matched = sum(normalize(item) in normalized_numbers for item in expected)
+        correctness = matched / len(expected) if expected else 0.0
+        tool_bonus = 0.2 * min(self.valid_calls / max(len(expected), 1), 1.0)
+        return correctness + tool_bonus - 0.1 * self.invalid_calls

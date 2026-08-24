@@ -38,6 +38,19 @@ class MiniScaleConfig:
             max_position_embeddings=384,
         )
 
+    @classmethod
+    def small_64m(cls, vocab_size: int = 8192, max_position_embeddings: int = 512) -> "MiniScaleConfig":
+        """The project training configuration: about 64.5M tied parameters."""
+        return cls(
+            vocab_size=vocab_size,
+            hidden_size=512,
+            intermediate_size=1536,
+            num_hidden_layers=20,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            max_position_embeddings=max_position_embeddings,
+        )
+
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
 

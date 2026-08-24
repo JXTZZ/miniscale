@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from .tokenizer import ByteTokenizer
+from .tokenizer import ByteTokenizer, SentencePieceTokenizer
 from .training.common import load_checkpoint, resolve_device
 
 
@@ -16,6 +16,8 @@ class GenerationOptions:
     top_k: int | None = 50
     device: str = "auto"
     system_prompt: str | None = None
+    tokenizer_path: str | Path | None = None
+    raw_prompt: bool = False
 
 
 def generate_from_checkpoint(
@@ -32,12 +34,19 @@ def generate_from_checkpoint(
 
     device = resolve_device(options.device)
     model = load_checkpoint(checkpoint_path, device).eval()
-    tokenizer = ByteTokenizer()
-    messages: list[dict[str, str]] = []
-    if options.system_prompt:
-        messages.append({"role": "system", "content": options.system_prompt})
-    messages.append({"role": "user", "content": prompt})
-    formatted_prompt = tokenizer.format_messages(messages, generation_prompt=True)
+    tokenizer = SentencePieceTokenizer(options.tokenizer_path) if options.tokenizer_path else ByteTokenizer()
+    if model.config.vocab_size != tokenizer.vocab_size:
+        raise ValueError(
+            f"checkpoint vocabulary ({model.config.vocab_size}) does not match tokenizer ({tokenizer.vocab_size})"
+        )
+    if options.raw_prompt:
+        formatted_prompt = prompt
+    else:
+        messages: list[dict[str, str]] = []
+        if options.system_prompt:
+            messages.append({"role": "system", "content": options.system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        formatted_prompt = tokenizer.format_messages(messages, generation_prompt=True)
     prompt_ids = tokenizer.encode(formatted_prompt, bos=True)
     prompt_budget = model.config.max_position_embeddings - options.max_new_tokens
     if prompt_budget < 1:

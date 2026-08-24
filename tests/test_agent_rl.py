@@ -48,6 +48,12 @@ class AgentRLTests(unittest.TestCase):
             )
             self.assertTrue(Path(str(metrics["checkpoint"])).exists())
 
+    def test_reward_scores_all_expected_answers(self) -> None:
+        from miniscale.agent_env import CalculatorEnv
+
+        env = CalculatorEnv(CalculatorTask("two calculations", "", ("4", "9")))
+        self.assertGreater(env.reward("4 and 9"), env.reward("4"))
+
 
 if __name__ == "__main__":
     unittest.main()

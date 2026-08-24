@@ -9,17 +9,19 @@ import torch
 from torch import Tensor
 
 from miniscale.agent_env import CalculatorEnv, CalculatorTask
+from miniscale.data import load_jsonl_rows
 from miniscale.model import MiniScaleForCausalLM
-from miniscale.tokenizer import ByteTokenizer
-from .common import resolve_device, save_checkpoint, seed_everything
+from miniscale.tokenizer import Tokenizer
+from .common import append_metric, resolve_device, save_checkpoint, seed_everything
 from .grpo import grpo_objective, normalize_group_rewards, sequence_token_log_probs
 
 
 @dataclass(slots=True)
 class AgentRLOptions:
     steps: int = 20
+    batch_size: int = 1
     group_size: int = 4
-    max_turns: int = 2
+    max_turns: int = 6
     max_new_tokens: int = 64
     learning_rate: float = 1e-5
     clip_epsilon: float = 0.2
@@ -29,6 +31,8 @@ class AgentRLOptions:
     grad_clip: float = 1.0
     seed: int = 42
     device: str = "auto"
+    data_limit: int | None = 1000
+    log_every: int = 10
 
 
 @dataclass(slots=True)
@@ -47,7 +51,7 @@ ResponseFunction = Callable[[str, int], str]
 @torch.no_grad()
 def rollout_agent(
     model: MiniScaleForCausalLM,
-    tokenizer: ByteTokenizer,
+    tokenizer: Tokenizer,
     task: CalculatorTask,
     options: AgentRLOptions,
     device: torch.device,
@@ -55,7 +59,7 @@ def rollout_agent(
 ) -> AgentTrajectory:
     env = CalculatorEnv(task)
     messages = [
-        {"role": "system", "content": env.tool_prompt},
+        {"role": "system", "content": task.system_prompt or env.tool_prompt},
         {"role": "user", "content": task.question},
     ]
     transcript = tokenizer.format_messages(messages, generation_prompt=True)
@@ -128,7 +132,7 @@ def _collate_trajectories(
 
 def run_agent_grpo(
     model: MiniScaleForCausalLM,
-    tokenizer: ByteTokenizer,
+    tokenizer: Tokenizer,
     tasks: list[CalculatorTask],
     output_dir: str | Path,
     options: AgentRLOptions | None = None,
@@ -144,11 +148,15 @@ def run_agent_grpo(
         parameter.requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=options.learning_rate)
     last: dict[str, float] = {}
-    for _ in range(options.steps):
+    metrics_path = Path(output_dir) / "agent_rl_metrics.jsonl"
+    task_cursor = 0
+    for step in range(1, options.steps + 1):
+        selected_tasks = [tasks[(task_cursor + index) % len(tasks)] for index in range(options.batch_size)]
+        task_cursor = (task_cursor + options.batch_size) % len(tasks)
         model.eval()
         trajectories = [
             rollout_agent(model, tokenizer, task, options, device)
-            for task in tasks
+            for task in selected_tasks
             for _ in range(options.group_size)
         ]
         input_ids, attention_mask, action_mask, rewards = _collate_trajectories(
@@ -174,13 +182,52 @@ def run_agent_grpo(
         torch.nn.utils.clip_grad_norm_(model.parameters(), options.grad_clip)
         optimizer.step()
         last = {
+            "step": float(step),
             "loss": float(loss.detach()),
             "reward_mean": float(rewards.mean()),
             "success_rate": float((rewards >= 1.0).float().mean()),
             "tool_call_rate": sum(item.observation_tokens > 0 for item in trajectories) / len(trajectories),
             **{name: float(value.detach()) for name, value in stats.items()},
         }
+        if step == 1 or step % options.log_every == 0 or step == options.steps:
+            append_metric(metrics_path, last)
+            print(
+                f"agent-rl step={step} loss={last['loss']:.4f} "
+                f"reward={last['reward_mean']:.4f} success={last['success_rate']:.3f}"
+            )
     checkpoint = save_checkpoint(
         Path(output_dir) / "agent_rl.pt", model, stage="agent_grpo", step=options.steps, metrics=last
     )
-    return {**last, "checkpoint": str(checkpoint), "device": str(device)}
+    return {**last, "checkpoint": str(checkpoint), "metrics": str(metrics_path), "device": str(device)}
+
+
+def load_agent_tasks(data_path: str | Path, limit: int | None = None) -> list[CalculatorTask]:
+    tasks: list[CalculatorTask] = []
+    for row in load_jsonl_rows(data_path, limit):
+        messages = row.get("conversations")
+        if not isinstance(messages, list):
+            continue
+        users = [str(message.get("content") or "") for message in messages if message.get("role") == "user"]
+        systems = [message for message in messages if message.get("role") == "system"]
+        ground_truth = row.get("gt")
+        answers = tuple(str(item) for item in ground_truth) if isinstance(ground_truth, list) else ()
+        if not users or not answers:
+            continue
+        system_prompt = None
+        if systems:
+            system = systems[-1]
+            system_prompt = f"{system.get('content') or ''}\n{system.get('tools') or ''}".strip()
+        tasks.append(CalculatorTask(users[-1], "", answers, system_prompt))
+    return tasks
+
+
+def run_agent_grpo_jsonl(
+    model: MiniScaleForCausalLM,
+    tokenizer: Tokenizer,
+    data_path: str | Path,
+    output_dir: str | Path,
+    options: AgentRLOptions | None = None,
+) -> dict[str, float | str]:
+    options = options or AgentRLOptions()
+    tasks = load_agent_tasks(data_path, options.data_limit)
+    return run_agent_grpo(model, tokenizer, tasks, output_dir, options)

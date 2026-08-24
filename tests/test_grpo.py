@@ -34,6 +34,7 @@ class GRPOTests(unittest.TestCase):
 
     def test_math_reward_prefers_exact_answer(self) -> None:
         self.assertGreater(math_reward("The answer is 5", "5"), math_reward("The answer is 4", "5"))
+        self.assertGreater(math_reward("answers: 5 and 7", ("5", "7")), math_reward("answer: 5", ("5", "7")))
 
     def test_grpo_stage_writes_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
