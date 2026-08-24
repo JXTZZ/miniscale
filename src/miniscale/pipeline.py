@@ -58,7 +58,7 @@ def _timed_stage(function, *args, **kwargs) -> dict[str, float | str]:
     return metrics
 
 
-def run_mvp_pipeline(output_dir: str | Path, *, device: str = "auto") -> dict[str, object]:
+def run_training_pipeline(output_dir: str | Path, *, device: str = "auto") -> dict[str, object]:
     """Run a deliberately tiny integration pipeline, not a quality training run."""
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)

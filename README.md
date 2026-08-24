@@ -5,7 +5,7 @@ MiniScale 是一个从零实现、可测试的“小模型到 Agent RL”学习�
 [MokioMind](https://github.com/Wood-Q/MokioMind) 的手写学习方式，但模型、数据管线、
 GRPO 目标和工具环境均在本仓库独立实现，不是对上游源码的改名复制。
 
-当前目标是 **MVP 级流水线正确性**：在一台笔记本上用两个样本刻意过拟合，验证每个阶段的
+当前目标是 **训练流水线正确性**：在一台笔记本上用两个样本刻意过拟合，验证每个阶段的
 数据流、损失、checkpoint 和阶段衔接。它不代表模型具备泛化能力。
 
 ## 已打通的流水线
@@ -31,7 +31,7 @@ tied embeddings；Tokenizer 暂用确定性的 byte tokenizer，从而不下载�
 uv sync
 uv run miniscale doctor
 uv run python -m unittest discover -s tests -v
-uv run miniscale pipeline --device cpu --output artifacts/mvp
+uv run miniscale pipeline --device cpu --output artifacts/run
 ```
 
 有可用 CUDA 时可将 `cpu` 改为 `cuda`。RTX 3050 Ti 4GB 适合本仓库 smoke 配置，
@@ -49,6 +49,28 @@ uv run python trainer/train_agent.py
 输出在 `artifacts/`，该目录已被 Git 忽略。流水线清单会记录各阶段 loss、reward、耗时和
 checkpoint 路径。
 
+使用 SFT 或最后一个 Agent RL checkpoint 生成文本：
+
+```bash
+uv run miniscale generate \
+  --checkpoint artifacts/run/sft.pt \
+  --prompt "Return only the result: 2+3" \
+  --temperature 0 \
+  --max-new-tokens 100
+
+# 也可以使用独立脚本；--raw 只打印模型回答
+uv run python generate.py \
+  --checkpoint artifacts/run/agent_rl.pt \
+  --prompt "Use the calculator for 3*4." \
+  --calculator \
+  --temperature 0 \
+  --raw
+```
+
+`pretrain.pt`、`sft.pt`、`rl.pt` 和 `agent_rl.pt` 使用相同 checkpoint 格式，都可以生成；
+但通常优先选择 `sft.pt` 或 `agent_rl.pt`。训练步数和数据量决定输出质量，文件能加载不等于
+模型已经具备泛化能力。
+
 ## 建议学习顺序
 
 1. `config.py`、`tokenizer.py`、`model.py`：亲手推导张量 shape，确认 causal test 为什么成立。
@@ -62,13 +84,13 @@ checkpoint 路径。
 
 ## 与工业训练栈的边界
 
-这个 MVP 刻意保留了工业界最重要的语义：阶段化 checkpoint、assistant/action masking、
+这个小型实现保留了工业界最重要的语义：阶段化 checkpoint、assistant/action masking、
 old/reference policy、可验证 reward、受限工具执行和端到端测试。但真正扩大训练规模前还需要：
 
 - 用 SentencePiece/BPE 和正式数据集替换 byte tokenizer 与内置样本，并做去重、质量过滤、污染检测；
 - 加入 BF16、gradient accumulation/checkpointing、FlashAttention、sequence packing、FSDP/DeepSpeed；
 - 将 rollout 与 learner 解耦，用 vLLM/SGLang 一类推理服务异步采样，并处理 policy weight 同步；
-- 对工具执行使用进程/容器级 sandbox、超时、资源限额和审计，而不仅是本 MVP 的 AST 白名单；
+- 对工具执行使用进程/容器级 sandbox、超时、资源限额和审计，而不仅是当前的 AST 白名单；
 - 建立固定 held-out eval、pass@k、tool-call success、KL/entropy、吞吐和显存监控；
 - 对 reward hacking、长度偏置、全组同分和训练/推理 chat template 不一致做专项回归。
 

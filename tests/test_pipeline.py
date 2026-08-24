@@ -4,7 +4,7 @@ import tempfile
 import unittest
 
 from miniscale.cli import environment_report
-from miniscale.pipeline import run_mvp_pipeline
+from miniscale.pipeline import run_training_pipeline
 
 
 class PipelineTests(unittest.TestCase):
@@ -14,7 +14,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_end_to_end_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            result = run_mvp_pipeline(directory, device="cpu")
+            result = run_training_pipeline(directory, device="cpu")
             manifest = Path(str(result["manifest"]))
             self.assertTrue(manifest.exists())
             self.assertEqual(

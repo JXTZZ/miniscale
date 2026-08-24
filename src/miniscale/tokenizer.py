@@ -4,7 +4,7 @@ from collections.abc import Iterable, Sequence
 
 
 class ByteTokenizer:
-    """A deterministic UTF-8 tokenizer used to make the MVP self-contained."""
+    """A deterministic UTF-8 tokenizer that keeps the project self-contained."""
 
     pad_token_id = 0
     bos_token_id = 1
