@@ -167,13 +167,14 @@ class MiniScaleForCausalLM(nn.Module):
         temperature: float = 1.0,
         top_k: int | None = None,
         eos_token_id: int | None = None,
+        do_sample: bool | None = None,
     ) -> Tensor:
         generated = input_ids
         eos_token_id = self.config.eos_token_id if eos_token_id is None else eos_token_id
         for _ in range(max_new_tokens):
             window = generated[:, -self.config.max_position_embeddings :]
             logits = self(window).logits[:, -1]
-            if temperature <= 0:
+            if do_sample is False or temperature <= 0:
                 next_token = logits.argmax(dim=-1, keepdim=True)
             else:
                 logits = logits / temperature

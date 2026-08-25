@@ -4,6 +4,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 import json
 import hashlib
+import random
 
 import torch
 from torch import Tensor
@@ -91,6 +92,8 @@ class JsonlPretrainDataset(IterableDataset[dict[str, Tensor]]):
         *,
         split: str = "all",
         validation_fraction: float = 0.005,
+        shuffle_buffer_size: int = 0,
+        seed: int = 42,
     ) -> None:
         if sequence_length < 2:
             raise ValueError("sequence_length must be at least 2")
@@ -99,8 +102,39 @@ class JsonlPretrainDataset(IterableDataset[dict[str, Tensor]]):
         self.sequence_length = sequence_length
         self.split = split
         self.validation_fraction = validation_fraction
+        self.shuffle_buffer_size = shuffle_buffer_size
+        self.seed = seed
+        self._iteration = 0
+        if shuffle_buffer_size < 0:
+            raise ValueError("shuffle_buffer_size must be non-negative")
 
     def __iter__(self) -> Iterator[dict[str, Tensor]]:
+        iteration = self._iteration
+        self._iteration += 1
+        examples = self._iter_packed_examples()
+        if self.shuffle_buffer_size <= 1:
+            yield from examples
+            return
+
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        rng = random.Random(self.seed + iteration * 1_000_003 + worker_id)
+        buffer: list[dict[str, Tensor]] = []
+        for example in examples:
+            if len(buffer) < self.shuffle_buffer_size:
+                buffer.append(example)
+                continue
+            index = rng.randrange(len(buffer))
+            yield buffer[index]
+            buffer[index] = example
+        while buffer:
+            index = rng.randrange(len(buffer))
+            selected = buffer[index]
+            buffer[index] = buffer[-1]
+            buffer.pop()
+            yield selected
+
+    def _iter_packed_examples(self) -> Iterator[dict[str, Tensor]]:
         buffer: list[int] = []
         target_length = self.sequence_length
         for row in _worker_rows(self.path):

@@ -87,11 +87,13 @@ uv run miniscale pretrain --steps 10000 --batch-size 1 \
   --gradient-accumulation 16 --sequence-length 768 \
   --learning-rate 3e-4 --min-learning-rate 3e-5 \
   --warmup-steps 200 --save-every 500 --keep-last 3 \
+  --validation-every 200 --generation-every 1000 \
+  --shuffle-buffer-size 8192 \
   --output artifacts/pretrain
 
 uv run miniscale sft --steps 3000 --batch-size 1 \
   --gradient-accumulation 16 \
-  --checkpoint artifacts/pretrain/pretrain.pt \
+  --checkpoint artifacts/pretrain/best.pt \
   --output artifacts/sft
 
 uv run miniscale dpo --steps 1000 --batch-size 1 \
@@ -107,9 +109,26 @@ uv run miniscale agent-rl --steps 500 --batch-size 1 --group-size 4 \
   --output artifacts/agent-rl
 ```
 
-预训练前 200 step 线性 warmup 到 `3e-4`，之后 cosine decay 到 `3e-5`。每 500 step
-在 `artifacts/pretrain/checkpoints/` 保存完整训练状态，并只保留最近 3 个周期 checkpoint；
-完整状态包含模型、AdamW、scheduler、step、token 计数和随机数状态。按 `Ctrl+C` 时还会写入
+预训练前 200 step 线性 warmup 到 `3e-4`，之后 cosine decay 到 `3e-5`。每 200 step
+计算 `validation_loss` 和 `perplexity`；只要 validation loss 创历史最低，就立即覆盖 `best.pt`。
+每 500 step 在 `checkpoints/` 保存完整训练状态，并只保留最近 3 个周期 checkpoint；每 1000
+step 还会对固定中文、英文和 Python prompt 做 greedy generation evaluation。训练结束总会保存
+`final.pt`。目录结构如下：
+
+```text
+artifacts/pretrain/
+├── checkpoints/
+│   └── step_xxxxxxxx.pt
+├── generations/
+│   └── step_xxxxxxxx.json
+├── pretrain_metrics.jsonl
+├── best.pt
+└── final.pt
+```
+
+`best.pt`、`final.pt` 和周期 checkpoint 都包含模型、AdamW、scheduler、step、token 计数、
+`best_val_loss` 及 Python/PyTorch/CUDA RNG 状态，可以用于断点续训。`keep_last` 只清理周期
+checkpoint，不会删除 `best.pt`、`final.pt` 或 generations。按 `Ctrl+C` 时还会写入
 `emergency_step_XXXXXXXX.pt` 后再退出。完整 checkpoint 通常约 700–800MB，请预留磁盘空间。
 
 从周期或 emergency checkpoint 继续时，`--steps` 仍表示原计划的总步数，其他影响训练轨迹的
@@ -120,13 +139,55 @@ uv run miniscale pretrain --steps 10000 --batch-size 1 \
   --gradient-accumulation 16 --sequence-length 768 \
   --learning-rate 3e-4 --min-learning-rate 3e-5 \
   --warmup-steps 200 --save-every 500 --keep-last 3 \
+  --validation-every 200 --generation-every 1000 \
   --resume artifacts/pretrain/checkpoints/step_00000500.pt \
   --output artifacts/pretrain
 ```
 
 恢复时数据流会跳过 checkpoint 已消费的 micro-batches，metrics 文件中晚于恢复 step 的旧记录
-会被移除，避免重复 step。旧版仅包含模型权重的 `pretrain.pt` 没有 optimizer/scheduler 状态，
-不能用 `--resume`；但仍可用于生成或作为后续 SFT 的初始权重。
+会被移除，避免重复 step。optimizer、scheduler、step、token 计数、历史最佳 validation loss 和
+RNG 都从断点恢复，因此 warmup/cosine schedule 会从原位置继续。旧版仅包含模型权重的
+`pretrain.pt` 没有 optimizer/scheduler 状态，不能用 `--resume`；但仍可用于生成或作为后续
+SFT 的初始权重。
+
+### 流式数据顺序
+
+预训练 JSONL 使用 `IterableDataset`，不能直接给 DataLoader 设置 `shuffle=True`。训练集默认用
+8192 个 packed sequences 的确定性 shuffle buffer，避免按语种、来源或网页类型排列的数据在
+某个 step 突然整体切换；同一 seed 下顺序可复现，断点恢复会重新定位到完全相同的数据位置。
+`--shuffle-buffer-size 0` 可以恢复旧的顺序读取行为，但不建议用于正式训练。
+
+内置 validation split 是稳定的 hash 切分，适合纵向比较；如果准备了覆盖中文、英文、代码等
+类别的独立 held-out JSONL，建议通过 `--validation-data data/eval/pretrain_validation.jsonl`
+传入，它会比只读取大文件前部的 validation batch 更有代表性。
+
+### W&B 训练曲线
+
+W&B 是可选依赖，先安装并登录：
+
+```bash
+uv sync --extra tracking
+uv run wandb login
+```
+
+向 `lotus111/MiniScale` 记录训练 loss、validation loss、perplexity、learning rate、grad norm、
+tokens seen 和 generation tables：
+
+```bash
+uv run miniscale pretrain --steps 10000 --batch-size 4 \
+  --gradient-accumulation 4 --sequence-length 768 \
+  --learning-rate 3e-4 --min-learning-rate 3e-5 \
+  --warmup-steps 200 --validation-every 200 \
+  --save-every 500 --keep-last 3 --generation-every 1000 \
+  --shuffle-buffer-size 8192 \
+  --wandb --wandb-project MiniScale --wandb-entity lotus111 \
+  --wandb-run-name pretrain-64m-shuffled-bs4 \
+  --output artifacts/pretrain-shuffled
+```
+
+W&B run ID 会写进所有完整 checkpoint。使用 `--resume` 时不需要再次填写 ID，训练会自动接回
+同一个 W&B run；也可以第一次恢复旧 checkpoint 时显式传入 `--wandb-run-id`。无法联网时使用
+`--wandb-mode offline`，之后再运行 `uv run wandb sync <离线 run 目录>`。
 
 当前 GRPO 默认使用 `agent_rl_math.jsonl`，因为其中的 `gt` 能形成确定的 verifier reward。
 `rlaif.jsonl` 是开放式回答，不能拿“有没有数字”充当质量奖励；要使用它，应另接冻结的
@@ -175,8 +236,8 @@ uv run python generate.py \
   --raw
 ```
 
-`pretrain.pt`、`sft.pt`、`dpo.pt`、`rl.pt` 和 `agent_rl.pt` 使用相同 checkpoint 格式，都可以生成；
-评估 base `pretrain.pt` 的续写时可给 `generate` 增加 `--raw-prompt`。
+`best.pt`、`final.pt`、`sft.pt`、`dpo.pt`、`rl.pt` 和 `agent_rl.pt` 都包含可加载的模型权重；
+评估 base 模型 `best.pt` 或 `final.pt` 的续写时可给 `generate` 增加 `--raw-prompt`。
 但通常优先选择 `sft.pt` 或 `agent_rl.pt`。训练步数和数据量决定输出质量，文件能加载不等于
 模型已经具备泛化能力。
 

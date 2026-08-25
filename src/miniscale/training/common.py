@@ -84,6 +84,11 @@ def save_training_checkpoint(
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         },
     }
+    # Duplicate these progress fields at the top level for easy inspection;
+    # training_state remains the canonical object used when resuming.
+    for name in ("tokens_seen", "best_val_loss"):
+        if name in training_state:
+            payload[name] = training_state[name]
     torch.save(payload, temporary)
     temporary.replace(target)
     return target
@@ -104,15 +109,23 @@ def load_training_checkpoint(
     model.load_state_dict(payload["model"])
     optimizer.load_state_dict(payload["optimizer"])
     scheduler.load_state_dict(payload["scheduler"])
-    rng_state = payload.get("rng_state")
+    restore_rng_state(payload.get("rng_state"))
+    return payload
+
+
+def restore_rng_state(rng_state: object) -> None:
+    """Restore Python, CPU and CUDA RNG state captured in a checkpoint."""
+
     if isinstance(rng_state, dict):
         if rng_state.get("python") is not None:
             random.setstate(rng_state["python"])
         if rng_state.get("torch") is not None:
             torch.set_rng_state(rng_state["torch"].cpu())
         if torch.cuda.is_available() and rng_state.get("cuda") is not None:
-            torch.cuda.set_rng_state_all(rng_state["cuda"])
-    return payload
+            # torch.load(..., map_location="cuda") also moves serialized RNG
+            # tensors to CUDA, while set_rng_state_all requires CPU ByteTensors.
+            cuda_states = [state.cpu() for state in rng_state["cuda"]]
+            torch.cuda.set_rng_state_all(cuda_states)
 
 
 def load_checkpoint(path: str | Path, device: str | torch.device = "cpu") -> MiniScaleForCausalLM:

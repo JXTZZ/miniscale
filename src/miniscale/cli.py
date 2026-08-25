@@ -83,11 +83,21 @@ def build_parser() -> argparse.ArgumentParser:
     pretrain.add_argument("--warmup-steps", type=int, default=200)
     pretrain.add_argument("--validation-every", type=int, default=200)
     pretrain.add_argument("--validation-batches", type=int, default=20)
+    pretrain.add_argument("--validation-data", type=Path, help="optional dedicated validation JSONL")
     pretrain.add_argument("--save-every", type=int, default=500, help="use 0 to disable periodic checkpoints")
     pretrain.add_argument("--keep-last", type=int, default=3, help="number of periodic checkpoints to retain")
+    pretrain.add_argument("--shuffle-buffer-size", type=int, default=8192, help="use 0 to preserve JSONL order")
+    pretrain.add_argument("--generation-every", type=int, default=1000, help="use 0 to disable generation evaluation")
+    pretrain.add_argument("--generation-max-new-tokens", type=int, default=64)
+    pretrain.add_argument("--wandb", action="store_true", help="log training metrics to Weights & Biases")
+    pretrain.add_argument("--wandb-project", default="MiniScale")
+    pretrain.add_argument("--wandb-entity")
+    pretrain.add_argument("--wandb-run-name")
+    pretrain.add_argument("--wandb-run-id", help="explicit W&B id; stored in checkpoints for automatic resume")
+    pretrain.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
     pretrain.add_argument("--resume", type=Path, help="resume from a full training checkpoint")
     pretrain.add_argument("--num-workers", type=int, default=0)
-    sft = training_parser("sft", "supervised fine-tuning from pretrain.pt", DEFAULT_DATA / "sft/sft_t2t_mini.jsonl")
+    sft = training_parser("sft", "supervised fine-tuning from a pretrain checkpoint", DEFAULT_DATA / "sft/sft_t2t_mini.jsonl")
     sft.add_argument("--checkpoint", type=Path, required=True)
     sft.add_argument("--gradient-accumulation", type=int, default=16)
     sft.add_argument("--learning-rate", type=float, default=2e-5)
@@ -173,8 +183,14 @@ def main(argv: list[str] | None = None) -> None:
                 log_every=arguments.log_every, validation_every=arguments.validation_every,
                 validation_batches=arguments.validation_batches, save_every=arguments.save_every,
                 keep_last_checkpoints=arguments.keep_last, resume_from=arguments.resume,
+                generation_every=arguments.generation_every,
+                generation_max_new_tokens=arguments.generation_max_new_tokens,
+                shuffle_buffer_size=arguments.shuffle_buffer_size,
+                wandb_enabled=arguments.wandb, wandb_project=arguments.wandb_project,
+                wandb_entity=arguments.wandb_entity, wandb_run_name=arguments.wandb_run_name,
+                wandb_run_id=arguments.wandb_run_id, wandb_mode=arguments.wandb_mode,
                 num_workers=arguments.num_workers, device=arguments.device,
-            ))
+            ), validation_path=arguments.validation_data)
         else:
             model = load_checkpoint(arguments.checkpoint)
             if model.config.vocab_size != tokenizer.vocab_size:

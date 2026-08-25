@@ -13,3 +13,6 @@ data/tokenizer/*
 !data/tokenizer/minimind/
 !data/tokenizer/minimind/tokenizer.json
 !data/tokenizer/minimind/tokenizer_config.json
+
+# Local learning notes: useful for personal review, not part of the public project.
+/TRAINING_EXPERIENCE.md

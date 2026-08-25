@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
@@ -11,12 +11,14 @@ from torch.utils.data import DataLoader
 from miniscale.data import JsonlPretrainDataset, PretrainDataset, collate_lm_batch
 from miniscale.model import MiniScaleForCausalLM
 from miniscale.tokenizer import ByteTokenizer, Tokenizer
+from miniscale.tracking import WandbTracker
 from .common import (
     append_metric,
     evaluate_lm,
     infinite_batches,
     load_training_checkpoint,
     resolve_device,
+    restore_rng_state,
     save_checkpoint,
     save_training_checkpoint,
     seed_everything,
@@ -43,7 +45,27 @@ class PretrainOptions:
     min_learning_rate: float = 3e-5
     save_every: int = 500
     keep_last_checkpoints: int = 3
+    generation_every: int = 1000
+    generation_max_new_tokens: int = 64
+    shuffle_buffer_size: int = 8192
+    wandb_enabled: bool = False
+    wandb_project: str = "MiniScale"
+    wandb_entity: str | None = None
+    wandb_run_name: str | None = None
+    wandb_run_id: str | None = None
+    wandb_mode: str = "online"
     resume_from: str | Path | None = None
+
+
+GENERATION_EVAL_PROMPTS: tuple[dict[str, str], ...] = (
+    {"name": "chinese", "language": "zh", "prompt": "人工智能的发展将会"},
+    {"name": "english", "language": "en", "prompt": "The future of artificial intelligence is"},
+    {
+        "name": "code",
+        "language": "python",
+        "prompt": "def fibonacci(n):\n    \"\"\"Return the nth Fibonacci number.\"\"\"\n",
+    },
+)
 
 
 def warmup_cosine_multiplier(
@@ -104,7 +126,24 @@ def _resume_signature(options: PretrainOptions) -> dict[str, object]:
         "learning_rate": options.learning_rate,
         "min_learning_rate": options.min_learning_rate,
         "warmup_steps": options.warmup_steps,
+        "shuffle_buffer_size": options.shuffle_buffer_size,
+        "seed": options.seed,
     }
+
+
+def _validate_resume_signature(saved: object, current: dict[str, object]) -> None:
+    if not isinstance(saved, dict):
+        raise ValueError("checkpoint resume_signature must be a mapping")
+    # Older checkpoints do not contain newly introduced data-order fields.
+    # Validate every field they did record, while allowing new fields to use
+    # their current defaults during a one-time migration.
+    mismatches = {
+        name: (value, current.get(name))
+        for name, value in saved.items()
+        if name not in current or current[name] != value
+    }
+    if mismatches:
+        raise ValueError(f"resume options do not match checkpoint: {mismatches}")
 
 
 def _prune_periodic_checkpoints(checkpoint_dir: Path, keep_last: int) -> None:
@@ -125,6 +164,65 @@ def _truncate_metrics_after(path: Path, step: int) -> None:
         if int(metric.get("step", -1)) <= step:
             retained.append(json.dumps(metric, ensure_ascii=False))
     path.write_text("".join(f"{line}\n" for line in retained), encoding="utf-8")
+
+
+@torch.no_grad()
+def run_generation_evaluation(
+    model: MiniScaleForCausalLM,
+    tokenizer: Tokenizer,
+    output_dir: str | Path,
+    *,
+    step: int,
+    device: torch.device,
+    max_new_tokens: int,
+) -> Path:
+    """Generate fixed multilingual probes with deterministic greedy decoding."""
+
+    was_training = model.training
+    model.eval()
+    samples: list[dict[str, object]] = []
+    try:
+        for probe in GENERATION_EVAL_PROMPTS:
+            prompt_ids = tokenizer.encode(probe["prompt"], bos=True)
+            if len(prompt_ids) >= model.config.max_position_embeddings:
+                prompt_ids = prompt_ids[-(model.config.max_position_embeddings - 1) :]
+            input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+            generated = model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,
+                top_k=None,
+                eos_token_id=tokenizer.eos_token_id,
+                do_sample=False,
+            )
+            completion_ids = generated[0, len(prompt_ids) :].tolist()
+            samples.append({
+                **probe,
+                "prompt_tokens": len(prompt_ids),
+                "generated_tokens": len(completion_ids),
+                "response": tokenizer.decode(completion_ids),
+            })
+    finally:
+        model.train(was_training)
+
+    target = Path(output_dir) / "generations" / f"step_{step:08d}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(f"{target.suffix}.tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "stage": "pretrain",
+                "step": step,
+                "decoding": {"do_sample": False, "strategy": "greedy", "temperature": 0.0},
+                "samples": samples,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+    return target
 
 
 def run_pretrain(
@@ -193,14 +291,22 @@ def run_pretrain_jsonl(
         raise ValueError("steps must be positive")
     if options.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
+    if options.validation_every < 1 or options.validation_batches < 1:
+        raise ValueError("validation_every and validation_batches must be positive")
     if options.save_every < 0 or options.keep_last_checkpoints < 1:
         raise ValueError("save_every must be non-negative and keep_last_checkpoints must be positive")
+    if options.generation_every < 0 or options.generation_max_new_tokens < 1:
+        raise ValueError("generation_every must be non-negative and generation_max_new_tokens must be positive")
+    if options.shuffle_buffer_size < 0:
+        raise ValueError("shuffle_buffer_size must be non-negative")
     seed_everything(options.seed)
     device = resolve_device(options.device)
     model.to(device).train()
     train_dataset = JsonlPretrainDataset(
         train_path, tokenizer, options.sequence_length, split="train",
         validation_fraction=options.validation_fraction,
+        shuffle_buffer_size=options.shuffle_buffer_size,
+        seed=options.seed,
     )
     collate = lambda rows: collate_lm_batch(rows, tokenizer.pad_token_id)
     loader = DataLoader(train_dataset, batch_size=options.batch_size, collate_fn=collate, num_workers=options.num_workers)
@@ -229,6 +335,8 @@ def run_pretrain_jsonl(
     tokens_seen = 0
     completed_step = 0
     micro_batches_seen = 0
+    best_val_loss = float("inf")
+    saved_wandb_run_id: str | None = None
     last_metrics: dict[str, float] = {"loss": last_loss, "tokens_seen": float(tokens_seen)}
     if options.resume_from is not None:
         payload = load_training_checkpoint(options.resume_from, model, optimizer, scheduler, device)
@@ -236,11 +344,13 @@ def run_pretrain_jsonl(
         if not isinstance(state, dict):
             raise ValueError("checkpoint training_state must be a mapping")
         saved_signature = state.get("resume_signature")
-        if saved_signature != _resume_signature(options):
-            raise ValueError(f"resume options do not match checkpoint: {saved_signature}")
+        _validate_resume_signature(saved_signature, _resume_signature(options))
         completed_step = int(payload["step"])
         tokens_seen = int(state.get("tokens_seen", 0))
         micro_batches_seen = int(state.get("micro_batches_seen", completed_step * options.gradient_accumulation_steps))
+        best_val_loss = float(state.get("best_val_loss", payload.get("best_val_loss", float("inf"))))
+        if state.get("wandb_run_id") is not None:
+            saved_wandb_run_id = str(state["wandb_run_id"])
         last_metrics = {name: float(value) for name, value in payload.get("metrics", {}).items()}
         last_loss = float(last_metrics.get("loss", last_metrics.get("train_loss", float("nan"))))
         _truncate_metrics_after(metrics_path, completed_step)
@@ -251,11 +361,44 @@ def run_pretrain_jsonl(
     batches = iter(infinite_batches(loader))
     for _ in range(micro_batches_seen):
         next(batches)
+    # Constructing/skipping DataLoader iterators can consume RNG. Restore the
+    # exact post-checkpoint RNG state after positioning the data stream.
+    if options.resume_from is not None:
+        restore_rng_state(payload.get("rng_state"))
+
+    if options.wandb_run_id and saved_wandb_run_id and options.wandb_run_id != saved_wandb_run_id:
+        raise ValueError("--wandb-run-id does not match the run id stored in the checkpoint")
+    output.mkdir(parents=True, exist_ok=True)
+    tracker = WandbTracker.start(
+        enabled=options.wandb_enabled,
+        project=options.wandb_project,
+        entity=options.wandb_entity,
+        name=options.wandb_run_name,
+        run_id=options.wandb_run_id or saved_wandb_run_id,
+        mode=options.wandb_mode,
+        config={
+            "stage": "pretrain",
+            "data": str(Path(train_path)),
+            "validation_data": str(Path(validation_path)) if validation_path else None,
+            "output": str(output),
+            "num_parameters": model.num_parameters,
+            "model": asdict(model.config),
+            "training": {
+                name: str(value) if isinstance(value, Path) else value
+                for name, value in asdict(options).items()
+                if name not in {"wandb_run_id", "resume_from"}
+            },
+        },
+        directory=output,
+    )
+    wandb_run_id = tracker.run_id if tracker is not None else saved_wandb_run_id
 
     def training_state() -> dict[str, object]:
         return {
             "tokens_seen": tokens_seen,
             "micro_batches_seen": micro_batches_seen,
+            "best_val_loss": best_val_loss,
+            "wandb_run_id": wandb_run_id,
             "resume_signature": _resume_signature(options),
         }
 
@@ -291,16 +434,58 @@ def run_pretrain_jsonl(
             if validation_due:
                 val_loss = evaluate_lm(model, validation_loader, device, options.validation_batches)
                 metric["validation_loss"] = val_loss
-                metric["perplexity"] = float(torch.exp(torch.tensor(min(val_loss, 20.0))))
+                metric["perplexity"] = math.exp(val_loss) if val_loss < 709.0 else float("inf")
             last_metrics = {
                 "loss": last_loss,
                 "tokens_seen": float(tokens_seen),
                 "learning_rate": current_lr,
+                "best_val_loss": best_val_loss,
             }
-            if step == 1 or step % options.log_every == 0 or step == options.steps or validation_due:
+            if validation_due:
+                last_metrics["validation_loss"] = float(metric["validation_loss"])
+                last_metrics["perplexity"] = float(metric["perplexity"])
+                if math.isfinite(last_metrics["validation_loss"]) and last_metrics["validation_loss"] < best_val_loss:
+                    best_val_loss = last_metrics["validation_loss"]
+                    last_metrics["best_val_loss"] = best_val_loss
+                    best_checkpoint = save_training_checkpoint(
+                        output / "best.pt",
+                        model,
+                        optimizer,
+                        scheduler,
+                        stage="pretrain",
+                        step=step,
+                        metrics=last_metrics,
+                        training_state=training_state(),
+                    )
+                    print(
+                        f"saved best checkpoint: {best_checkpoint} (validation_loss={best_val_loss:.6f})",
+                        flush=True,
+                    )
+                metric["best_val_loss"] = best_val_loss
+            generation_path: Path | None = None
+            if options.generation_every and step % options.generation_every == 0:
+                generation_path = run_generation_evaluation(
+                    model,
+                    tokenizer,
+                    output,
+                    step=step,
+                    device=device,
+                    max_new_tokens=options.generation_max_new_tokens,
+                )
+                print(f"saved generation evaluation: {generation_path}", flush=True)
+            log_due = (
+                step == 1
+                or step % options.log_every == 0
+                or step == options.steps
+                or validation_due
+                or generation_path is not None
+            )
+            if log_due:
                 append_metric(metrics_path, metric)
+                if tracker is not None:
+                    tracker.log(metric, generation_path=generation_path)
                 print(metric, flush=True)
-            if options.save_every and step % options.save_every == 0 and step < options.steps:
+            if options.save_every and step % options.save_every == 0:
                 checkpoint = save_training_checkpoint(
                     checkpoint_dir / f"step_{step:08d}.pt",
                     model,
@@ -325,11 +510,18 @@ def run_pretrain_jsonl(
             training_state=training_state(),
         )
         print(f"training interrupted; emergency checkpoint saved: {emergency}", flush=True)
+        if tracker is not None:
+            tracker.finish(exit_code=1, summary={"interrupted_step": completed_step})
         raise
 
-    metrics = {"loss": last_loss, "tokens_seen": float(tokens_seen), "learning_rate": last_metrics["learning_rate"]}
+    metrics = {
+        "loss": last_loss,
+        "tokens_seen": float(tokens_seen),
+        "learning_rate": last_metrics["learning_rate"],
+        "best_val_loss": best_val_loss,
+    }
     checkpoint = save_training_checkpoint(
-        output / "pretrain.pt",
+        output / "final.pt",
         model,
         optimizer,
         scheduler,
@@ -338,4 +530,14 @@ def run_pretrain_jsonl(
         metrics=metrics,
         training_state=training_state(),
     )
-    return {**metrics, "checkpoint": str(checkpoint), "metrics": str(metrics_path), "device": str(device)}
+    if tracker is not None:
+        tracker.finish(summary={**metrics, "final_step": options.steps})
+    result: dict[str, float | str] = {
+        **metrics,
+        "checkpoint": str(checkpoint),
+        "metrics": str(metrics_path),
+        "device": str(device),
+    }
+    if wandb_run_id is not None:
+        result["wandb_run_id"] = wandb_run_id
+    return result

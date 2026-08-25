@@ -42,6 +42,29 @@ class JsonlTrainingChainTests(unittest.TestCase):
             )
             self.assertIsNotNone(result.loss)
 
+    def test_pretrain_shuffle_buffer_is_deterministic_and_changes_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Path(directory) / "pretrain.jsonl"
+            write_jsonl(corpus, [{"text": f"document-{index}-" * 20} for index in range(20)])
+            tokenizer = ByteTokenizer()
+
+            def blocks(buffer_size: int) -> list[tuple[int, ...]]:
+                dataset = JsonlPretrainDataset(
+                    corpus,
+                    tokenizer,
+                    sequence_length=32,
+                    validation_fraction=0,
+                    shuffle_buffer_size=buffer_size,
+                    seed=17,
+                )
+                return [tuple(row["input_ids"].tolist()) for row in dataset]
+
+            ordered = blocks(0)
+            shuffled = blocks(8)
+            self.assertNotEqual(ordered, shuffled)
+            self.assertEqual(shuffled, blocks(8))
+            self.assertEqual(sorted(ordered), sorted(shuffled))
+
     def test_sentencepiece_training_and_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
