@@ -53,6 +53,68 @@ def save_checkpoint(
     return target
 
 
+def save_training_checkpoint(
+    path: str | Path,
+    model: MiniScaleForCausalLM,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    *,
+    stage: str,
+    step: int,
+    metrics: dict[str, float],
+    training_state: dict[str, object],
+) -> Path:
+    """Atomically save everything required to continue a training run."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(f"{target.suffix}.tmp")
+    payload: dict[str, object] = {
+        "stage": stage,
+        "step": step,
+        "metrics": metrics,
+        "config": model.config,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "training_state": training_state,
+        "rng_state": {
+            "python": random.getstate(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+    }
+    torch.save(payload, temporary)
+    temporary.replace(target)
+    return target
+
+
+def load_training_checkpoint(
+    path: str | Path,
+    model: MiniScaleForCausalLM,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    device: str | torch.device,
+) -> dict[str, object]:
+    payload = torch.load(path, map_location=device, weights_only=False)
+    required = {"model", "optimizer", "scheduler", "training_state", "step"}
+    missing = required.difference(payload)
+    if missing:
+        raise ValueError(f"checkpoint cannot resume training; missing: {', '.join(sorted(missing))}")
+    model.load_state_dict(payload["model"])
+    optimizer.load_state_dict(payload["optimizer"])
+    scheduler.load_state_dict(payload["scheduler"])
+    rng_state = payload.get("rng_state")
+    if isinstance(rng_state, dict):
+        if rng_state.get("python") is not None:
+            random.setstate(rng_state["python"])
+        if rng_state.get("torch") is not None:
+            torch.set_rng_state(rng_state["torch"].cpu())
+        if torch.cuda.is_available() and rng_state.get("cuda") is not None:
+            torch.cuda.set_rng_state_all(rng_state["cuda"])
+    return payload
+
+
 def load_checkpoint(path: str | Path, device: str | torch.device = "cpu") -> MiniScaleForCausalLM:
     payload = torch.load(path, map_location=device, weights_only=False)
     config = payload["config"]

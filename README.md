@@ -84,7 +84,9 @@ uv run miniscale tokenize \
 
 ```bash
 uv run miniscale pretrain --steps 10000 --batch-size 1 \
-  --gradient-accumulation 16 --sequence-length 512 \
+  --gradient-accumulation 16 --sequence-length 768 \
+  --learning-rate 3e-4 --min-learning-rate 3e-5 \
+  --warmup-steps 200 --save-every 500 --keep-last 3 \
   --output artifacts/pretrain
 
 uv run miniscale sft --steps 3000 --batch-size 1 \
@@ -104,6 +106,27 @@ uv run miniscale agent-rl --steps 500 --batch-size 1 --group-size 4 \
   --checkpoint artifacts/grpo/rl.pt \
   --output artifacts/agent-rl
 ```
+
+预训练前 200 step 线性 warmup 到 `3e-4`，之后 cosine decay 到 `3e-5`。每 500 step
+在 `artifacts/pretrain/checkpoints/` 保存完整训练状态，并只保留最近 3 个周期 checkpoint；
+完整状态包含模型、AdamW、scheduler、step、token 计数和随机数状态。按 `Ctrl+C` 时还会写入
+`emergency_step_XXXXXXXX.pt` 后再退出。完整 checkpoint 通常约 700–800MB，请预留磁盘空间。
+
+从周期或 emergency checkpoint 继续时，`--steps` 仍表示原计划的总步数，其他影响训练轨迹的
+参数必须与原命令一致：
+
+```bash
+uv run miniscale pretrain --steps 10000 --batch-size 1 \
+  --gradient-accumulation 16 --sequence-length 768 \
+  --learning-rate 3e-4 --min-learning-rate 3e-5 \
+  --warmup-steps 200 --save-every 500 --keep-last 3 \
+  --resume artifacts/pretrain/checkpoints/step_00000500.pt \
+  --output artifacts/pretrain
+```
+
+恢复时数据流会跳过 checkpoint 已消费的 micro-batches，metrics 文件中晚于恢复 step 的旧记录
+会被移除，避免重复 step。旧版仅包含模型权重的 `pretrain.pt` 没有 optimizer/scheduler 状态，
+不能用 `--resume`；但仍可用于生成或作为后续 SFT 的初始权重。
 
 当前 GRPO 默认使用 `agent_rl_math.jsonl`，因为其中的 `gt` 能形成确定的 verifier reward。
 `rlaif.jsonl` 是开放式回答，不能拿“有没有数字”充当质量奖励；要使用它，应另接冻结的
@@ -175,7 +198,7 @@ uv run python generate.py \
 old/reference policy、可验证 reward、受限工具执行和端到端测试。但真正扩大训练规模前还需要：
 
 - 为现有 BPE/JSONL 数据加入去重、质量过滤、数据配比和评测污染检测；
-- 加入 BF16、gradient checkpointing、FlashAttention、学习率调度、断点续训、FSDP/DeepSpeed；
+- 加入 BF16、gradient checkpointing、FlashAttention、FSDP/DeepSpeed；
 - 将 rollout 与 learner 解耦，用 vLLM/SGLang 一类推理服务异步采样，并处理 policy weight 同步；
 - 对工具执行使用进程/容器级 sandbox、超时、资源限额和审计，而不仅是当前的 AST 白名单；
 - 建立固定 held-out eval、pass@k、tool-call success、KL/entropy、吞吐和显存监控；

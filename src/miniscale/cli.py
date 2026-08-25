@@ -76,11 +76,16 @@ def build_parser() -> argparse.ArgumentParser:
         return command
 
     pretrain = training_parser("pretrain", "pretrain the 64M base model", DEFAULT_DATA / "pretrain/pretrain_t2t_mini.jsonl")
-    pretrain.add_argument("--sequence-length", type=int, default=512)
+    pretrain.add_argument("--sequence-length", type=int, default=768)
     pretrain.add_argument("--gradient-accumulation", type=int, default=16)
     pretrain.add_argument("--learning-rate", type=float, default=3e-4)
+    pretrain.add_argument("--min-learning-rate", type=float, default=3e-5)
+    pretrain.add_argument("--warmup-steps", type=int, default=200)
     pretrain.add_argument("--validation-every", type=int, default=200)
     pretrain.add_argument("--validation-batches", type=int, default=20)
+    pretrain.add_argument("--save-every", type=int, default=500, help="use 0 to disable periodic checkpoints")
+    pretrain.add_argument("--keep-last", type=int, default=3, help="number of periodic checkpoints to retain")
+    pretrain.add_argument("--resume", type=Path, help="resume from a full training checkpoint")
     pretrain.add_argument("--num-workers", type=int, default=0)
     sft = training_parser("sft", "supervised fine-tuning from pretrain.pt", DEFAULT_DATA / "sft/sft_t2t_mini.jsonl")
     sft.add_argument("--checkpoint", type=Path, required=True)
@@ -162,9 +167,13 @@ def main(argv: list[str] | None = None) -> None:
             ))
             result = run_pretrain_jsonl(model, tokenizer, arguments.data, arguments.output, PretrainOptions(
                 steps=arguments.steps, batch_size=arguments.batch_size, sequence_length=arguments.sequence_length,
-                learning_rate=arguments.learning_rate, gradient_accumulation_steps=arguments.gradient_accumulation,
+                learning_rate=arguments.learning_rate, min_learning_rate=arguments.min_learning_rate,
+                warmup_steps=arguments.warmup_steps,
+                gradient_accumulation_steps=arguments.gradient_accumulation,
                 log_every=arguments.log_every, validation_every=arguments.validation_every,
-                validation_batches=arguments.validation_batches, num_workers=arguments.num_workers, device=arguments.device,
+                validation_batches=arguments.validation_batches, save_every=arguments.save_every,
+                keep_last_checkpoints=arguments.keep_last, resume_from=arguments.resume,
+                num_workers=arguments.num_workers, device=arguments.device,
             ))
         else:
             model = load_checkpoint(arguments.checkpoint)
