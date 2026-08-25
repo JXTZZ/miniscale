@@ -4,6 +4,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+import json
 
 import torch
 from torch import Tensor
@@ -58,10 +59,10 @@ def rollout_agent(
     response_fn: ResponseFunction | None = None,
 ) -> AgentTrajectory:
     env = CalculatorEnv(task)
-    messages = [
-        {"role": "system", "content": task.system_prompt or env.tool_prompt},
-        {"role": "user", "content": task.question},
-    ]
+    system_message: dict[str, object] = {"role": "system", "content": task.system_prompt or env.tool_prompt}
+    if task.tools is not None:
+        system_message["tools"] = task.tools
+    messages = [system_message, {"role": "user", "content": task.question}]
     transcript = tokenizer.format_messages(messages, generation_prompt=True)
     input_ids = tokenizer.encode(transcript, bos=True)
     if len(input_ids) >= model.config.max_position_embeddings:
@@ -94,7 +95,10 @@ def rollout_agent(
         observation = env.execute(response)
         if observation is None or turn + 1 >= options.max_turns:
             break
-        observation_text = f"\n<|tool|>\n{observation}<|end|>\n<|assistant|>\n"
+        observation_text = tokenizer.format_tool_observation(
+            observation,
+            assistant_closed=bool(response_ids) and response_ids[-1] == tokenizer.eos_token_id,
+        )
         observation_ids = tokenizer.encode(observation_text)
         observation_ids = observation_ids[: model.config.max_position_embeddings - len(input_ids)]
         observation_start = len(input_ids)
@@ -214,10 +218,17 @@ def load_agent_tasks(data_path: str | Path, limit: int | None = None) -> list[Ca
         if not users or not answers:
             continue
         system_prompt = None
+        tools = None
         if systems:
             system = systems[-1]
-            system_prompt = f"{system.get('content') or ''}\n{system.get('tools') or ''}".strip()
-        tasks.append(CalculatorTask(users[-1], "", answers, system_prompt))
+            system_prompt = str(system.get("content") or "").strip() or None
+            tools = system.get("tools")
+            if isinstance(tools, str):
+                try:
+                    tools = json.loads(tools)
+                except json.JSONDecodeError:
+                    pass
+        tasks.append(CalculatorTask(users[-1], "", answers, system_prompt, tools))
     return tasks
 
 

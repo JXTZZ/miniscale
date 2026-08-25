@@ -7,4 +7,9 @@ __pycache__/
 build/
 dist/
 artifacts/
-data/
+data/*
+!data/tokenizer/
+data/tokenizer/*
+!data/tokenizer/minimind/
+!data/tokenizer/minimind/tokenizer.json
+!data/tokenizer/minimind/tokenizer_config.json

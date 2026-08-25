@@ -15,8 +15,10 @@ class Tokenizer(Protocol):
 
     def encode(self, text: str, *, bos: bool = False, eos: bool = False) -> list[int]: ...
     def decode(self, ids: Iterable[int], *, skip_special_tokens: bool = True) -> str: ...
+    def convert_ids_to_tokens(self, ids: Iterable[int]) -> list[str]: ...
     def format_messages(self, messages: Sequence[dict[str, object]], *, generation_prompt: bool = False) -> str: ...
     def encode_sft(self, messages: Sequence[dict[str, object]]) -> tuple[list[int], list[int]]: ...
+    def format_tool_observation(self, observation: str, *, assistant_closed: bool = False) -> str: ...
 
 
 def _message_content(message: dict[str, object]) -> str:
@@ -49,6 +51,9 @@ class ChatTemplateMixin:
         labels.append(self.eos_token_id if messages and messages[-1]["role"] == "assistant" else -100)
         return input_ids, labels
 
+    def format_tool_observation(self, observation: str, *, assistant_closed: bool = False) -> str:
+        return f"\n<|tool|>\n{observation}<|end|>\n<|assistant|>\n"
+
 
 class ByteTokenizer(ChatTemplateMixin):
     """A deterministic UTF-8 tokenizer that keeps the project self-contained."""
@@ -76,6 +81,10 @@ class ByteTokenizer(ChatTemplateMixin):
             elif not skip_special_tokens:
                 payload.extend(f"<|{token_id}|>".encode())
         return payload.decode("utf-8", errors="replace")
+
+    def convert_ids_to_tokens(self, ids: Iterable[int]) -> list[str]:
+        special = {0: "<pad>", 1: "<bos>", 2: "<eos>", 3: "<unk>"}
+        return [special.get(int(token_id), f"<0x{int(token_id) - 4:02X}>") for token_id in ids]
 
 
 
@@ -107,6 +116,120 @@ class SentencePieceTokenizer(ChatTemplateMixin):
             special = {self.pad_token_id, self.bos_token_id, self.eos_token_id}
             values = [token_id for token_id in values if token_id not in special]
         return self.processor.decode(values)
+
+    def convert_ids_to_tokens(self, ids: Iterable[int]) -> list[str]:
+        return [self.processor.id_to_piece(int(token_id)) for token_id in ids]
+
+
+class HuggingFaceTokenizer:
+    """Adapter for a local Hugging Face fast-tokenizer directory."""
+
+    def __init__(self, tokenizer_path: str | Path) -> None:
+        from transformers import AutoTokenizer
+
+        path = Path(tokenizer_path)
+        self.model_path = path.parent if path.is_file() else path
+        self.processor = AutoTokenizer.from_pretrained(self.model_path, local_files_only=True)
+        self.pad_token_id = self._required_id("pad_token_id")
+        self.bos_token_id = self._required_id("bos_token_id")
+        self.eos_token_id = self._required_id("eos_token_id")
+        self.unk_token_id = self._required_id("unk_token_id")
+        self.vocab_size = len(self.processor)
+
+    def _required_id(self, name: str) -> int:
+        value = getattr(self.processor, name)
+        if value is None:
+            raise ValueError(f"Hugging Face tokenizer must define {name}")
+        return int(value)
+
+    @staticmethod
+    def _parse_json_value(value: object) -> object:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value
+        return value
+
+    def encode(self, text: str, *, bos: bool = False, eos: bool = False) -> list[int]:
+        ids = list(self.processor.encode(text, add_special_tokens=False))
+        if bos and (not ids or ids[0] != self.bos_token_id):
+            ids.insert(0, self.bos_token_id)
+        if eos and (not ids or ids[-1] != self.eos_token_id):
+            ids.append(self.eos_token_id)
+        return ids
+
+    def decode(self, ids: Iterable[int], *, skip_special_tokens: bool = True) -> str:
+        return self.processor.decode(
+            [int(token_id) for token_id in ids],
+            skip_special_tokens=skip_special_tokens,
+            clean_up_tokenization_spaces=False,
+        )
+
+    def convert_ids_to_tokens(self, ids: Iterable[int]) -> list[str]:
+        tokens = self.processor.convert_ids_to_tokens([int(token_id) for token_id in ids])
+        return [str(token) for token in tokens]
+
+    def format_messages(self, messages: Sequence[dict[str, object]], *, generation_prompt: bool = False) -> str:
+        prepared: list[dict[str, object]] = []
+        tools: object | None = None
+        for raw_message in messages:
+            message = dict(raw_message)
+            raw_tools = message.pop("tools", None)
+            if message.get("role") == "system" and raw_tools:
+                tools = self._parse_json_value(raw_tools)
+            if message.get("tool_calls"):
+                message["tool_calls"] = self._parse_json_value(message["tool_calls"])
+            message["content"] = message.get("content") or ""
+            prepared.append(message)
+        kwargs: dict[str, object] = {
+            "tokenize": False,
+            "add_generation_prompt": generation_prompt,
+            "open_thinking": False,
+        }
+        if tools is not None:
+            kwargs["tools"] = tools
+        rendered = self.processor.apply_chat_template(prepared, **kwargs)
+        if not isinstance(rendered, str):
+            raise TypeError("chat template must render text when tokenize=False")
+        return rendered
+
+    def encode_sft(self, messages: Sequence[dict[str, object]]) -> tuple[list[int], list[int]]:
+        input_ids = self.encode(self.format_messages(messages))
+        labels = [-100] * len(input_ids)
+        assistant_prefix = self.encode(f"{self.processor.bos_token}assistant\n")
+        assistant_end = self.encode(f"{self.processor.eos_token}\n")
+        index = 0
+        while index < len(input_ids):
+            if input_ids[index : index + len(assistant_prefix)] != assistant_prefix:
+                index += 1
+                continue
+            start = index + len(assistant_prefix)
+            end = start
+            while end < len(input_ids) and input_ids[end : end + len(assistant_end)] != assistant_end:
+                end += 1
+            supervised_end = min(end + len(assistant_end), len(input_ids))
+            labels[start:supervised_end] = input_ids[start:supervised_end]
+            index = supervised_end
+        return input_ids, labels
+
+    def format_tool_observation(self, observation: str, *, assistant_closed: bool = False) -> str:
+        close_assistant = "" if assistant_closed else f"{self.processor.eos_token}\n"
+        return (
+            f"{close_assistant}<|im_start|>user\n<tool_response>\n{observation}\n"
+            "</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+
+
+def load_tokenizer(tokenizer_path: str | Path) -> Tokenizer:
+    """Load either a SentencePiece model or a Hugging Face tokenizer directory."""
+
+    path = Path(tokenizer_path)
+    if path.is_dir() or path.name == "tokenizer.json":
+        return HuggingFaceTokenizer(path)
+    if path.suffix == ".model":
+        return SentencePieceTokenizer(path)
+    raise ValueError(f"unsupported tokenizer path: {path}")
 
 
 def iter_tokenizer_texts(jsonl_path: str | Path, limit: int | None = None) -> Iterator[str]:

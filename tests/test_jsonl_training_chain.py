@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM, SentencePieceTokenizer
+from miniscale.data import JsonlPretrainDataset
 from miniscale.inference import GenerationOptions, generate_from_checkpoint
 from miniscale.tokenizer import train_sentencepiece
 from miniscale.training import (
@@ -26,6 +27,21 @@ def write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class JsonlTrainingChainTests(unittest.TestCase):
+    def test_pretrain_blocks_never_exceed_sequence_length(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Path(directory) / "pretrain.jsonl"
+            write_jsonl(corpus, [{"text": "边界长度测试。" * 20}])
+            dataset = JsonlPretrainDataset(corpus, ByteTokenizer(), sequence_length=32)
+            sample = next(iter(dataset))
+            self.assertEqual(sample["input_ids"].numel(), 32)
+            config = MiniScaleConfig.smoke()
+            config.max_position_embeddings = 32
+            result = MiniScaleForCausalLM(config)(
+                sample["input_ids"].unsqueeze(0),
+                labels=sample["labels"].unsqueeze(0),
+            )
+            self.assertIsNotNone(result.loss)
+
     def test_sentencepiece_training_and_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

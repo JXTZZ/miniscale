@@ -39,8 +39,16 @@ class MiniScaleConfig:
         )
 
     @classmethod
-    def small_64m(cls, vocab_size: int = 8192, max_position_embeddings: int = 512) -> "MiniScaleConfig":
-        """The project training configuration: about 64.5M tied parameters."""
+    def small_64m(
+        cls,
+        vocab_size: int = 6400,
+        max_position_embeddings: int = 512,
+        *,
+        pad_token_id: int = 0,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
+    ) -> "MiniScaleConfig":
+        """The project training configuration: about 63.6M tied parameters with the MiniMind vocabulary."""
         return cls(
             vocab_size=vocab_size,
             hidden_size=512,
@@ -49,6 +57,9 @@ class MiniScaleConfig:
             num_attention_heads=8,
             num_key_value_heads=2,
             max_position_embeddings=max_position_embeddings,
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
         )
 
     def save(self, path: str | Path) -> None:

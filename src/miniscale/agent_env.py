@@ -13,6 +13,7 @@ class CalculatorTask:
     expression: str
     answer: str | tuple[str, ...]
     system_prompt: str | None = None
+    tools: object | None = None
 
 
 _BINARY_OPERATORS = {

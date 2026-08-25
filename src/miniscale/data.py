@@ -14,13 +14,15 @@ from .tokenizer import ByteTokenizer, Tokenizer
 
 class PretrainDataset(Dataset[dict[str, Tensor]]):
     def __init__(self, texts: Sequence[str], tokenizer: ByteTokenizer, sequence_length: int) -> None:
+        if sequence_length < 2:
+            raise ValueError("sequence_length must be at least 2")
         stream: list[int] = []
         for text in texts:
             stream.extend(tokenizer.encode(text, bos=True, eos=True))
         self.examples = [
-            stream[start : start + sequence_length + 1]
-            for start in range(0, max(len(stream) - 1, 0), sequence_length)
-            if len(stream[start : start + sequence_length + 1]) >= 2
+            stream[start : start + sequence_length]
+            for start in range(0, max(len(stream) - 1, 0), sequence_length - 1)
+            if len(stream[start : start + sequence_length]) >= 2
         ]
 
     def __len__(self) -> int:
@@ -90,6 +92,8 @@ class JsonlPretrainDataset(IterableDataset[dict[str, Tensor]]):
         split: str = "all",
         validation_fraction: float = 0.005,
     ) -> None:
+        if sequence_length < 2:
+            raise ValueError("sequence_length must be at least 2")
         self.path = Path(path)
         self.tokenizer = tokenizer
         self.sequence_length = sequence_length
@@ -98,7 +102,7 @@ class JsonlPretrainDataset(IterableDataset[dict[str, Tensor]]):
 
     def __iter__(self) -> Iterator[dict[str, Tensor]]:
         buffer: list[int] = []
-        target_length = self.sequence_length + 1
+        target_length = self.sequence_length
         for row in _worker_rows(self.path):
             text = row.get("text")
             if not isinstance(text, str) or not text:
@@ -111,7 +115,9 @@ class JsonlPretrainDataset(IterableDataset[dict[str, Tensor]]):
             buffer.extend(self.tokenizer.encode(text, bos=True, eos=True))
             while len(buffer) >= target_length:
                 ids = torch.tensor(buffer[:target_length], dtype=torch.long)
-                del buffer[: self.sequence_length]
+                # Retain the final token as the first context token of the next
+                # block, so the boundary next-token target is not discarded.
+                del buffer[: self.sequence_length - 1]
                 yield {"input_ids": ids, "labels": ids.clone()}
 
 

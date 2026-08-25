@@ -12,7 +12,7 @@ from .config import MiniScaleConfig
 from .inference import GenerationOptions, generate_from_checkpoint
 from .model import MiniScaleForCausalLM
 from .pipeline import run_training_pipeline
-from .tokenizer import SentencePieceTokenizer, train_sentencepiece
+from .tokenizer import load_tokenizer, train_sentencepiece
 from .training import (
     AgentRLOptions, DPOOptions, GRPOOptions, PretrainOptions, SFTOptions,
     run_agent_grpo_jsonl, run_dpo_jsonl, run_grpo_jsonl, run_pretrain_jsonl, run_sft_jsonl,
@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     generate = subcommands.add_parser("generate", help="generate text from a training checkpoint")
     generate.add_argument("--checkpoint", type=Path, required=True)
-    generate.add_argument("--tokenizer", type=Path, help="SentencePiece .model used to train this checkpoint")
+    generate.add_argument("--tokenizer", type=Path, help="tokenizer directory or SentencePiece .model")
     generate.add_argument("--prompt", required=True)
     system = generate.add_mutually_exclusive_group()
     system.add_argument("--system-prompt")
@@ -53,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     generate.add_argument("--raw-prompt", action="store_true", help="skip the chat template (useful for base models)")
     generate.add_argument("--raw", action="store_true", help="print only the generated response")
+    inspect_tokenizer = subcommands.add_parser("tokenize", help="inspect token ids and pieces for text")
+    inspect_tokenizer.add_argument("--tokenizer", type=Path, default=Path("data/tokenizer/minimind"))
+    inspect_tokenizer.add_argument("--text", required=True)
+    inspect_tokenizer.add_argument("--add-bos", action="store_true")
+    inspect_tokenizer.add_argument("--add-eos", action="store_true")
     tokenizer = subcommands.add_parser("train-tokenizer", help="train SentencePiece from pretraining JSONL")
     tokenizer.add_argument("--data", type=Path, default=DEFAULT_DATA / "pretrain/pretrain_t2t_mini.jsonl")
     tokenizer.add_argument("--output-prefix", type=Path, default=Path("data/tokenizer/miniscale"))
@@ -62,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     def training_parser(name: str, help_text: str, default_data: Path) -> argparse.ArgumentParser:
         command = subcommands.add_parser(name, help=help_text)
         command.add_argument("--data", type=Path, default=default_data)
-        command.add_argument("--tokenizer", type=Path, default=Path("data/tokenizer/miniscale.model"))
+        command.add_argument("--tokenizer", type=Path, default=Path("data/tokenizer/minimind"))
         command.add_argument("--output", type=Path, default=Path("artifacts") / name)
         command.add_argument("--steps", type=int, required=True)
         command.add_argument("--batch-size", type=int, default=1)
@@ -124,15 +129,37 @@ def main(argv: list[str] | None = None) -> None:
         if arguments.raw:
             print(result["response"])
             return
+    elif arguments.command == "tokenize":
+        tokenizer = load_tokenizer(arguments.tokenizer)
+        token_ids = tokenizer.encode(arguments.text, bos=arguments.add_bos, eos=arguments.add_eos)
+        decoded = tokenizer.decode(token_ids)
+        result = {
+            "tokenizer": str(arguments.tokenizer),
+            "vocab_size": tokenizer.vocab_size,
+            "text": arguments.text,
+            "token_ids": token_ids,
+            "tokens": tokenizer.convert_ids_to_tokens(token_ids),
+            "token_count": len(token_ids),
+            "character_count": len(arguments.text),
+            "characters_per_token": len(arguments.text) / max(len(token_ids), 1),
+            "decoded": decoded,
+            "round_trip": decoded == arguments.text,
+        }
     elif arguments.command == "train-tokenizer":
         result = {"tokenizer": str(train_sentencepiece(
             arguments.data, arguments.output_prefix, vocab_size=arguments.vocab_size,
             input_sentence_size=arguments.input_sentences,
         ))}
     else:
-        tokenizer = SentencePieceTokenizer(arguments.tokenizer)
+        tokenizer = load_tokenizer(arguments.tokenizer)
         if arguments.command == "pretrain":
-            model = MiniScaleForCausalLM(MiniScaleConfig.small_64m(tokenizer.vocab_size, arguments.sequence_length))
+            model = MiniScaleForCausalLM(MiniScaleConfig.small_64m(
+                tokenizer.vocab_size,
+                arguments.sequence_length,
+                pad_token_id=tokenizer.pad_token_id,
+                bos_token_id=tokenizer.bos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            ))
             result = run_pretrain_jsonl(model, tokenizer, arguments.data, arguments.output, PretrainOptions(
                 steps=arguments.steps, batch_size=arguments.batch_size, sequence_length=arguments.sequence_length,
                 learning_rate=arguments.learning_rate, gradient_accumulation_steps=arguments.gradient_accumulation,

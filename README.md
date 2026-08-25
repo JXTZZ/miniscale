@@ -12,7 +12,7 @@ GRPO 目标和工具环境均在本仓库独立实现，不是对上游源码的
 ## 已打通的流水线
 
 ```text
-JSONL 文本 -> SentencePiece -> Pretrain (next-token loss)
+JSONL 文本 -> MiniMind ByteLevel BPE -> Pretrain (next-token loss)
             -> SFT (仅 assistant token loss)
             -> DPO (chosen/rejected + frozen reference)
             -> RLVR/GRPO (可验证数学奖励 + group advantage + clip + reference KL)
@@ -21,8 +21,9 @@ JSONL 文本 -> SentencePiece -> Pretrain (next-token loss)
 ```
 
 模型部分原生 PyTorch 实现了 RMSNorm、RoPE、GQA、SDPA causal attention、SwiGLU、
-tied embeddings。真实训练使用 SentencePiece unigram tokenizer（byte fallback，中文字符不做
-NFKC 改写）；byte tokenizer 只用于不依赖外部数据的 smoke test。
+tied embeddings。真实训练默认使用 MiniMind 已训练好的 6400 词表 Hugging Face tokenizer，
+并直接复用其 chat template、思考标签和工具调用格式；byte tokenizer 只用于 smoke test，
+本仓库训练 SentencePiece 的入口则保留为对照实验。
 
 ## 立即运行
 
@@ -38,7 +39,7 @@ uv run miniscale pipeline --device cpu --output artifacts/run
 ```
 
 有可用 CUDA 时可将 `cpu` 改为 `cuda`。约 64M 参数的默认结构是 20 层、hidden size 512、
-8 个 attention heads、2 个 KV heads、词表 8192、上下文 512。4GB 显存应从 batch size 1
+8 个 attention heads、2 个 KV heads、词表 6400、上下文 512。4GB 显存应从 batch size 1
 开始；发生 OOM 时先把 sequence length 和 rollout group size 调低。
 
 ## 用真实数据运行完整链路
@@ -54,17 +55,32 @@ agent/agent_rl_math.jsonl          带 gt 的数学工具任务
 agent/agent_rl.jsonl               混合 Agent 任务
 ```
 
-先训练 tokenizer。这一步只统计文本和训练分词器，不训练语言模型：
+MiniMind tokenizer 已放在 `data/tokenizer/minimind/`，包含 `tokenizer.json` 和
+`tokenizer_config.json`，不需要重新训练。可以先验证它：
 
 ```bash
-uv run miniscale train-tokenizer \
-  --data data/raw/minimind/pretrain/pretrain_t2t_mini.jsonl \
-  --output-prefix data/tokenizer/miniscale \
-  --vocab-size 8192
+uv run python -c "from miniscale.tokenizer import load_tokenizer; t=load_tokenizer('data/tokenizer/minimind'); print(type(t).__name__, t.vocab_size)"
 ```
 
+预期输出 `HuggingFaceTokenizer 6400`。如果需要做 tokenizer 消融实验，仍可使用
+`miniscale train-tokenizer` 训练独立 SentencePiece 模型，但它产生的 checkpoint 与默认
+MiniMind tokenizer checkpoint 不兼容。
+
+输入任意文本查看 token ID、子词、压缩率和解码结果：
+
+```bash
+uv run miniscale tokenize \
+  --text "你好，中国的首都是北京。MiniScale正在学习Agent RL！" \
+  --add-bos \
+  --add-eos
+```
+
+`round_trip` 应为 `true`；`characters_per_token` 越高表示这段文本压缩得越好，但应在固定的
+中英/代码/数学测试集上比较，而不是只看一个句子。ByteLevel BPE 的 `tokens` 可能显示成
+`ä½łå¥½` 一类内部字节符号，这是正常表示，判断正确性应看 `decoded` 和 `round_trip`。
+
 然后逐阶段运行。下面的步数用于首次端到端实验，不代表最终收敛配置；每个阶段必须使用上个
-阶段的权重和同一个 `miniscale.model`：
+阶段的权重和同一个 `data/tokenizer/minimind/` 目录：
 
 ```bash
 uv run miniscale pretrain --steps 10000 --batch-size 1 \
@@ -122,7 +138,7 @@ checkpoint 路径。
 ```bash
 uv run miniscale generate \
   --checkpoint artifacts/sft/sft.pt \
-  --tokenizer data/tokenizer/miniscale.model \
+  --tokenizer data/tokenizer/minimind \
   --prompt "你好，中国的首都是哪里？" \
   --temperature 0 \
   --max-new-tokens 100
@@ -158,7 +174,7 @@ uv run python generate.py \
 这个小型实现保留了工业界最重要的语义：阶段化 checkpoint、assistant/action masking、
 old/reference policy、可验证 reward、受限工具执行和端到端测试。但真正扩大训练规模前还需要：
 
-- 为现有 SentencePiece/JSONL 数据加入去重、质量过滤、数据配比和评测污染检测；
+- 为现有 BPE/JSONL 数据加入去重、质量过滤、数据配比和评测污染检测；
 - 加入 BF16、gradient checkpointing、FlashAttention、学习率调度、断点续训、FSDP/DeepSpeed；
 - 将 rollout 与 learner 解耦，用 vLLM/SGLang 一类推理服务异步采样，并处理 policy weight 同步；
 - 对工具执行使用进程/容器级 sandbox、超时、资源限额和审计，而不仅是当前的 AST 白名单；

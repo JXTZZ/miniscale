@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from .tokenizer import ByteTokenizer, SentencePieceTokenizer
+from .tokenizer import ByteTokenizer, load_tokenizer
 from .training.common import load_checkpoint, resolve_device
 
 
@@ -34,7 +34,7 @@ def generate_from_checkpoint(
 
     device = resolve_device(options.device)
     model = load_checkpoint(checkpoint_path, device).eval()
-    tokenizer = SentencePieceTokenizer(options.tokenizer_path) if options.tokenizer_path else ByteTokenizer()
+    tokenizer = load_tokenizer(options.tokenizer_path) if options.tokenizer_path else ByteTokenizer()
     if model.config.vocab_size != tokenizer.vocab_size:
         raise ValueError(
             f"checkpoint vocabulary ({model.config.vocab_size}) does not match tokenizer ({tokenizer.vocab_size})"
