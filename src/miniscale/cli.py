@@ -9,6 +9,7 @@ import torch
 
 from .agent_env import CalculatorEnv
 from .config import MiniScaleConfig
+from .data_audit import audit_pretrain_jsonl, save_data_audit
 from .inference import GenerationOptions, generate_from_checkpoint
 from .model import MiniScaleForCausalLM
 from .pipeline import run_training_pipeline
@@ -17,7 +18,8 @@ from .training import (
     AgentRLOptions, DPOOptions, GRPOOptions, PretrainOptions, SFTOptions,
     run_agent_grpo_jsonl, run_dpo_jsonl, run_grpo_jsonl, run_pretrain_jsonl, run_sft_jsonl,
 )
-from .training.common import load_checkpoint
+from .training.common import load_checkpoint, seed_everything
+from .training.pretrain import pretrain_option_default
 
 
 DEFAULT_DATA = Path("data/raw/minimind")
@@ -58,6 +60,19 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_tokenizer.add_argument("--text", required=True)
     inspect_tokenizer.add_argument("--add-bos", action="store_true")
     inspect_tokenizer.add_argument("--add-eos", action="store_true")
+    audit_data = subcommands.add_parser(
+        "audit-pretrain-data", help="fully scan pretraining JSONL and emit a reproducible data report"
+    )
+    audit_data.add_argument("--data", type=Path, default=DEFAULT_DATA / "pretrain/pretrain_t2t_mini.jsonl")
+    audit_data.add_argument("--tokenizer", type=Path, default=Path("data/tokenizer/minimind"))
+    audit_data.add_argument("--output", type=Path)
+    audit_data.add_argument(
+        "--validation-fraction", type=float, default=pretrain_option_default("validation_fraction")
+    )
+    audit_data.add_argument(
+        "--sequence-length", type=int, default=pretrain_option_default("sequence_length")
+    )
+    audit_data.add_argument("--tokenizer-batch-size", type=int, default=4096)
     tokenizer = subcommands.add_parser("train-tokenizer", help="train SentencePiece from pretraining JSONL")
     tokenizer.add_argument("--data", type=Path, default=DEFAULT_DATA / "pretrain/pretrain_t2t_mini.jsonl")
     tokenizer.add_argument("--output-prefix", type=Path, default=Path("data/tokenizer/miniscale"))
@@ -76,27 +91,78 @@ def build_parser() -> argparse.ArgumentParser:
         return command
 
     pretrain = training_parser("pretrain", "pretrain the 64M base model", DEFAULT_DATA / "pretrain/pretrain_t2t_mini.jsonl")
-    pretrain.add_argument("--sequence-length", type=int, default=768)
-    pretrain.add_argument("--gradient-accumulation", type=int, default=16)
-    pretrain.add_argument("--learning-rate", type=float, default=3e-4)
-    pretrain.add_argument("--min-learning-rate", type=float, default=3e-5)
-    pretrain.add_argument("--warmup-steps", type=int, default=200)
-    pretrain.add_argument("--validation-every", type=int, default=200)
-    pretrain.add_argument("--validation-batches", type=int, default=20)
+    pretrain.set_defaults(
+        batch_size=pretrain_option_default("batch_size"),
+        log_every=pretrain_option_default("log_every"),
+    )
+    pretrain.add_argument("--sequence-length", type=int, default=pretrain_option_default("sequence_length"))
+    pretrain.add_argument(
+        "--gradient-accumulation", type=int,
+        default=pretrain_option_default("gradient_accumulation_steps"),
+    )
+    pretrain.add_argument("--learning-rate", type=float, default=pretrain_option_default("learning_rate"))
+    pretrain.add_argument("--min-learning-rate", type=float, default=pretrain_option_default("min_learning_rate"))
+    pretrain.add_argument("--weight-decay", type=float, default=pretrain_option_default("weight_decay"))
+    pretrain.add_argument("--adam-beta1", type=float, default=pretrain_option_default("adam_beta1"))
+    pretrain.add_argument("--adam-beta2", type=float, default=pretrain_option_default("adam_beta2"))
+    pretrain.add_argument("--adam-eps", type=float, default=pretrain_option_default("adam_eps"))
+    pretrain.add_argument("--grad-clip", type=float, default=pretrain_option_default("grad_clip"))
+    pretrain.add_argument("--seed", type=int, default=pretrain_option_default("seed"))
+    pretrain.add_argument(
+        "--precision",
+        choices=("fp32", "bf16"),
+        default=pretrain_option_default("precision"),
+        help="compute precision; bf16 requires a supported CUDA device",
+    )
+    pretrain.add_argument("--warmup-steps", type=int, default=pretrain_option_default("warmup_steps"))
+    pretrain.add_argument("--validation-every", type=int, default=pretrain_option_default("validation_every"))
+    pretrain.add_argument("--validation-batches", type=int, default=pretrain_option_default("validation_batches"))
+    pretrain.add_argument(
+        "--validation-fraction", type=float, default=pretrain_option_default("validation_fraction")
+    )
     pretrain.add_argument("--validation-data", type=Path, help="optional dedicated validation JSONL")
-    pretrain.add_argument("--save-every", type=int, default=500, help="use 0 to disable periodic checkpoints")
-    pretrain.add_argument("--keep-last", type=int, default=3, help="number of periodic checkpoints to retain")
-    pretrain.add_argument("--shuffle-buffer-size", type=int, default=8192, help="use 0 to preserve JSONL order")
-    pretrain.add_argument("--generation-every", type=int, default=1000, help="use 0 to disable generation evaluation")
-    pretrain.add_argument("--generation-max-new-tokens", type=int, default=64)
-    pretrain.add_argument("--wandb", action="store_true", help="log training metrics to Weights & Biases")
-    pretrain.add_argument("--wandb-project", default="MiniScale")
+    pretrain.add_argument(
+        "--save-every", type=int, default=pretrain_option_default("save_every"),
+        help="use 0 to disable periodic checkpoints",
+    )
+    pretrain.add_argument(
+        "--keep-last", type=int, default=pretrain_option_default("keep_last_checkpoints"),
+        help="number of periodic checkpoints to retain",
+    )
+    pretrain.add_argument(
+        "--shuffle-buffer-size", type=int, default=pretrain_option_default("shuffle_buffer_size"),
+        help="use 0 to preserve JSONL order",
+    )
+    pretrain.add_argument(
+        "--generation-every", type=int, default=pretrain_option_default("generation_every"),
+        help="use 0 to disable generation evaluation",
+    )
+    pretrain.add_argument(
+        "--generation-max-new-tokens", type=int,
+        default=pretrain_option_default("generation_max_new_tokens"),
+    )
+    pretrain.add_argument(
+        "--wandb", action="store_true", default=pretrain_option_default("wandb_enabled"),
+        help="log training metrics to Weights & Biases",
+    )
+    pretrain.add_argument("--wandb-project", default=pretrain_option_default("wandb_project"))
     pretrain.add_argument("--wandb-entity")
     pretrain.add_argument("--wandb-run-name")
     pretrain.add_argument("--wandb-run-id", help="explicit W&B id; stored in checkpoints for automatic resume")
-    pretrain.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
+    pretrain.add_argument(
+        "--wandb-mode", choices=("online", "offline", "disabled"),
+        default=pretrain_option_default("wandb_mode"),
+    )
+    pretrain.add_argument(
+        "--wandb-retry-every", type=int, default=pretrain_option_default("wandb_retry_every_steps"),
+        help="retry W&B connection and pending uploads every N training steps",
+    )
     pretrain.add_argument("--resume", type=Path, help="resume from a full training checkpoint")
-    pretrain.add_argument("--num-workers", type=int, default=0)
+    pretrain.add_argument(
+        "--allow-legacy-resume", action="store_true",
+        help="accept a pre-v2 checkpoint without strict data/tokenizer identity checks",
+    )
+    pretrain.add_argument("--num-workers", type=int, default=pretrain_option_default("num_workers"))
     sft = training_parser("sft", "supervised fine-tuning from a pretrain checkpoint", DEFAULT_DATA / "sft/sft_t2t_mini.jsonl")
     sft.add_argument("--checkpoint", type=Path, required=True)
     sft.add_argument("--gradient-accumulation", type=int, default=16)
@@ -160,6 +226,18 @@ def main(argv: list[str] | None = None) -> None:
             "decoded": decoded,
             "round_trip": decoded == arguments.text,
         }
+    elif arguments.command == "audit-pretrain-data":
+        tokenizer = load_tokenizer(arguments.tokenizer)
+        result = audit_pretrain_jsonl(
+            arguments.data,
+            tokenizer,
+            validation_fraction=arguments.validation_fraction,
+            sequence_length=arguments.sequence_length,
+            tokenizer_batch_size=arguments.tokenizer_batch_size,
+        )
+        if arguments.output is not None:
+            save_data_audit(result, arguments.output)
+            result["report"] = str(arguments.output)
     elif arguments.command == "train-tokenizer":
         result = {"tokenizer": str(train_sentencepiece(
             arguments.data, arguments.output_prefix, vocab_size=arguments.vocab_size,
@@ -168,6 +246,10 @@ def main(argv: list[str] | None = None) -> None:
     else:
         tokenizer = load_tokenizer(arguments.tokenizer)
         if arguments.command == "pretrain":
+            # The training function receives an already-created model. Seed
+            # before construction so --seed controls initial weights as well
+            # as data order and later stochastic operations.
+            seed_everything(arguments.seed)
             model = MiniScaleForCausalLM(MiniScaleConfig.small_64m(
                 tokenizer.vocab_size,
                 arguments.sequence_length,
@@ -178,17 +260,23 @@ def main(argv: list[str] | None = None) -> None:
             result = run_pretrain_jsonl(model, tokenizer, arguments.data, arguments.output, PretrainOptions(
                 steps=arguments.steps, batch_size=arguments.batch_size, sequence_length=arguments.sequence_length,
                 learning_rate=arguments.learning_rate, min_learning_rate=arguments.min_learning_rate,
+                weight_decay=arguments.weight_decay,
+                adam_beta1=arguments.adam_beta1, adam_beta2=arguments.adam_beta2, adam_eps=arguments.adam_eps,
+                grad_clip=arguments.grad_clip, seed=arguments.seed, precision=arguments.precision,
                 warmup_steps=arguments.warmup_steps,
                 gradient_accumulation_steps=arguments.gradient_accumulation,
                 log_every=arguments.log_every, validation_every=arguments.validation_every,
-                validation_batches=arguments.validation_batches, save_every=arguments.save_every,
-                keep_last_checkpoints=arguments.keep_last, resume_from=arguments.resume,
+                validation_batches=arguments.validation_batches, validation_fraction=arguments.validation_fraction,
+                save_every=arguments.save_every,
+                keep_last_checkpoints=arguments.keep_last,
                 generation_every=arguments.generation_every,
                 generation_max_new_tokens=arguments.generation_max_new_tokens,
                 shuffle_buffer_size=arguments.shuffle_buffer_size,
                 wandb_enabled=arguments.wandb, wandb_project=arguments.wandb_project,
                 wandb_entity=arguments.wandb_entity, wandb_run_name=arguments.wandb_run_name,
                 wandb_run_id=arguments.wandb_run_id, wandb_mode=arguments.wandb_mode,
+                wandb_retry_every_steps=arguments.wandb_retry_every,
+                resume_from=arguments.resume, allow_legacy_resume=arguments.allow_legacy_resume,
                 num_workers=arguments.num_workers, device=arguments.device,
             ), validation_path=arguments.validation_data)
         else:

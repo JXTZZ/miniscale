@@ -1,41 +1,71 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from contextlib import nullcontext
+from dataclasses import MISSING, asdict, dataclass, fields
+from functools import partial
 import json
 import math
 from pathlib import Path
+import time
+import warnings
 
 import torch
 from torch.utils.data import DataLoader
 
-from miniscale.data import JsonlPretrainDataset, PretrainDataset, collate_lm_batch
+from miniscale.data import (
+    JsonlPretrainDataset,
+    PretrainDataset,
+    collate_lm_batch,
+    reservoir_sample_lm_batches,
+)
+from miniscale.integrity import path_identity, tokenizer_identity
 from miniscale.model import MiniScaleForCausalLM
 from miniscale.tokenizer import ByteTokenizer, Tokenizer
 from miniscale.tracking import WandbTracker
 from .common import (
+    TRAINING_CHECKPOINT_FORMAT_VERSION,
     append_metric,
     evaluate_lm,
     infinite_batches,
-    load_training_checkpoint,
+    read_training_checkpoint,
     resolve_device,
     restore_rng_state,
+    restore_training_checkpoint,
     save_checkpoint,
     save_training_checkpoint,
+    seed_worker,
     seed_everything,
 )
 
 
+PRETRAIN_RESUME_SIGNATURE_VERSION = 2
+PRETRAIN_IMPLEMENTATION_VERSION = 2
+PRETRAIN_INITIALIZATION_SCHEME = "normal_0.02_residual_scaled_1_over_sqrt_2L_v1"
+PRETRAIN_OPTIMIZER_GROUPING = "matrix_weights_decay_norm_embedding_no_decay_v1"
+
+
 @dataclass(slots=True)
 class PretrainOptions:
-    steps: int = 100
-    batch_size: int = 8
-    sequence_length: int = 128
+    """Resolved options for the production JSONL pretraining path.
+
+    CLI defaults are read from this dataclass so library and command-line
+    callers share one source of truth. ``steps`` intentionally has no default:
+    a real training run must always choose its token/update budget explicitly.
+    """
+
+    steps: int
+    batch_size: int = 1
+    sequence_length: int = 768
     learning_rate: float = 3e-4
     weight_decay: float = 0.1
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    adam_eps: float = 1e-8
     grad_clip: float = 1.0
     seed: int = 42
     device: str = "auto"
-    gradient_accumulation_steps: int = 1
+    precision: str = "fp32"
+    gradient_accumulation_steps: int = 16
     log_every: int = 10
     validation_every: int = 200
     validation_batches: int = 20
@@ -54,7 +84,50 @@ class PretrainOptions:
     wandb_run_name: str | None = None
     wandb_run_id: str | None = None
     wandb_mode: str = "online"
+    wandb_retry_every_steps: int = 200
     resume_from: str | Path | None = None
+    allow_legacy_resume: bool = False
+
+
+@dataclass(slots=True)
+class SmokePretrainOptions:
+    """Small in-memory integration settings; not a production recipe."""
+
+    steps: int = 2
+    batch_size: int = 2
+    sequence_length: int = 64
+    learning_rate: float = 3e-4
+    weight_decay: float = 0.1
+    grad_clip: float = 1.0
+    seed: int = 42
+    device: str = "auto"
+
+
+def pretrain_option_default(name: str) -> object:
+    """Return a production option default without constructing fake steps."""
+
+    option = next((field for field in fields(PretrainOptions) if field.name == name), None)
+    if option is None:
+        raise KeyError(f"unknown pretraining option: {name}")
+    if option.default is MISSING:
+        raise ValueError(f"pretraining option has no default: {name}")
+    return option.default
+
+
+def resolve_autocast_dtype(precision: str, device: torch.device) -> torch.dtype | None:
+    if precision == "fp32":
+        return None
+    if precision != "bf16":
+        raise ValueError("precision must be 'fp32' or 'bf16'")
+    if device.type != "cuda" or not torch.cuda.is_bf16_supported():
+        raise RuntimeError("bf16 precision requires a CUDA device with BF16 support")
+    return torch.bfloat16
+
+
+def _autocast_context(device: torch.device, dtype: torch.dtype | None):
+    if dtype is None:
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=dtype)
 
 
 GENERATION_EVAL_PROMPTS: tuple[dict[str, str], ...] = (
@@ -117,8 +190,125 @@ def build_warmup_cosine_scheduler(
     )
 
 
-def _resume_signature(options: PretrainOptions) -> dict[str, object]:
+def build_pretrain_optimizer(
+    model: MiniScaleForCausalLM,
+    options: PretrainOptions,
+) -> torch.optim.AdamW:
+    """Build auditable AdamW groups without decaying norms or embeddings."""
+
+    decay: list[torch.nn.Parameter] = []
+    no_decay: list[torch.nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.ndim >= 2 and name != "embedding.weight":
+            decay.append(parameter)
+        else:
+            no_decay.append(parameter)
+    if not decay or not no_decay:
+        raise ValueError("pretraining optimizer requires non-empty decay and no-decay parameter groups")
+    return torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": options.weight_decay, "group_name": "decay"},
+            {"params": no_decay, "weight_decay": 0.0, "group_name": "no_decay"},
+        ],
+        lr=options.learning_rate,
+        betas=(options.adam_beta1, options.adam_beta2),
+        eps=options.adam_eps,
+    )
+
+
+def _migrate_legacy_single_group_optimizer(
+    payload: dict[str, object],
+    model: MiniScaleForCausalLM,
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, object]:
+    """Map an old model-order AdamW state onto the current named groups."""
+
+    saved_optimizer = payload.get("optimizer")
+    if not isinstance(saved_optimizer, dict):
+        raise ValueError("checkpoint optimizer state must be a mapping")
+    saved_groups = saved_optimizer.get("param_groups")
+    saved_state = saved_optimizer.get("state")
+    if not isinstance(saved_groups, list) or not isinstance(saved_state, dict):
+        raise ValueError("checkpoint optimizer state has invalid groups or state")
+    if len(saved_groups) == len(optimizer.param_groups):
+        return payload
+    if len(saved_groups) != 1 or not isinstance(saved_groups[0], dict):
+        raise ValueError(
+            "legacy optimizer parameter groups cannot be migrated automatically; "
+            f"checkpoint has {len(saved_groups)} groups, expected 1"
+        )
+
+    saved_ids = saved_groups[0].get("params")
+    model_parameters = list(model.parameters())
+    if not isinstance(saved_ids, list) or len(saved_ids) != len(model_parameters):
+        raise ValueError("legacy optimizer parameter order does not match the current model")
+    saved_id_by_parameter = {
+        id(parameter): saved_id for parameter, saved_id in zip(model_parameters, saved_ids, strict=True)
+    }
+
+    current_optimizer = optimizer.state_dict()
+    current_groups = current_optimizer["param_groups"]
+    migrated_state: dict[object, object] = {}
+    migrated_groups: list[dict[str, object]] = []
+    source_group = saved_groups[0]
+    for live_group, serialized_group in zip(optimizer.param_groups, current_groups, strict=True):
+        current_ids = serialized_group["params"]
+        for parameter, current_id in zip(live_group["params"], current_ids, strict=True):
+            saved_id = saved_id_by_parameter[id(parameter)]
+            if saved_id in saved_state:
+                migrated_state[current_id] = saved_state[saved_id]
+        migrated_group = dict(serialized_group)
+        for name, value in source_group.items():
+            if name not in {"params", "weight_decay", "group_name"}:
+                migrated_group[name] = value
+        migrated_groups.append(migrated_group)
+
+    scheduler_state = payload.get("scheduler")
+    migrated_scheduler = dict(scheduler_state) if isinstance(scheduler_state, dict) else scheduler_state
+    if isinstance(migrated_scheduler, dict):
+        group_count = len(migrated_groups)
+        for name in ("base_lrs", "_last_lr", "lr_lambdas"):
+            value = migrated_scheduler.get(name)
+            if isinstance(value, list) and len(value) == 1:
+                migrated_scheduler[name] = value * group_count
+
+    migrated = dict(payload)
+    migrated["optimizer"] = {"state": migrated_state, "param_groups": migrated_groups}
+    migrated["scheduler"] = migrated_scheduler
+    warnings.warn(
+        "migrated legacy single-group AdamW state to decay/no-decay parameter groups",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return migrated
+
+
+def _resume_signature(
+    options: PretrainOptions,
+    model: MiniScaleForCausalLM,
+    tokenizer: Tokenizer,
+    train_path: str | Path,
+    validation_path: str | Path | None,
+    resolved_precision: str,
+) -> dict[str, object]:
+    train_identity = path_identity(train_path)
+    validation_identity: dict[str, object]
+    if validation_path is None:
+        validation_identity = {
+            "mode": "content_hash_split",
+            "fraction": options.validation_fraction,
+            "source": train_identity,
+        }
+    else:
+        dedicated_identity = path_identity(validation_path)
+        if dedicated_identity == train_identity:
+            raise ValueError("dedicated validation data is identical to training data")
+        validation_identity = {"mode": "dedicated_file", "source": dedicated_identity}
     return {
+        "signature_version": PRETRAIN_RESUME_SIGNATURE_VERSION,
+        "implementation_version": PRETRAIN_IMPLEMENTATION_VERSION,
         "total_steps": options.steps,
         "batch_size": options.batch_size,
         "sequence_length": options.sequence_length,
@@ -126,24 +316,152 @@ def _resume_signature(options: PretrainOptions) -> dict[str, object]:
         "learning_rate": options.learning_rate,
         "min_learning_rate": options.min_learning_rate,
         "warmup_steps": options.warmup_steps,
+        "weight_decay": options.weight_decay,
+        "adam_beta1": options.adam_beta1,
+        "adam_beta2": options.adam_beta2,
+        "adam_eps": options.adam_eps,
+        "grad_clip": options.grad_clip,
         "shuffle_buffer_size": options.shuffle_buffer_size,
+        "num_workers": options.num_workers,
+        "validation_fraction": options.validation_fraction,
+        "validation_every": options.validation_every,
+        "validation_batches": options.validation_batches,
+        "validation_sampling": "fixed_reservoir_v1",
         "seed": options.seed,
+        "precision": resolved_precision,
+        "parameter_initialization": PRETRAIN_INITIALIZATION_SCHEME,
+        "optimizer_parameter_groups": PRETRAIN_OPTIMIZER_GROUPING,
+        "world_size": 1,
+        "model": asdict(model.config),
+        "tokenizer": tokenizer_identity(tokenizer),
+        "train_data": train_identity,
+        "validation_data": validation_identity,
     }
 
 
-def _validate_resume_signature(saved: object, current: dict[str, object]) -> None:
+def _signature_differences(saved: object, current: object, prefix: str = "") -> dict[str, tuple[object, object]]:
+    if isinstance(saved, dict) and isinstance(current, dict):
+        differences: dict[str, tuple[object, object]] = {}
+        for name in sorted(set(saved) | set(current)):
+            path = f"{prefix}.{name}" if prefix else str(name)
+            if name not in saved:
+                differences[path] = ("<missing>", current[name])
+            elif name not in current:
+                differences[path] = (saved[name], "<missing>")
+            else:
+                differences.update(_signature_differences(saved[name], current[name], path))
+        return differences
+    return {} if saved == current else {prefix: (saved, current)}
+
+
+def _validate_resume_signature(
+    saved: object,
+    current: dict[str, object],
+    *,
+    allow_legacy: bool = False,
+) -> None:
     if not isinstance(saved, dict):
         raise ValueError("checkpoint resume_signature must be a mapping")
-    # Older checkpoints do not contain newly introduced data-order fields.
-    # Validate every field they did record, while allowing new fields to use
-    # their current defaults during a one-time migration.
-    mismatches = {
-        name: (value, current.get(name))
-        for name, value in saved.items()
-        if name not in current or current[name] != value
-    }
+    if saved.get("signature_version") != PRETRAIN_RESUME_SIGNATURE_VERSION:
+        if not allow_legacy:
+            raise ValueError(
+                "checkpoint predates strict resume identity checks; pass "
+                "--allow-legacy-resume once to accept the documented migration risk"
+            )
+        warnings.warn(
+            "resuming a legacy checkpoint without verified data/tokenizer/model identity; "
+            "the next checkpoint will be upgraded to the current format",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        comparable = {
+            name: value
+            for name, value in saved.items()
+            if name in current and name not in {"signature_version", "implementation_version"}
+        }
+        mismatches = _signature_differences(comparable, {name: current[name] for name in comparable})
+    else:
+        mismatches = _signature_differences(saved, current)
     if mismatches:
         raise ValueError(f"resume options do not match checkpoint: {mismatches}")
+
+
+def _resolved_options(options: PretrainOptions) -> dict[str, object]:
+    return {
+        name: str(value) if isinstance(value, Path) else value
+        for name, value in asdict(options).items()
+        if name not in {"allow_legacy_resume", "resume_from"}
+    }
+
+
+def _write_run_manifest(
+    path: Path,
+    *,
+    model: MiniScaleForCausalLM,
+    options: PretrainOptions,
+    resume_signature: dict[str, object],
+    train_path: str | Path,
+    validation_path: str | Path | None,
+    resumed_step: int,
+    resolved_precision: str,
+) -> None:
+    manifest = {
+        "schema_version": 1,
+        "stage": "pretrain",
+        "checkpoint_format_version": TRAINING_CHECKPOINT_FORMAT_VERSION,
+        "implementation_version": PRETRAIN_IMPLEMENTATION_VERSION,
+        "parameter_initialization": PRETRAIN_INITIALIZATION_SCHEME,
+        "optimizer_parameter_groups": PRETRAIN_OPTIMIZER_GROUPING,
+        "model": asdict(model.config),
+        "num_parameters": model.num_parameters,
+        "training": _resolved_options(options),
+        "resolved_precision": resolved_precision,
+        "derived": {
+            "world_size": 1,
+            "global_batch_sequences": options.batch_size * options.gradient_accumulation_steps,
+            "input_tokens_per_update": (
+                options.batch_size * options.gradient_accumulation_steps * options.sequence_length
+            ),
+            "target_tokens_per_update": (
+                options.batch_size
+                * options.gradient_accumulation_steps
+                * (options.sequence_length - 1)
+            ),
+            "planned_input_tokens": (
+                options.steps
+                * options.batch_size
+                * options.gradient_accumulation_steps
+                * options.sequence_length
+            ),
+            "planned_target_tokens": (
+                options.steps
+                * options.batch_size
+                * options.gradient_accumulation_steps
+                * (options.sequence_length - 1)
+            ),
+            "warmup_ratio": min(options.warmup_steps, options.steps) / options.steps,
+            "tokens_per_parameter": (
+                options.steps
+                * options.batch_size
+                * options.gradient_accumulation_steps
+                * options.sequence_length
+                / model.num_parameters
+            ),
+        },
+        "inputs": {
+            "train": str(Path(train_path).resolve()),
+            "validation": str(Path(validation_path).resolve()) if validation_path else None,
+        },
+        "resume": {
+            "checkpoint": str(Path(options.resume_from).resolve()) if options.resume_from else None,
+            "completed_step": resumed_step,
+        },
+        "resume_identity": resume_signature,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def _prune_periodic_checkpoints(checkpoint_dir: Path, keep_last: int) -> None:
@@ -175,6 +493,7 @@ def run_generation_evaluation(
     step: int,
     device: torch.device,
     max_new_tokens: int,
+    autocast_dtype: torch.dtype | None = None,
 ) -> Path:
     """Generate fixed multilingual probes with deterministic greedy decoding."""
 
@@ -187,14 +506,15 @@ def run_generation_evaluation(
             if len(prompt_ids) >= model.config.max_position_embeddings:
                 prompt_ids = prompt_ids[-(model.config.max_position_embeddings - 1) :]
             input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-            generated = model.generate(
-                input_ids,
-                max_new_tokens=max_new_tokens,
-                temperature=0.0,
-                top_k=None,
-                eos_token_id=tokenizer.eos_token_id,
-                do_sample=False,
-            )
+            with _autocast_context(device, autocast_dtype):
+                generated = model.generate(
+                    input_ids,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    top_k=None,
+                    eos_token_id=tokenizer.eos_token_id,
+                    do_sample=False,
+                )
             completion_ids = generated[0, len(prompt_ids) :].tolist()
             samples.append({
                 **probe,
@@ -230,9 +550,16 @@ def run_pretrain(
     tokenizer: ByteTokenizer,
     texts: list[str],
     output_dir: str | Path,
-    options: PretrainOptions | None = None,
+    options: SmokePretrainOptions | None = None,
 ) -> dict[str, float | str]:
-    options = options or PretrainOptions()
+    """Run the deliberately tiny in-memory smoke path.
+
+    Production callers should use :func:`run_pretrain_jsonl`; keeping a
+    separate options type prevents smoke defaults from becoming an accidental
+    real training recipe.
+    """
+
+    options = options or SmokePretrainOptions()
     if options.steps < 1:
         raise ValueError("steps must be positive")
     seed_everything(options.seed)
@@ -245,7 +572,8 @@ def run_pretrain(
         dataset,
         batch_size=options.batch_size,
         shuffle=True,
-        collate_fn=lambda rows: collate_lm_batch(rows, tokenizer.pad_token_id),
+        collate_fn=partial(collate_lm_batch, pad_token_id=tokenizer.pad_token_id),
+        generator=torch.Generator().manual_seed(options.seed),
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -287,20 +615,85 @@ def run_pretrain_jsonl(
     options: PretrainOptions,
     validation_path: str | Path | None = None,
 ) -> dict[str, float | str]:
+    """Train an already-initialized model on a production JSONL stream.
+
+    The CLI seeds before model construction. Library callers that need
+    reproducible from-scratch initialization must do the same before creating
+    ``model``; this function seeds data order and subsequent operations.
+    """
+
     if options.steps < 1:
         raise ValueError("steps must be positive")
+    if options.batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if options.sequence_length < 2:
+        raise ValueError("sequence_length must be at least 2")
+    if options.sequence_length > model.config.max_position_embeddings:
+        raise ValueError("sequence_length exceeds the model context length")
     if options.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
+    if options.log_every < 1:
+        raise ValueError("log_every must be positive")
     if options.validation_every < 1 or options.validation_batches < 1:
         raise ValueError("validation_every and validation_batches must be positive")
+    if not 0 <= options.validation_fraction < 1:
+        raise ValueError("validation_fraction must be in [0, 1)")
     if options.save_every < 0 or options.keep_last_checkpoints < 1:
         raise ValueError("save_every must be non-negative and keep_last_checkpoints must be positive")
     if options.generation_every < 0 or options.generation_max_new_tokens < 1:
         raise ValueError("generation_every must be non-negative and generation_max_new_tokens must be positive")
     if options.shuffle_buffer_size < 0:
         raise ValueError("shuffle_buffer_size must be non-negative")
+    if options.num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
+    if options.learning_rate <= 0 or options.min_learning_rate < 0:
+        raise ValueError("learning rates must be non-negative and peak learning_rate must be positive")
+    if options.weight_decay < 0 or options.grad_clip <= 0 or options.adam_eps <= 0:
+        raise ValueError("weight_decay must be non-negative; grad_clip and adam_eps must be positive")
+    if not 0 <= options.adam_beta1 < 1 or not 0 <= options.adam_beta2 < 1:
+        raise ValueError("Adam beta values must be in [0, 1)")
+    if options.wandb_retry_every_steps < 1:
+        raise ValueError("wandb_retry_every_steps must be positive")
+    if model.config.vocab_size != tokenizer.vocab_size:
+        raise ValueError("model vocabulary does not match tokenizer")
+    special_ids = {
+        "pad_token_id": tokenizer.pad_token_id,
+        "bos_token_id": tokenizer.bos_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+    special_mismatches = {
+        name: (getattr(model.config, name), value)
+        for name, value in special_ids.items()
+        if getattr(model.config, name) != value
+    }
+    if special_mismatches:
+        raise ValueError(f"model special token ids do not match tokenizer: {special_mismatches}")
+
+    output = Path(output_dir)
+    metrics_path = output / "pretrain_metrics.jsonl"
+    checkpoint_dir = output / "checkpoints"
+    manifest_path = output / "pretrain_run.json"
+    if options.resume_from is None:
+        existing = [path for path in (metrics_path, output / "best.pt", output / "final.pt") if path.exists()]
+        existing.extend(checkpoint_dir.glob("*.pt") if checkpoint_dir.exists() else ())
+        if existing:
+            raise FileExistsError(
+                f"output already contains pretraining artifacts ({existing[0]}); "
+                "choose a new --output or use --resume"
+            )
+
     seed_everything(options.seed)
     device = resolve_device(options.device)
+    autocast_dtype = resolve_autocast_dtype(options.precision, device)
+    resolved_precision = "bf16" if autocast_dtype is torch.bfloat16 else "fp32"
+    resume_signature = _resume_signature(
+        options,
+        model,
+        tokenizer,
+        train_path,
+        validation_path,
+        resolved_precision,
+    )
     model.to(device).train()
     train_dataset = JsonlPretrainDataset(
         train_path, tokenizer, options.sequence_length, split="train",
@@ -308,46 +701,67 @@ def run_pretrain_jsonl(
         shuffle_buffer_size=options.shuffle_buffer_size,
         seed=options.seed,
     )
-    collate = lambda rows: collate_lm_batch(rows, tokenizer.pad_token_id)
-    loader = DataLoader(train_dataset, batch_size=options.batch_size, collate_fn=collate, num_workers=options.num_workers)
-    validation_loader = None
+    collate = partial(collate_lm_batch, pad_token_id=tokenizer.pad_token_id)
+    train_generator = torch.Generator().manual_seed(options.seed)
+    loader = DataLoader(
+        train_dataset,
+        batch_size=options.batch_size,
+        collate_fn=collate,
+        num_workers=options.num_workers,
+        worker_init_fn=seed_worker if options.num_workers else None,
+        generator=train_generator,
+        drop_last=True,
+    )
+    validation_dataset = None
     if validation_path or options.validation_fraction > 0:
-        validation_loader = DataLoader(
-            JsonlPretrainDataset(
-                validation_path or train_path, tokenizer, options.sequence_length,
-                split="all" if validation_path else "validation",
-                validation_fraction=options.validation_fraction,
-            ),
-            batch_size=options.batch_size,
-            collate_fn=collate,
+        validation_dataset = JsonlPretrainDataset(
+            validation_path or train_path,
+            tokenizer,
+            options.sequence_length,
+            split="all" if validation_path else "validation",
+            validation_fraction=options.validation_fraction,
         )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=options.learning_rate, weight_decay=options.weight_decay, betas=(0.9, 0.95))
+    optimizer = build_pretrain_optimizer(model, options)
     scheduler = build_warmup_cosine_scheduler(
         optimizer,
         total_steps=options.steps,
         warmup_steps=options.warmup_steps,
         min_learning_rate=options.min_learning_rate,
     )
-    output = Path(output_dir)
-    metrics_path = output / "pretrain_metrics.jsonl"
-    checkpoint_dir = output / "checkpoints"
     last_loss = float("nan")
     tokens_seen = 0
+    target_tokens_seen = 0
     completed_step = 0
     micro_batches_seen = 0
     best_val_loss = float("inf")
     saved_wandb_run_id: str | None = None
     last_metrics: dict[str, float] = {"loss": last_loss, "tokens_seen": float(tokens_seen)}
+    payload: dict[str, object] | None = None
     if options.resume_from is not None:
-        payload = load_training_checkpoint(options.resume_from, model, optimizer, scheduler, device)
+        payload = read_training_checkpoint(options.resume_from, device)
         state = payload["training_state"]
         if not isinstance(state, dict):
             raise ValueError("checkpoint training_state must be a mapping")
         saved_signature = state.get("resume_signature")
-        _validate_resume_signature(saved_signature, _resume_signature(options))
+        _validate_resume_signature(
+            saved_signature,
+            resume_signature,
+            allow_legacy=options.allow_legacy_resume,
+        )
+        if not isinstance(saved_signature, dict) or (
+            saved_signature.get("signature_version") != PRETRAIN_RESUME_SIGNATURE_VERSION
+        ):
+            payload = _migrate_legacy_single_group_optimizer(payload, model, optimizer)
+        restore_training_checkpoint(payload, model, optimizer, scheduler, restore_rng=False)
         completed_step = int(payload["step"])
         tokens_seen = int(state.get("tokens_seen", 0))
         micro_batches_seen = int(state.get("micro_batches_seen", completed_step * options.gradient_accumulation_steps))
+        target_tokens_seen = int(
+            state.get(
+                "target_tokens_seen",
+                max(tokens_seen - micro_batches_seen * options.batch_size, 0),
+            )
+        )
         best_val_loss = float(state.get("best_val_loss", payload.get("best_val_loss", float("inf"))))
         if state.get("wandb_run_id") is not None:
             saved_wandb_run_id = str(state["wandb_run_id"])
@@ -364,11 +778,32 @@ def run_pretrain_jsonl(
     # Constructing/skipping DataLoader iterators can consume RNG. Restore the
     # exact post-checkpoint RNG state after positioning the data stream.
     if options.resume_from is not None:
+        assert payload is not None
         restore_rng_state(payload.get("rng_state"))
+
+    validation_loader = None
+    if validation_dataset is not None:
+        validation_loader = reservoir_sample_lm_batches(
+            validation_dataset,
+            batch_size=options.batch_size,
+            batches=options.validation_batches,
+            pad_token_id=tokenizer.pad_token_id,
+            seed=options.seed + 1,
+        )
 
     if options.wandb_run_id and saved_wandb_run_id and options.wandb_run_id != saved_wandb_run_id:
         raise ValueError("--wandb-run-id does not match the run id stored in the checkpoint")
     output.mkdir(parents=True, exist_ok=True)
+    _write_run_manifest(
+        manifest_path,
+        model=model,
+        options=options,
+        resume_signature=resume_signature,
+        train_path=train_path,
+        validation_path=validation_path,
+        resumed_step=completed_step,
+        resolved_precision=resolved_precision,
+    )
     tracker = WandbTracker.start(
         enabled=options.wandb_enabled,
         project=options.wandb_project,
@@ -383,61 +818,102 @@ def run_pretrain_jsonl(
             "output": str(output),
             "num_parameters": model.num_parameters,
             "model": asdict(model.config),
-            "training": {
-                name: str(value) if isinstance(value, Path) else value
-                for name, value in asdict(options).items()
-                if name not in {"wandb_run_id", "resume_from"}
-            },
+            "training": _resolved_options(options),
+            "resume_identity": resume_signature,
+            "manifest": str(manifest_path),
         },
         directory=output,
+        retry_every_steps=options.wandb_retry_every_steps,
+        initial_step=completed_step,
     )
     wandb_run_id = tracker.run_id if tracker is not None else saved_wandb_run_id
 
     def training_state() -> dict[str, object]:
         return {
             "tokens_seen": tokens_seen,
+            "target_tokens_seen": target_tokens_seen,
             "micro_batches_seen": micro_batches_seen,
             "best_val_loss": best_val_loss,
             "wandb_run_id": wandb_run_id,
-            "resume_signature": _resume_signature(options),
+            "resolved_options": _resolved_options(options),
+            "resume_signature": resume_signature,
         }
 
     try:
         for step in range(completed_step + 1, options.steps + 1):
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+                torch.cuda.synchronize(device)
+            update_started = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
-            micro_losses: list[float] = []
+            loss_times_targets = 0.0
             step_tokens = 0
+            step_target_tokens = 0
             current_lr = float(optimizer.param_groups[0]["lr"])
-            for _ in range(options.gradient_accumulation_steps):
+            for micro_step in range(1, options.gradient_accumulation_steps + 1):
                 batch = {name: value.to(device) for name, value in next(batches).items()}
-                result = model(**batch)
+                with _autocast_context(device, autocast_dtype):
+                    result = model(**batch)
                 if result.loss is None:
                     raise RuntimeError("model did not return a pretraining loss")
+                if not bool(torch.isfinite(result.loss)):
+                    raise FloatingPointError(
+                        f"non-finite pretraining loss at optimizer step {step}, micro step {micro_step}: "
+                        f"{float(result.loss.detach())}"
+                    )
+                target_count = int((batch["labels"][:, 1:] != -100).sum())
+                if target_count < 1:
+                    raise RuntimeError("pretraining micro batch contains no supervised next-token targets")
                 (result.loss / options.gradient_accumulation_steps).backward()
-                micro_losses.append(float(result.loss.detach()))
+                loss_times_targets += float(result.loss.detach()) * target_count
                 step_tokens += int(batch["attention_mask"].sum())
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), options.grad_clip)
+                step_target_tokens += target_count
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), options.grad_clip, error_if_nonfinite=True
+            )
             optimizer.step()
             scheduler.step()
+            if device.type == "cuda":
+                # CUDA kernels are asynchronous; synchronize before deriving
+                # throughput so the metric measures completed update work.
+                torch.cuda.synchronize(device)
+            update_seconds = time.perf_counter() - update_started
             completed_step = step
             micro_batches_seen += options.gradient_accumulation_steps
             tokens_seen += step_tokens
-            last_loss = sum(micro_losses) / len(micro_losses)
+            target_tokens_seen += step_target_tokens
+            last_loss = loss_times_targets / step_target_tokens
             metric: dict[str, object] = {
                 "stage": "pretrain", "step": step, "tokens_seen": tokens_seen,
+                "target_tokens_seen": target_tokens_seen,
                 "train_loss": last_loss, "learning_rate": current_lr,
                 "grad_norm": float(grad_norm),
+                "grad_was_clipped": bool(float(grad_norm) > options.grad_clip),
+                "update_seconds": update_seconds,
+                "tokens_per_second": step_tokens / max(update_seconds, 1e-12),
+                "samples_per_second": (
+                    options.batch_size * options.gradient_accumulation_steps / max(update_seconds, 1e-12)
+                ),
             }
+            if device.type == "cuda":
+                metric["cuda_peak_memory_mb"] = torch.cuda.max_memory_allocated(device) / 2**20
             validation_due = validation_loader is not None and (
                 step % options.validation_every == 0 or step == options.steps
             )
             if validation_due:
-                val_loss = evaluate_lm(model, validation_loader, device, options.validation_batches)
+                val_loss = evaluate_lm(
+                    model,
+                    validation_loader,
+                    device,
+                    options.validation_batches,
+                    autocast_dtype=autocast_dtype,
+                )
                 metric["validation_loss"] = val_loss
                 metric["perplexity"] = math.exp(val_loss) if val_loss < 709.0 else float("inf")
             last_metrics = {
                 "loss": last_loss,
                 "tokens_seen": float(tokens_seen),
+                "target_tokens_seen": float(target_tokens_seen),
                 "learning_rate": current_lr,
                 "best_val_loss": best_val_loss,
             }
@@ -471,6 +947,7 @@ def run_pretrain_jsonl(
                     step=step,
                     device=device,
                     max_new_tokens=options.generation_max_new_tokens,
+                    autocast_dtype=autocast_dtype,
                 )
                 print(f"saved generation evaluation: {generation_path}", flush=True)
             log_due = (
@@ -517,6 +994,7 @@ def run_pretrain_jsonl(
     metrics = {
         "loss": last_loss,
         "tokens_seen": float(tokens_seen),
+        "target_tokens_seen": float(target_tokens_seen),
         "learning_rate": last_metrics["learning_rate"],
         "best_val_loss": best_val_loss,
     }
@@ -536,6 +1014,7 @@ def run_pretrain_jsonl(
         **metrics,
         "checkpoint": str(checkpoint),
         "metrics": str(metrics_path),
+        "manifest": str(manifest_path),
         "device": str(device),
     }
     if wandb_run_id is not None:

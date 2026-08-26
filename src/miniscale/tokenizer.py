@@ -14,6 +14,7 @@ class Tokenizer(Protocol):
     vocab_size: int
 
     def encode(self, text: str, *, bos: bool = False, eos: bool = False) -> list[int]: ...
+    def encode_batch(self, texts: Sequence[str], *, bos: bool = False, eos: bool = False) -> list[list[int]]: ...
     def decode(self, ids: Iterable[int], *, skip_special_tokens: bool = True) -> str: ...
     def convert_ids_to_tokens(self, ids: Iterable[int]) -> list[str]: ...
     def format_messages(self, messages: Sequence[dict[str, object]], *, generation_prompt: bool = False) -> str: ...
@@ -72,6 +73,9 @@ class ByteTokenizer(ChatTemplateMixin):
             ids.append(self.eos_token_id)
         return ids
 
+    def encode_batch(self, texts: Sequence[str], *, bos: bool = False, eos: bool = False) -> list[list[int]]:
+        return [self.encode(text, bos=bos, eos=eos) for text in texts]
+
     def decode(self, ids: Iterable[int], *, skip_special_tokens: bool = True) -> str:
         payload = bytearray()
         for token_id in ids:
@@ -109,6 +113,9 @@ class SentencePieceTokenizer(ChatTemplateMixin):
         if eos:
             ids.append(self.eos_token_id)
         return ids
+
+    def encode_batch(self, texts: Sequence[str], *, bos: bool = False, eos: bool = False) -> list[list[int]]:
+        return [self.encode(text, bos=bos, eos=eos) for text in texts]
 
     def decode(self, ids: Iterable[int], *, skip_special_tokens: bool = True) -> str:
         values = [int(token_id) for token_id in ids]
@@ -158,6 +165,23 @@ class HuggingFaceTokenizer:
         if eos and (not ids or ids[-1] != self.eos_token_id):
             ids.append(self.eos_token_id)
         return ids
+
+    def encode_batch(self, texts: Sequence[str], *, bos: bool = False, eos: bool = False) -> list[list[int]]:
+        encoded = self.processor(
+            list(texts),
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )["input_ids"]
+        rows: list[list[int]] = []
+        for raw_ids in encoded:
+            ids = [int(token_id) for token_id in raw_ids]
+            if bos and (not ids or ids[0] != self.bos_token_id):
+                ids.insert(0, self.bos_token_id)
+            if eos and (not ids or ids[-1] != self.eos_token_id):
+                ids.append(self.eos_token_id)
+            rows.append(ids)
+        return rows
 
     def decode(self, ids: Iterable[int], *, skip_special_tokens: bool = True) -> str:
         return self.processor.decode(

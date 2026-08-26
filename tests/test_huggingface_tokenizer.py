@@ -36,6 +36,10 @@ class HuggingFaceTokenizerTests(unittest.TestCase):
         self.assertEqual((tokenizer.pad_token_id, tokenizer.bos_token_id, tokenizer.eos_token_id), (0, 1, 2))
         self.assertEqual(tokenizer.decode(tokenizer.encode(text)), text)
         self.assertIsInstance(load_tokenizer(TOKENIZER_DIR / "tokenizer.json"), HuggingFaceTokenizer)
+        texts = ["你好", "MiniScale"]
+        self.assertEqual(tokenizer.encode_batch(texts, bos=True, eos=True), [
+            tokenizer.encode(text, bos=True, eos=True) for text in texts
+        ])
 
     def test_chat_template_and_sft_mask_match_minimind(self) -> None:
         tokenizer = HuggingFaceTokenizer(TOKENIZER_DIR)

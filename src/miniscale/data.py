@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 import json
 import hashlib
@@ -11,6 +11,13 @@ from torch import Tensor
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from .tokenizer import ByteTokenizer, Tokenizer
+
+
+def is_validation_text(text: str, validation_fraction: float) -> bool:
+    if not 0 <= validation_fraction < 1:
+        raise ValueError("validation_fraction must be in [0, 1)")
+    bucket = int.from_bytes(hashlib.blake2b(text.encode(), digest_size=8).digest(), "big") / 2**64
+    return bucket < validation_fraction
 
 
 class PretrainDataset(Dataset[dict[str, Tensor]]):
@@ -105,6 +112,10 @@ class JsonlPretrainDataset(IterableDataset[dict[str, Tensor]]):
         self.shuffle_buffer_size = shuffle_buffer_size
         self.seed = seed
         self._iteration = 0
+        if split not in {"all", "train", "validation"}:
+            raise ValueError("split must be 'all', 'train', or 'validation'")
+        if not 0 <= validation_fraction < 1:
+            raise ValueError("validation_fraction must be in [0, 1)")
         if shuffle_buffer_size < 0:
             raise ValueError("shuffle_buffer_size must be non-negative")
 
@@ -142,8 +153,7 @@ class JsonlPretrainDataset(IterableDataset[dict[str, Tensor]]):
             if not isinstance(text, str) or not text:
                 continue
             if self.split != "all":
-                bucket = int.from_bytes(hashlib.blake2b(text.encode(), digest_size=8).digest(), "big") / 2**64
-                is_validation = bucket < self.validation_fraction
+                is_validation = is_validation_text(text, self.validation_fraction)
                 if (self.split == "validation") != is_validation:
                     continue
             buffer.extend(self.tokenizer.encode(text, bos=True, eos=True))
@@ -197,6 +207,37 @@ def collate_lm_batch(examples: Sequence[dict[str, Tensor]], pad_token_id: int = 
         "labels": torch.stack(label_rows),
         "attention_mask": torch.stack(masks),
     }
+
+
+def reservoir_sample_lm_batches(
+    examples: Iterable[dict[str, Tensor]],
+    *,
+    batch_size: int,
+    batches: int,
+    pad_token_id: int,
+    seed: int,
+) -> list[dict[str, Tensor]]:
+    """Build a deterministic fixed validation set sampled across a full stream."""
+
+    if batch_size < 1 or batches < 1:
+        raise ValueError("batch_size and batches must be positive")
+    capacity = batch_size * batches
+    rng = random.Random(seed)
+    reservoir: list[dict[str, Tensor]] = []
+    for index, example in enumerate(examples):
+        if index < capacity:
+            reservoir.append(example)
+            continue
+        replacement = rng.randrange(index + 1)
+        if replacement < capacity:
+            reservoir[replacement] = example
+    if not reservoir:
+        raise ValueError("validation corpus produced no packed examples")
+    rng.shuffle(reservoir)
+    return [
+        collate_lm_batch(reservoir[start : start + batch_size], pad_token_id)
+        for start in range(0, len(reservoir), batch_size)
+    ]
 
 
 def F_pad(tensor: Tensor, right: int, value: int) -> Tensor:

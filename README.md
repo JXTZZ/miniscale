@@ -39,7 +39,8 @@ uv run miniscale pipeline --device cpu --output artifacts/run
 ```
 
 有可用 CUDA 时可将 `cpu` 改为 `cuda`。约 64M 参数的默认结构是 20 层、hidden size 512、
-8 个 attention heads、2 个 KV heads、词表 6400、上下文 512。4GB 显存应从 batch size 1
+8 个 attention heads、2 个 KV heads、词表 6400；正式 CLI 默认上下文 768，并按命令中的
+`--sequence-length` 构造模型。4GB 显存应从 batch size 1
 开始；发生 OOM 时先把 sequence length 和 rollout group size 调低。
 
 ## 用真实数据运行完整链路
@@ -82,12 +83,25 @@ uv run miniscale tokenize \
 然后逐阶段运行。下面的步数用于首次端到端实验，不代表最终收敛配置；每个阶段必须使用上个
 阶段的权重和同一个 `data/tokenizer/minimind/` 目录：
 
+正式预训练前建议先完整扫描语料。报告会给出内容指纹、有效/异常行、exact duplicate、真实 token
+总量、稳定 train/validation 切分和 packing 利用率，但不会静默删除数据：
+
+```bash
+uv run miniscale audit-pretrain-data \
+  --data data/raw/minimind/pretrain/pretrain_t2t_mini.jsonl \
+  --tokenizer data/tokenizer/minimind \
+  --sequence-length 768 \
+  --output artifacts/data-audit.json
+```
+
 ```bash
 uv run miniscale pretrain --steps 10000 --batch-size 1 \
   --gradient-accumulation 16 --sequence-length 768 \
+  --precision bf16 \
   --learning-rate 3e-4 --min-learning-rate 3e-5 \
   --warmup-steps 200 --save-every 500 --keep-last 3 \
-  --validation-every 200 --generation-every 1000 \
+  --validation-every 200 --validation-batches 100 \
+  --generation-every 1000 \
   --shuffle-buffer-size 8192 \
   --output artifacts/pretrain
 
@@ -122,12 +136,14 @@ artifacts/pretrain/
 ├── generations/
 │   └── step_xxxxxxxx.json
 ├── pretrain_metrics.jsonl
+├── pretrain_run.json
 ├── best.pt
 └── final.pt
 ```
 
 `best.pt`、`final.pt` 和周期 checkpoint 都包含模型、AdamW、scheduler、step、token 计数、
-`best_val_loss` 及 Python/PyTorch/CUDA RNG 状态，可以用于断点续训。`keep_last` 只清理周期
+`best_val_loss` 及 Python/NumPy/PyTorch/CUDA RNG 状态，可以用于断点续训。`pretrain_run.json`
+保存解析后的完整 recipe、模型配置和数据/tokenizer 内容指纹。`keep_last` 只清理周期
 checkpoint，不会删除 `best.pt`、`final.pt` 或 generations。按 `Ctrl+C` 时还会写入
 `emergency_step_XXXXXXXX.pt` 后再退出。完整 checkpoint 通常约 700–800MB，请预留磁盘空间。
 
@@ -137,9 +153,11 @@ checkpoint，不会删除 `best.pt`、`final.pt` 或 generations。按 `Ctrl+C` 
 ```bash
 uv run miniscale pretrain --steps 10000 --batch-size 1 \
   --gradient-accumulation 16 --sequence-length 768 \
+  --precision bf16 \
   --learning-rate 3e-4 --min-learning-rate 3e-5 \
   --warmup-steps 200 --save-every 500 --keep-last 3 \
-  --validation-every 200 --generation-every 1000 \
+  --validation-every 200 --validation-batches 100 \
+  --generation-every 1000 \
   --resume artifacts/pretrain/checkpoints/step_00000500.pt \
   --output artifacts/pretrain
 ```
@@ -150,6 +168,17 @@ RNG 都从断点恢复，因此 warmup/cosine schedule 会从原位置继续。�
 `pretrain.pt` 没有 optimizer/scheduler 状态，不能用 `--resume`；但仍可用于生成或作为后续
 SFT 的初始权重。
 
+新版 checkpoint 会在加载任何训练状态前严格校验数据、tokenizer、模型和所有影响训练轨迹的
+参数。旧版完整 checkpoint 缺少这些指纹，需要人工确认输入未变后，在第一次迁移时增加
+`--allow-legacy-resume`；之后保存的新 checkpoint 不再需要该参数。完整格式和迁移约定见
+[`docs/checkpointing.md`](docs/checkpointing.md)。新训练也不能直接复用已有产物的输出目录；应使用
+新目录或显式 `--resume`，避免悄悄拼接 metrics 或覆盖 checkpoint。
+
+默认精度是 FP32。上例中的 BF16 必须由支持 BF16 的 CUDA GPU 显式启用；它使用 autocast，但模型
+参数与 AdamW state 仍为 FP32，也不使用 GradScaler。不支持的硬件会在训练前明确失败。优化器只对
+Linear matrix weights 使用 weight decay，RMSNorm 与 tied embedding/lm head 不衰减；残差输出投影按
+层数缩放初始化。完整训练语义见 [`docs/pretraining.md`](docs/pretraining.md)。
+
 ### 流式数据顺序
 
 预训练 JSONL 使用 `IterableDataset`，不能直接给 DataLoader 设置 `shuffle=True`。训练集默认用
@@ -159,7 +188,9 @@ SFT 的初始权重。
 
 内置 validation split 是稳定的 hash 切分，适合纵向比较；如果准备了覆盖中文、英文、代码等
 类别的独立 held-out JSONL，建议通过 `--validation-data data/eval/pretrain_validation.jsonl`
-传入，它会比只读取大文件前部的 validation batch 更有代表性。
+传入。无论使用内置 split 还是独立文件，程序都会完整扫描 validation stream，并用固定 seed 的
+reservoir sampling 等概率抽取候选 block，而不是只读取文件前部。`--validation-batches 100` 表示
+缓存并复用最多 100 个 validation batch；实际 block 数为 `100 × batch_size`，候选不足时使用全部。
 
 ### W&B 训练曲线
 
@@ -182,11 +213,15 @@ uv run miniscale pretrain --steps 10000 --batch-size 4 \
   --shuffle-buffer-size 8192 \
   --wandb --wandb-project MiniScale --wandb-entity lotus111 \
   --wandb-run-name pretrain-64m-shuffled-bs4 \
+  --wandb-retry-every 200 \
   --output artifacts/pretrain-shuffled
 ```
 
 W&B run ID 会写进所有完整 checkpoint。使用 `--resume` 时不需要再次填写 ID，训练会自动接回
-同一个 W&B run；也可以第一次恢复旧 checkpoint 时显式传入 `--wandb-run-id`。无法联网时使用
+同一个 W&B run；也可以第一次恢复旧 checkpoint 时显式传入 `--wandb-run-id`。所有待上传指标会先
+持久化到输出目录的 `wandb_pending.jsonl`，断联后默认每 200 step 自动重连，连接恢复后补传 loss
+等标量和 generation table；训练进程重启后也会继续处理该队列。generation 与标量分开上传，因此
+Table 上传超时不会挡住 loss 曲线。可用 `--wandb-retry-every` 修改重试间隔。无法联网时也可以使用
 `--wandb-mode offline`，之后再运行 `uv run wandb sync <离线 run 目录>`。
 
 当前 GRPO 默认使用 `agent_rl_math.jsonl`，因为其中的 `gt` 能形成确定的 verifier reward。
@@ -259,7 +294,7 @@ uv run python generate.py \
 old/reference policy、可验证 reward、受限工具执行和端到端测试。但真正扩大训练规模前还需要：
 
 - 为现有 BPE/JSONL 数据加入去重、质量过滤、数据配比和评测污染检测；
-- 加入 BF16、gradient checkpointing、FlashAttention、FSDP/DeepSpeed；
+- 加入 gradient checkpointing、显式 FlashAttention backend、FSDP/DeepSpeed 和 MFU 统计；
 - 将 rollout 与 learner 解耦，用 vLLM/SGLang 一类推理服务异步采样，并处理 policy weight 同步；
 - 对工具执行使用进程/容器级 sandbox、超时、资源限额和审计，而不仅是当前的 AST 白名单；
 - 建立固定 held-out eval、pass@k、tool-call success、KL/entropy、吞吐和显存监控；
@@ -276,6 +311,9 @@ trainer/                各阶段可直接运行的薄入口
 tests/                  算法语义与端到端回归测试
 artifacts/              本地 checkpoint/manifest（不提交）
 ```
+
+贡献流程、测试约定和 checkpoint 兼容性要求见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。CI 会在 push 和
+pull request 上使用锁定依赖运行完整 unittest。公开发布前仍需由仓库所有者明确选择并添加许可证。
 
 ## 阶段提交
 

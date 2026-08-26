@@ -124,8 +124,12 @@ class MiniScaleForCausalLM(nn.Module):
         self.layers = nn.ModuleList(DecoderLayer(config) for _ in range(config.num_hidden_layers))
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.lm_head.weight = self.embedding.weight
         self.apply(self._initialize)
+        self._initialize_residual_projections()
+        # Tie only after initialization. Tying first makes ``Module.apply``
+        # initialize the same Parameter twice through embedding and lm_head,
+        # and overwrites the embedding padding-row initialization.
+        self.lm_head.weight = self.embedding.weight
 
     def _initialize(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -135,6 +139,14 @@ class MiniScaleForCausalLM(nn.Module):
             if module.padding_idx is not None:
                 with torch.no_grad():
                     module.weight[module.padding_idx].zero_()
+
+    def _initialize_residual_projections(self) -> None:
+        """Scale residual branch outputs to keep variance stable with depth."""
+
+        residual_std = 0.02 / math.sqrt(2 * self.config.num_hidden_layers)
+        for layer in self.layers:
+            nn.init.normal_(layer.attention.output.weight, mean=0.0, std=residual_std)
+            nn.init.normal_(layer.mlp.down.weight, mean=0.0, std=residual_std)
 
     def forward(
         self,

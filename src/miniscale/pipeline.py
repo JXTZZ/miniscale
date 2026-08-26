@@ -14,7 +14,7 @@ from .tokenizer import ByteTokenizer
 from .training import (
     AgentRLOptions,
     GRPOOptions,
-    PretrainOptions,
+    SmokePretrainOptions,
     RLTask,
     SFTOptions,
     run_agent_grpo,
@@ -73,7 +73,7 @@ def run_training_pipeline(output_dir: str | Path, *, device: str = "auto") -> di
         tokenizer,
         PRETRAIN_TEXTS,
         output,
-        PretrainOptions(steps=2, batch_size=2, sequence_length=64, device=device),
+        SmokePretrainOptions(device=device),
     )
     stages["sft"] = _timed_stage(
         run_sft,
