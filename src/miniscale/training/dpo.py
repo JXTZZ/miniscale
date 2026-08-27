@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from miniscale.data import collate_lm_batch, load_jsonl_rows
 from miniscale.model import MiniScaleForCausalLM
+from miniscale.sft_data import truncate_sft_example
 from miniscale.tokenizer import Tokenizer
 from .common import append_metric, resolve_device, save_checkpoint, seed_everything
 
@@ -24,16 +25,37 @@ class DPOOptions:
     grad_clip: float = 1.0
     log_every: int = 10
     data_limit: int | None = None
+    target_mode: str = "reasoning_and_response"
+    min_context_tokens: int = 32
     seed: int = 42
     device: str = "auto"
 
 
-def _encoded_batch(messages: list[list[dict[str, object]]], tokenizer: Tokenizer, max_length: int) -> dict[str, Tensor]:
+def _encoded_batch(
+    messages: list[list[dict[str, object]]],
+    tokenizer: Tokenizer,
+    max_length: int,
+    *,
+    target_mode: str,
+    min_context_tokens: int,
+) -> dict[str, Tensor]:
     examples = []
     for conversation in messages:
-        input_ids, labels = tokenizer.encode_sft(conversation)
-        input_ids, labels = input_ids[-max_length:], labels[-max_length:]
-        examples.append({"input_ids": torch.tensor(input_ids), "labels": torch.tensor(labels)})
+        input_ids, labels = tokenizer.encode_sft(
+            conversation,
+            target_mode=target_mode,
+            target_assistant_index=-1,
+        )
+        encoded = truncate_sft_example(
+            input_ids,
+            labels,
+            max_length=max_length,
+            min_context_tokens=min(min_context_tokens, max_length - 1),
+        )
+        examples.append({
+            "input_ids": torch.tensor(encoded.input_ids),
+            "labels": torch.tensor(encoded.labels),
+        })
     return collate_lm_batch(examples, tokenizer.pad_token_id)
 
 
@@ -65,6 +87,10 @@ def run_dpo_jsonl(
     options: DPOOptions | None = None,
 ) -> dict[str, float | str]:
     options = options or DPOOptions()
+    if options.target_mode not in {"reasoning_and_response", "response_only"}:
+        raise ValueError("target_mode must be 'reasoning_and_response' or 'response_only'")
+    if options.min_context_tokens < 1:
+        raise ValueError("min_context_tokens must be positive")
     seed_everything(options.seed)
     device = resolve_device(options.device)
     rows = load_jsonl_rows(data_path, options.data_limit)
@@ -85,8 +111,20 @@ def run_dpo_jsonl(
     for step in range(1, options.steps + 1):
         selected = [pairs[(cursor + index) % len(pairs)] for index in range(options.batch_size)]
         cursor = (cursor + options.batch_size) % len(pairs)
-        chosen = _encoded_batch([item[0] for item in selected], tokenizer, model.config.max_position_embeddings)
-        rejected = _encoded_batch([item[1] for item in selected], tokenizer, model.config.max_position_embeddings)
+        chosen = _encoded_batch(
+            [item[0] for item in selected],
+            tokenizer,
+            model.config.max_position_embeddings,
+            target_mode=options.target_mode,
+            min_context_tokens=options.min_context_tokens,
+        )
+        rejected = _encoded_batch(
+            [item[1] for item in selected],
+            tokenizer,
+            model.config.max_position_embeddings,
+            target_mode=options.target_mode,
+            min_context_tokens=options.min_context_tokens,
+        )
         chosen = {name: tensor.to(device) for name, tensor in chosen.items()}
         rejected = {name: tensor.to(device) for name, tensor in rejected.items()}
         with torch.no_grad():

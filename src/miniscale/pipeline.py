@@ -16,7 +16,7 @@ from .training import (
     GRPOOptions,
     SmokePretrainOptions,
     RLTask,
-    SFTOptions,
+    SmokeSFTOptions,
     run_agent_grpo,
     run_grpo,
     run_pretrain,
@@ -83,7 +83,7 @@ def run_training_pipeline(output_dir: str | Path, *, device: str = "auto") -> di
         output,
         # Enough steps to deliberately overfit the two-example integration set;
         # this proves stage hand-off, not generalization.
-        SFTOptions(steps=200, batch_size=2, learning_rate=3e-3, device=device),
+        SmokeSFTOptions(steps=200, batch_size=2, learning_rate=3e-3, device=device),
     )
     stages["rl"] = _timed_stage(
         run_grpo,

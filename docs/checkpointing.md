@@ -1,12 +1,13 @@
 # Checkpoint and resume contract
 
 MiniScale treats "resume" as continuation of the same training experiment, not
-as loading weights for a new experiment. New pretraining checkpoints therefore
-use checkpoint format v2 and a versioned resume identity.
+as loading weights for a new experiment. Production pretraining and SFT
+checkpoints therefore use checkpoint format v2 and stage-specific versioned
+resume identities.
 
 ## What strict resume verifies
 
-Before model or optimizer state is mutated, the pretraining entry point checks:
+Before model or optimizer state is mutated, the production training entry point checks:
 
 - SHA-256 identities of the training data and optional dedicated validation data;
 - tokenizer class, vocabulary, special-token IDs, and local tokenizer files;
@@ -15,12 +16,16 @@ Before model or optimizer state is mutated, the pretraining entry point checks:
   worker count, seed, validation split, and shuffle-buffer settings;
 - pretraining implementation and signature versions.
 
+SFT additionally verifies the parent initialization checkpoint, assistant-turn
+example format, reasoning target mode, structured mask and truncation versions,
+exact-dedup policy, global indexed data order, and minimum retained context.
+
 Paths are recorded for provenance, but compatibility uses content identities, so
 moving an unchanged dataset or tokenizer does not invalidate a checkpoint.
 Logging, W&B, generation, checkpoint-retention, and output cadence may be changed
 when resuming because they do not alter optimizer updates.
 
-Every run also writes `pretrain_run.json`, a human-readable resolved recipe and
+Every run also writes `pretrain_run.json` or `sft_run.json`, a human-readable resolved recipe and
 input identity manifest. Full checkpoints contain the same identity plus model,
 optimizer, scheduler, progress counters, and Python/NumPy/PyTorch/CUDA RNG state.
 
@@ -59,7 +64,7 @@ checkpoints.
 
 ## Output safety
 
-Starting a new production run in a directory that already contains pretraining
+Starting a new production run in a directory that already contains stage
 metrics or checkpoints is rejected. Choose a new `--output`, or use `--resume`
 with the matching checkpoint. This prevents accidental metric concatenation and
 checkpoint overwrite.
@@ -67,3 +72,8 @@ checkpoint overwrite.
 Dedicated validation data must not be byte-for-byte identical to the training
 data. Near-duplicate and benchmark-contamination checks remain a separate data
 governance responsibility.
+
+For SFT, `--checkpoint` starts a new run from model weights and creates a new
+optimizer/scheduler. `--resume` requires a full SFT checkpoint and restores the
+same run exactly. A legacy pretraining `best.pt` is therefore a valid SFT
+`--checkpoint`, but it is never an SFT `--resume` checkpoint.

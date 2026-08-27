@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import MISSING, asdict, dataclass, fields
 from functools import partial
-import json
 import math
 from pathlib import Path
 import time
@@ -25,9 +23,15 @@ from miniscale.tracking import WandbTracker
 from .common import (
     TRAINING_CHECKPOINT_FORMAT_VERSION,
     append_metric,
+    atomic_write_json,
+    autocast_context as _autocast_context,
+    build_adamw_optimizer,
+    build_warmup_cosine_scheduler,
     evaluate_lm,
     infinite_batches,
+    prune_periodic_checkpoints,
     read_training_checkpoint,
+    resolve_autocast_dtype,
     resolve_device,
     restore_rng_state,
     restore_training_checkpoint,
@@ -35,6 +39,8 @@ from .common import (
     save_training_checkpoint,
     seed_worker,
     seed_everything,
+    signature_differences,
+    truncate_metrics_after,
 )
 
 
@@ -114,22 +120,6 @@ def pretrain_option_default(name: str) -> object:
     return option.default
 
 
-def resolve_autocast_dtype(precision: str, device: torch.device) -> torch.dtype | None:
-    if precision == "fp32":
-        return None
-    if precision != "bf16":
-        raise ValueError("precision must be 'fp32' or 'bf16'")
-    if device.type != "cuda" or not torch.cuda.is_bf16_supported():
-        raise RuntimeError("bf16 precision requires a CUDA device with BF16 support")
-    return torch.bfloat16
-
-
-def _autocast_context(device: torch.device, dtype: torch.dtype | None):
-    if dtype is None:
-        return nullcontext()
-    return torch.autocast(device_type=device.type, dtype=dtype)
-
-
 GENERATION_EVAL_PROMPTS: tuple[dict[str, str], ...] = (
     {"name": "chinese", "language": "zh", "prompt": "人工智能的发展将会"},
     {"name": "english", "language": "en", "prompt": "The future of artificial intelligence is"},
@@ -141,79 +131,16 @@ GENERATION_EVAL_PROMPTS: tuple[dict[str, str], ...] = (
 )
 
 
-def warmup_cosine_multiplier(
-    step_index: int,
-    *,
-    total_steps: int,
-    warmup_steps: int,
-    min_lr_ratio: float,
-) -> float:
-    """LR multiplier for the update at zero-based ``step_index``."""
-
-    if warmup_steps > 0 and step_index < warmup_steps:
-        return (step_index + 1) / warmup_steps
-    decay_steps = total_steps - warmup_steps
-    if decay_steps <= 0:
-        return 1.0
-    if warmup_steps == 0:
-        progress = step_index / max(total_steps - 1, 1)
-    else:
-        progress = (step_index - warmup_steps + 1) / decay_steps
-    progress = min(max(progress, 0.0), 1.0)
-    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-
-def build_warmup_cosine_scheduler(
-    optimizer: torch.optim.Optimizer,
-    *,
-    total_steps: int,
-    warmup_steps: int,
-    min_learning_rate: float,
-) -> torch.optim.lr_scheduler.LambdaLR:
-    peak_lr = float(optimizer.defaults["lr"])
-    if peak_lr <= 0:
-        raise ValueError("learning_rate must be positive")
-    if not 0 <= min_learning_rate <= peak_lr:
-        raise ValueError("min_learning_rate must be between zero and learning_rate")
-    if warmup_steps < 0:
-        raise ValueError("warmup_steps must be non-negative")
-    effective_warmup_steps = min(warmup_steps, total_steps)
-    return torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda step_index: warmup_cosine_multiplier(
-            step_index,
-            total_steps=total_steps,
-            warmup_steps=effective_warmup_steps,
-            min_lr_ratio=min_learning_rate / peak_lr,
-        ),
-    )
-
-
 def build_pretrain_optimizer(
     model: MiniScaleForCausalLM,
     options: PretrainOptions,
 ) -> torch.optim.AdamW:
-    """Build auditable AdamW groups without decaying norms or embeddings."""
-
-    decay: list[torch.nn.Parameter] = []
-    no_decay: list[torch.nn.Parameter] = []
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        if parameter.ndim >= 2 and name != "embedding.weight":
-            decay.append(parameter)
-        else:
-            no_decay.append(parameter)
-    if not decay or not no_decay:
-        raise ValueError("pretraining optimizer requires non-empty decay and no-decay parameter groups")
-    return torch.optim.AdamW(
-        [
-            {"params": decay, "weight_decay": options.weight_decay, "group_name": "decay"},
-            {"params": no_decay, "weight_decay": 0.0, "group_name": "no_decay"},
-        ],
-        lr=options.learning_rate,
-        betas=(options.adam_beta1, options.adam_beta2),
+    return build_adamw_optimizer(
+        model,
+        learning_rate=options.learning_rate,
+        weight_decay=options.weight_decay,
+        beta1=options.adam_beta1,
+        beta2=options.adam_beta2,
         eps=options.adam_eps,
     )
 
@@ -339,21 +266,6 @@ def _resume_signature(
     }
 
 
-def _signature_differences(saved: object, current: object, prefix: str = "") -> dict[str, tuple[object, object]]:
-    if isinstance(saved, dict) and isinstance(current, dict):
-        differences: dict[str, tuple[object, object]] = {}
-        for name in sorted(set(saved) | set(current)):
-            path = f"{prefix}.{name}" if prefix else str(name)
-            if name not in saved:
-                differences[path] = ("<missing>", current[name])
-            elif name not in current:
-                differences[path] = (saved[name], "<missing>")
-            else:
-                differences.update(_signature_differences(saved[name], current[name], path))
-        return differences
-    return {} if saved == current else {prefix: (saved, current)}
-
-
 def _validate_resume_signature(
     saved: object,
     current: dict[str, object],
@@ -379,9 +291,9 @@ def _validate_resume_signature(
             for name, value in saved.items()
             if name in current and name not in {"signature_version", "implementation_version"}
         }
-        mismatches = _signature_differences(comparable, {name: current[name] for name in comparable})
+        mismatches = signature_differences(comparable, {name: current[name] for name in comparable})
     else:
-        mismatches = _signature_differences(saved, current)
+        mismatches = signature_differences(saved, current)
     if mismatches:
         raise ValueError(f"resume options do not match checkpoint: {mismatches}")
 
@@ -458,30 +370,7 @@ def _write_run_manifest(
         },
         "resume_identity": resume_signature,
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
-
-
-def _prune_periodic_checkpoints(checkpoint_dir: Path, keep_last: int) -> None:
-    checkpoints = sorted(checkpoint_dir.glob("step_*.pt"))
-    for checkpoint in checkpoints[:-keep_last]:
-        checkpoint.unlink()
-
-
-def _truncate_metrics_after(path: Path, step: int) -> None:
-    if not path.exists():
-        return
-    retained: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            metric = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if int(metric.get("step", -1)) <= step:
-            retained.append(json.dumps(metric, ensure_ascii=False))
-    path.write_text("".join(f"{line}\n" for line in retained), encoding="utf-8")
+    atomic_write_json(path, manifest)
 
 
 @torch.no_grad()
@@ -526,22 +415,12 @@ def run_generation_evaluation(
         model.train(was_training)
 
     target = Path(output_dir) / "generations" / f"step_{step:08d}.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(f"{target.suffix}.tmp")
-    temporary.write_text(
-        json.dumps(
-            {
-                "stage": "pretrain",
-                "step": step,
-                "decoding": {"do_sample": False, "strategy": "greedy", "temperature": 0.0},
-                "samples": samples,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(target)
+    atomic_write_json(target, {
+        "stage": "pretrain",
+        "step": step,
+        "decoding": {"do_sample": False, "strategy": "greedy", "temperature": 0.0},
+        "samples": samples,
+    })
     return target
 
 
@@ -767,7 +646,7 @@ def run_pretrain_jsonl(
             saved_wandb_run_id = str(state["wandb_run_id"])
         last_metrics = {name: float(value) for name, value in payload.get("metrics", {}).items()}
         last_loss = float(last_metrics.get("loss", last_metrics.get("train_loss", float("nan"))))
-        _truncate_metrics_after(metrics_path, completed_step)
+        truncate_metrics_after(metrics_path, completed_step)
         print(f"resuming from step={completed_step}; skipping {micro_batches_seen} consumed micro-batches", flush=True)
     if completed_step >= options.steps:
         raise ValueError("resume checkpoint is already at or beyond the requested total steps")
@@ -973,7 +852,7 @@ def run_pretrain_jsonl(
                     metrics=last_metrics,
                     training_state=training_state(),
                 )
-                _prune_periodic_checkpoints(checkpoint_dir, options.keep_last_checkpoints)
+                prune_periodic_checkpoints(checkpoint_dir, options.keep_last_checkpoints)
                 print(f"saved checkpoint: {checkpoint}", flush=True)
     except KeyboardInterrupt:
         emergency = save_training_checkpoint(

@@ -61,6 +61,38 @@ class HuggingFaceTokenizerTests(unittest.TestCase):
         self.assertIn("<tool_response>\n4\n</tool_response>", observation)
         self.assertIn("<|im_start|>assistant", observation)
 
+    def test_sft_mask_can_target_one_turn_and_exclude_reasoning(self) -> None:
+        tokenizer = HuggingFaceTokenizer(TOKENIZER_DIR)
+        messages = [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer", "reasoning_content": "first reasoning"},
+            {"role": "user", "content": "second question"},
+            {"role": "assistant", "content": "second answer", "reasoning_content": "private reasoning"},
+        ]
+        _, reasoning_labels = tokenizer.encode_sft(
+            messages,
+            target_mode="reasoning_and_response",
+            target_assistant_index=-1,
+        )
+        reasoning_target = tokenizer.decode(
+            [label for label in reasoning_labels if label != -100], skip_special_tokens=False
+        )
+        self.assertIn("private reasoning", reasoning_target)
+        self.assertIn("second answer", reasoning_target)
+        self.assertNotIn("first answer", reasoning_target)
+
+        _, response_labels = tokenizer.encode_sft(
+            messages,
+            target_mode="response_only",
+            target_assistant_index=-1,
+        )
+        response_target = tokenizer.decode(
+            [label for label in response_labels if label != -100], skip_special_tokens=False
+        )
+        self.assertIn("second answer", response_target)
+        self.assertNotIn("private reasoning", response_target)
+        self.assertNotIn("first answer", response_target)
+
     def test_generation_loads_tokenizer_directory(self) -> None:
         tokenizer = HuggingFaceTokenizer(TOKENIZER_DIR)
         config = MiniScaleConfig.smoke()

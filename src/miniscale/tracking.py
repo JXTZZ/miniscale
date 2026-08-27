@@ -217,10 +217,12 @@ class WandbTracker:
             "train/tokens_seen": metric["tokens_seen"],
         }
         optional_metrics = {
+            "examples_seen": "train/examples_seen",
             "target_tokens_seen": "train/target_tokens_seen",
             "grad_was_clipped": "train/grad_was_clipped",
             "update_seconds": "performance/update_seconds",
             "tokens_per_second": "performance/tokens_per_second",
+            "supervised_tokens_per_second": "performance/supervised_tokens_per_second",
             "samples_per_second": "performance/samples_per_second",
             "cuda_peak_memory_mb": "performance/cuda_peak_memory_mb",
         }
@@ -231,6 +233,10 @@ class WandbTracker:
             values["eval/loss"] = metric["validation_loss"]
             values["eval/perplexity"] = metric["perplexity"]
             values["eval/best_loss"] = metric["best_val_loss"]
+            if "validation_token_accuracy" in metric:
+                values["eval/token_accuracy"] = metric["validation_token_accuracy"]
+            if "validation_target_tokens" in metric:
+                values["eval/target_tokens"] = metric["validation_target_tokens"]
         return values
 
     def _schedule_retry(self, step: int) -> None:

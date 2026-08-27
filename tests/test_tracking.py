@@ -127,8 +127,12 @@ class TrackingTests(unittest.TestCase):
                 "perplexity": 8.17,
                 "best_val_loss": 2.1,
                 "target_tokens_seen": 90,
+                "examples_seen": 12,
                 "tokens_per_second": 1234.0,
+                "supervised_tokens_per_second": 432.0,
                 "update_seconds": 0.25,
+                "validation_token_accuracy": 0.25,
+                "validation_target_tokens": 80,
             })
             tracker.log(value, generation_path=generation)
 
@@ -138,7 +142,9 @@ class TrackingTests(unittest.TestCase):
             self.assertEqual(scalar_values["train/loss"], 2.0)
             self.assertEqual(scalar_values["eval/loss"], 2.1)
             self.assertEqual(scalar_values["train/target_tokens_seen"], 90)
+            self.assertEqual(scalar_values["train/examples_seen"], 12)
             self.assertEqual(scalar_values["performance/tokens_per_second"], 1234.0)
+            self.assertEqual(scalar_values["eval/token_accuracy"], 0.25)
             self.assertNotIn("eval/generations", scalar_values)
             self.assertIsNone(table_step)
             self.assertIn("eval/generations", table_values)

@@ -42,6 +42,8 @@ class PretrainDataset(Dataset[dict[str, Tensor]]):
 
 
 class SFTDataset(Dataset[dict[str, Tensor]]):
+    """Small eager ByteTokenizer dataset used only by the smoke pipeline."""
+
     def __init__(
         self,
         conversations: Sequence[Sequence[dict[str, str]]],
@@ -163,26 +165,6 @@ class JsonlPretrainDataset(IterableDataset[dict[str, Tensor]]):
                 # block, so the boundary next-token target is not discarded.
                 del buffer[: self.sequence_length - 1]
                 yield {"input_ids": ids, "labels": ids.clone()}
-
-
-class JsonlSFTDataset(IterableDataset[dict[str, Tensor]]):
-    def __init__(self, path: str | Path, tokenizer: Tokenizer, max_length: int) -> None:
-        self.path = Path(path)
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
-    def __iter__(self) -> Iterator[dict[str, Tensor]]:
-        for row in _worker_rows(self.path):
-            messages = row.get("conversations")
-            if not isinstance(messages, list) or not messages:
-                continue
-            input_ids, labels = self.tokenizer.encode_sft(messages)
-            input_ids, labels = input_ids[-self.max_length :], labels[-self.max_length :]
-            if any(label != -100 for label in labels):
-                yield {
-                    "input_ids": torch.tensor(input_ids, dtype=torch.long),
-                    "labels": torch.tensor(labels, dtype=torch.long),
-                }
 
 
 def load_jsonl_rows(path: str | Path, limit: int | None = None) -> list[dict[str, object]]:

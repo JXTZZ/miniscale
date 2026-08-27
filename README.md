@@ -106,7 +106,12 @@ uv run miniscale pretrain --steps 10000 --batch-size 1 \
   --output artifacts/pretrain
 
 uv run miniscale sft --steps 3000 --batch-size 1 \
-  --gradient-accumulation 16 \
+  --gradient-accumulation 16 --max-length 512 \
+  --precision bf16 \
+  --learning-rate 2e-5 --min-learning-rate 2e-6 \
+  --warmup-steps 100 \
+  --validation-every 200 --validation-batches 100 \
+  --save-every 500 --keep-last 3 --generation-every 1000 \
   --checkpoint artifacts/pretrain/best.pt \
   --output artifacts/sft
 
@@ -122,6 +127,12 @@ uv run miniscale agent-rl --steps 500 --batch-size 1 --group-size 4 \
   --checkpoint artifacts/grpo/rl.pt \
   --output artifacts/agent-rl
 ```
+
+正式 SFT 会把 conversation 展开为 assistant-turn 样本，只监督当前 assistant 回复；训练数据使用
+全局确定性 permutation，而不是只读取 JSONL 前部。默认按 conversation hash 留出 0.5% validation、
+跳过 exact duplicate，并在超过 context 时同时保留最近 prompt 和回复开头。训练前建议先运行
+`audit-sft-data`；reasoning mask、旧 10k 权重启动、3050 Ti/5070 配置和精确恢复命令见
+[`docs/sft.md`](docs/sft.md)。
 
 预训练前 200 step 线性 warmup 到 `3e-4`，之后 cosine decay 到 `3e-5`。每 200 step
 计算 `validation_loss` 和 `perplexity`；只要 validation loss 创历史最低，就立即覆盖 `best.pt`。

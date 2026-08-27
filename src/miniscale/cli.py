@@ -13,6 +13,8 @@ from .data_audit import audit_pretrain_jsonl, save_data_audit
 from .inference import GenerationOptions, generate_from_checkpoint
 from .model import MiniScaleForCausalLM
 from .pipeline import run_training_pipeline
+from .sft_data_audit import audit_sft_jsonl, save_sft_data_audit
+from .sft_data_prepare import prepare_sft_jsonl
 from .tokenizer import load_tokenizer, train_sentencepiece
 from .training import (
     AgentRLOptions, DPOOptions, GRPOOptions, PretrainOptions, SFTOptions,
@@ -20,6 +22,7 @@ from .training import (
 )
 from .training.common import load_checkpoint, seed_everything
 from .training.pretrain import pretrain_option_default
+from .training.sft_config import sft_option_default
 
 
 DEFAULT_DATA = Path("data/raw/minimind")
@@ -73,6 +76,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--sequence-length", type=int, default=pretrain_option_default("sequence_length")
     )
     audit_data.add_argument("--tokenizer-batch-size", type=int, default=4096)
+    audit_sft = subcommands.add_parser(
+        "audit-sft-data", help="scan SFT JSONL and report structure, duplication, splits, and truncation"
+    )
+    audit_sft.add_argument("--data", type=Path, default=DEFAULT_DATA / "sft/sft_t2t_mini.jsonl")
+    audit_sft.add_argument("--tokenizer", type=Path, default=Path("data/tokenizer/minimind"))
+    audit_sft.add_argument("--output", type=Path)
+    audit_sft.add_argument("--max-length", type=int, default=512)
+    audit_sft.add_argument("--min-context-tokens", type=int, default=sft_option_default("min_context_tokens"))
+    audit_sft.add_argument(
+        "--target-mode",
+        choices=("reasoning_and_response", "response_only"),
+        default=sft_option_default("target_mode"),
+    )
+    audit_sft.add_argument("--validation-fraction", type=float, default=sft_option_default("validation_fraction"))
+    audit_sft.add_argument("--sample-size", type=int, default=5000)
+    audit_sft.add_argument("--seed", type=int, default=sft_option_default("seed"))
+    audit_sft.add_argument(
+        "--identity-pattern",
+        action="append",
+        default=[],
+        help="case-insensitive identity/brand substring to count; repeat for multiple patterns",
+    )
+    prepare_sft = subcommands.add_parser(
+        "prepare-sft-data", help="write a deduplicated and optionally filtered derived SFT JSONL"
+    )
+    prepare_sft.add_argument("--data", type=Path, default=DEFAULT_DATA / "sft/sft_t2t_mini.jsonl")
+    prepare_sft.add_argument("--output", type=Path, required=True)
+    prepare_sft.add_argument("--manifest", type=Path)
+    prepare_sft.add_argument(
+        "--deduplicate-exact", action=argparse.BooleanOptionalAction, default=True
+    )
+    prepare_sft.add_argument(
+        "--exclude-pattern",
+        action="append",
+        default=[],
+        help="case-insensitive identity/brand substring to exclude; repeat for multiple patterns",
+    )
     tokenizer = subcommands.add_parser("train-tokenizer", help="train SentencePiece from pretraining JSONL")
     tokenizer.add_argument("--data", type=Path, default=DEFAULT_DATA / "pretrain/pretrain_t2t_mini.jsonl")
     tokenizer.add_argument("--output-prefix", type=Path, default=Path("data/tokenizer/miniscale"))
@@ -163,14 +203,76 @@ def build_parser() -> argparse.ArgumentParser:
         help="accept a pre-v2 checkpoint without strict data/tokenizer identity checks",
     )
     pretrain.add_argument("--num-workers", type=int, default=pretrain_option_default("num_workers"))
-    sft = training_parser("sft", "supervised fine-tuning from a pretrain checkpoint", DEFAULT_DATA / "sft/sft_t2t_mini.jsonl")
-    sft.add_argument("--checkpoint", type=Path, required=True)
-    sft.add_argument("--gradient-accumulation", type=int, default=16)
-    sft.add_argument("--learning-rate", type=float, default=2e-5)
+    sft = training_parser(
+        "sft", "supervised fine-tuning from a pretrain checkpoint", DEFAULT_DATA / "sft/sft_t2t_mini.jsonl"
+    )
+    sft.set_defaults(
+        batch_size=sft_option_default("batch_size"),
+        log_every=sft_option_default("log_every"),
+    )
+    sft_source = sft.add_mutually_exclusive_group(required=True)
+    sft_source.add_argument("--checkpoint", type=Path, help="initialize a new SFT run from model weights")
+    sft_source.add_argument("--resume", type=Path, help="resume the exact state of a full SFT checkpoint")
+    sft.add_argument("--max-length", type=int, help="defaults to the checkpoint context length")
+    sft.add_argument("--min-context-tokens", type=int, default=sft_option_default("min_context_tokens"))
+    sft.add_argument(
+        "--target-mode",
+        choices=("reasoning_and_response", "response_only"),
+        default=sft_option_default("target_mode"),
+    )
+    sft.add_argument(
+        "--gradient-accumulation", type=int, default=sft_option_default("gradient_accumulation_steps")
+    )
+    sft.add_argument("--learning-rate", type=float, default=sft_option_default("learning_rate"))
+    sft.add_argument("--min-learning-rate", type=float, default=sft_option_default("min_learning_rate"))
+    sft.add_argument("--weight-decay", type=float, default=sft_option_default("weight_decay"))
+    sft.add_argument("--adam-beta1", type=float, default=sft_option_default("adam_beta1"))
+    sft.add_argument("--adam-beta2", type=float, default=sft_option_default("adam_beta2"))
+    sft.add_argument("--adam-eps", type=float, default=sft_option_default("adam_eps"))
+    sft.add_argument("--grad-clip", type=float, default=sft_option_default("grad_clip"))
+    sft.add_argument("--warmup-steps", type=int, default=sft_option_default("warmup_steps"))
+    sft.add_argument(
+        "--precision", choices=("fp32", "bf16"), default=sft_option_default("precision")
+    )
+    sft.add_argument("--validation-fraction", type=float, default=sft_option_default("validation_fraction"))
+    sft.add_argument("--validation-data", type=Path, help="optional dedicated SFT validation JSONL")
+    sft.add_argument("--validation-every", type=int, default=sft_option_default("validation_every"))
+    sft.add_argument("--validation-batches", type=int, default=sft_option_default("validation_batches"))
+    sft.add_argument("--save-every", type=int, default=sft_option_default("save_every"))
+    sft.add_argument("--keep-last", type=int, default=sft_option_default("keep_last_checkpoints"))
+    sft.add_argument("--generation-every", type=int, default=sft_option_default("generation_every"))
+    sft.add_argument(
+        "--generation-max-new-tokens", type=int, default=sft_option_default("generation_max_new_tokens")
+    )
+    sft.add_argument(
+        "--deduplicate-exact",
+        action=argparse.BooleanOptionalAction,
+        default=sft_option_default("deduplicate_exact"),
+    )
+    sft.add_argument("--seed", type=int, default=sft_option_default("seed"))
+    sft.add_argument("--num-workers", type=int, default=sft_option_default("num_workers"))
+    sft.add_argument("--wandb", action="store_true", default=sft_option_default("wandb_enabled"))
+    sft.add_argument("--wandb-project", default=sft_option_default("wandb_project"))
+    sft.add_argument("--wandb-entity")
+    sft.add_argument("--wandb-run-name")
+    sft.add_argument("--wandb-run-id")
+    sft.add_argument(
+        "--wandb-mode",
+        choices=("online", "offline", "disabled"),
+        default=sft_option_default("wandb_mode"),
+    )
+    sft.add_argument("--wandb-retry-every", type=int, default=sft_option_default("wandb_retry_every_steps"))
     dpo = training_parser("dpo", "preference optimization from sft.pt", DEFAULT_DATA / "preference/dpo.jsonl")
     dpo.add_argument("--checkpoint", type=Path, required=True)
     dpo.add_argument("--learning-rate", type=float, default=5e-6)
     dpo.add_argument("--beta", type=float, default=0.1)
+    dpo.add_argument(
+        "--target-mode",
+        choices=("reasoning_and_response", "response_only"),
+        default="reasoning_and_response",
+        help="must match the completion semantics used by the parent SFT run",
+    )
+    dpo.add_argument("--min-context-tokens", type=int, default=32)
     grpo = training_parser(
         "grpo", "online GRPO with verifiable math rewards", DEFAULT_DATA / "agent/agent_rl_math.jsonl"
     )
@@ -238,6 +340,30 @@ def main(argv: list[str] | None = None) -> None:
         if arguments.output is not None:
             save_data_audit(result, arguments.output)
             result["report"] = str(arguments.output)
+    elif arguments.command == "audit-sft-data":
+        tokenizer = load_tokenizer(arguments.tokenizer)
+        result = audit_sft_jsonl(
+            arguments.data,
+            tokenizer,
+            max_length=arguments.max_length,
+            min_context_tokens=arguments.min_context_tokens,
+            target_mode=arguments.target_mode,
+            validation_fraction=arguments.validation_fraction,
+            sample_size=arguments.sample_size,
+            seed=arguments.seed,
+            identity_patterns=arguments.identity_pattern,
+        )
+        if arguments.output is not None:
+            save_sft_data_audit(result, arguments.output)
+            result["report"] = str(arguments.output)
+    elif arguments.command == "prepare-sft-data":
+        result = prepare_sft_jsonl(
+            arguments.data,
+            arguments.output,
+            manifest_path=arguments.manifest,
+            deduplicate_exact=arguments.deduplicate_exact,
+            exclude_patterns=arguments.exclude_pattern,
+        )
     elif arguments.command == "train-tokenizer":
         result = {"tokenizer": str(train_sentencepiece(
             arguments.data, arguments.output_prefix, vocab_size=arguments.vocab_size,
@@ -280,19 +406,57 @@ def main(argv: list[str] | None = None) -> None:
                 num_workers=arguments.num_workers, device=arguments.device,
             ), validation_path=arguments.validation_data)
         else:
-            model = load_checkpoint(arguments.checkpoint)
+            checkpoint_source = (
+                arguments.resume if arguments.command == "sft" and arguments.resume is not None
+                else arguments.checkpoint
+            )
+            model = load_checkpoint(checkpoint_source)
             if model.config.vocab_size != tokenizer.vocab_size:
                 raise ValueError("checkpoint vocabulary does not match tokenizer")
             if arguments.command == "sft":
                 result = run_sft_jsonl(model, tokenizer, arguments.data, arguments.output, SFTOptions(
-                    steps=arguments.steps, batch_size=arguments.batch_size, learning_rate=arguments.learning_rate,
-                    gradient_accumulation_steps=arguments.gradient_accumulation, log_every=arguments.log_every,
+                    steps=arguments.steps,
+                    batch_size=arguments.batch_size,
+                    max_length=arguments.max_length,
+                    min_context_tokens=arguments.min_context_tokens,
+                    target_mode=arguments.target_mode,
+                    learning_rate=arguments.learning_rate,
+                    min_learning_rate=arguments.min_learning_rate,
+                    weight_decay=arguments.weight_decay,
+                    adam_beta1=arguments.adam_beta1,
+                    adam_beta2=arguments.adam_beta2,
+                    adam_eps=arguments.adam_eps,
+                    grad_clip=arguments.grad_clip,
+                    warmup_steps=arguments.warmup_steps,
+                    precision=arguments.precision,
+                    gradient_accumulation_steps=arguments.gradient_accumulation,
+                    validation_fraction=arguments.validation_fraction,
+                    validation_every=arguments.validation_every,
+                    validation_batches=arguments.validation_batches,
+                    save_every=arguments.save_every,
+                    keep_last_checkpoints=arguments.keep_last,
+                    generation_every=arguments.generation_every,
+                    generation_max_new_tokens=arguments.generation_max_new_tokens,
+                    deduplicate_exact=arguments.deduplicate_exact,
+                    log_every=arguments.log_every,
+                    num_workers=arguments.num_workers,
+                    seed=arguments.seed,
                     device=arguments.device,
-                ))
+                    wandb_enabled=arguments.wandb,
+                    wandb_project=arguments.wandb_project,
+                    wandb_entity=arguments.wandb_entity,
+                    wandb_run_name=arguments.wandb_run_name,
+                    wandb_run_id=arguments.wandb_run_id,
+                    wandb_mode=arguments.wandb_mode,
+                    wandb_retry_every_steps=arguments.wandb_retry_every,
+                    resume_from=arguments.resume,
+                ), validation_path=arguments.validation_data, initial_checkpoint_path=arguments.checkpoint)
             elif arguments.command == "dpo":
                 result = run_dpo_jsonl(model, tokenizer, arguments.data, arguments.output, DPOOptions(
                     steps=arguments.steps, batch_size=arguments.batch_size, learning_rate=arguments.learning_rate,
-                    beta=arguments.beta, log_every=arguments.log_every, device=arguments.device,
+                    beta=arguments.beta, target_mode=arguments.target_mode,
+                    min_context_tokens=arguments.min_context_tokens,
+                    log_every=arguments.log_every, device=arguments.device,
                 ))
             elif arguments.command == "grpo":
                 result = run_grpo_jsonl(model, tokenizer, arguments.data, arguments.output, GRPOOptions(

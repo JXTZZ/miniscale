@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
 from .tokenizer import Tokenizer
+
+
+def atomic_write_json(path: str | Path, value: dict[str, object]) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(target)
+    return target
 
 
 def _update_hash_from_file(digest: Any, path: Path) -> int:

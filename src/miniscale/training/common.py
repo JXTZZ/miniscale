@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from contextlib import nullcontext
 from pathlib import Path
 import json
+import math
 import random
 
 import numpy as np
@@ -11,6 +12,7 @@ import torch
 from torch import Tensor
 
 from miniscale.config import MiniScaleConfig
+from miniscale.integrity import atomic_write_json
 from miniscale.model import MiniScaleForCausalLM
 
 
@@ -37,6 +39,105 @@ def resolve_device(device: str = "auto") -> torch.device:
     if device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device)
+
+
+def resolve_autocast_dtype(precision: str, device: torch.device) -> torch.dtype | None:
+    if precision == "fp32":
+        return None
+    if precision != "bf16":
+        raise ValueError("precision must be 'fp32' or 'bf16'")
+    if device.type != "cuda" or not torch.cuda.is_bf16_supported():
+        raise RuntimeError("bf16 precision requires a CUDA device with BF16 support")
+    return torch.bfloat16
+
+
+def autocast_context(device: torch.device, dtype: torch.dtype | None):
+    if dtype is None:
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=dtype)
+
+
+def warmup_cosine_multiplier(
+    step_index: int,
+    *,
+    total_steps: int,
+    warmup_steps: int,
+    min_lr_ratio: float,
+) -> float:
+    if warmup_steps > 0 and step_index < warmup_steps:
+        return (step_index + 1) / warmup_steps
+    decay_steps = total_steps - warmup_steps
+    if decay_steps <= 0:
+        return 1.0
+    progress = (
+        step_index / max(total_steps - 1, 1)
+        if warmup_steps == 0
+        else (step_index - warmup_steps + 1) / decay_steps
+    )
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+
+def build_warmup_cosine_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    total_steps: int,
+    warmup_steps: int,
+    min_learning_rate: float,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    if total_steps < 1:
+        raise ValueError("total_steps must be positive")
+    peak_lr = float(optimizer.defaults["lr"])
+    if peak_lr <= 0:
+        raise ValueError("learning_rate must be positive")
+    if not 0 <= min_learning_rate <= peak_lr:
+        raise ValueError("min_learning_rate must be between zero and learning_rate")
+    if warmup_steps < 0:
+        raise ValueError("warmup_steps must be non-negative")
+    effective_warmup = min(warmup_steps, total_steps)
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step_index: warmup_cosine_multiplier(
+            step_index,
+            total_steps=total_steps,
+            warmup_steps=effective_warmup,
+            min_lr_ratio=min_learning_rate / peak_lr,
+        ),
+    )
+
+
+def build_adamw_optimizer(
+    model: MiniScaleForCausalLM,
+    *,
+    learning_rate: float,
+    weight_decay: float,
+    beta1: float,
+    beta2: float,
+    eps: float,
+) -> torch.optim.AdamW:
+    """Build explicit AdamW groups without decaying biases, norms, or embeddings."""
+
+    decay: list[torch.nn.Parameter] = []
+    no_decay: list[torch.nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.ndim >= 2 and name != "embedding.weight":
+            decay.append(parameter)
+        else:
+            no_decay.append(parameter)
+    if not decay or not no_decay:
+        raise ValueError("optimizer requires non-empty decay and no-decay parameter groups")
+    return torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": weight_decay, "group_name": "decay"},
+            {"params": no_decay, "weight_decay": 0.0, "group_name": "no_decay"},
+        ],
+        lr=learning_rate,
+        betas=(beta1, beta2),
+        eps=eps,
+    )
 
 
 def infinite_batches(loader: Iterable[dict[str, Tensor]]) -> Iterable[dict[str, Tensor]]:
@@ -200,6 +301,46 @@ def append_metric(path: str | Path, metric: dict[str, object]) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as output:
         output.write(json.dumps(metric, ensure_ascii=False) + "\n")
+
+
+def signature_differences(
+    saved: object,
+    current: object,
+    prefix: str = "",
+) -> dict[str, tuple[object, object]]:
+    if isinstance(saved, dict) and isinstance(current, dict):
+        differences: dict[str, tuple[object, object]] = {}
+        for name in sorted(set(saved) | set(current)):
+            path = f"{prefix}.{name}" if prefix else str(name)
+            if name not in saved:
+                differences[path] = ("<missing>", current[name])
+            elif name not in current:
+                differences[path] = (saved[name], "<missing>")
+            else:
+                differences.update(signature_differences(saved[name], current[name], path))
+        return differences
+    return {} if saved == current else {prefix: (saved, current)}
+
+
+def truncate_metrics_after(path: str | Path, step: int) -> None:
+    target = Path(path)
+    if not target.exists():
+        return
+    retained: list[str] = []
+    for line in target.read_text(encoding="utf-8").splitlines():
+        try:
+            metric = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if int(metric.get("step", -1)) <= step:
+            retained.append(json.dumps(metric, ensure_ascii=False))
+    target.write_text("".join(f"{line}\n" for line in retained), encoding="utf-8")
+
+
+def prune_periodic_checkpoints(path: str | Path, keep_last: int) -> None:
+    checkpoint_dir = Path(path)
+    for checkpoint in sorted(checkpoint_dir.glob("step_*.pt"))[:-keep_last]:
+        checkpoint.unlink()
 
 
 @torch.no_grad()

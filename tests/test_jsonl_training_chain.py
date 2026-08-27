@@ -120,7 +120,22 @@ class JsonlTrainingChainTests(unittest.TestCase):
                 PretrainOptions(steps=1, batch_size=1, sequence_length=32, validation_fraction=0, device="cpu"),
             )
             self.assertTrue(Path(str(pretrain_result["checkpoint"])).exists())
-            run_sft_jsonl(model, tokenizer, sft, root / "sft-out", SFTOptions(steps=1, batch_size=1, device="cpu"))
+            run_sft_jsonl(
+                model,
+                tokenizer,
+                sft,
+                root / "sft-out",
+                SFTOptions(
+                    steps=1,
+                    batch_size=1,
+                    gradient_accumulation_steps=1,
+                    validation_fraction=0,
+                    warmup_steps=0,
+                    save_every=0,
+                    generation_every=0,
+                    device="cpu",
+                ),
+            )
             run_dpo_jsonl(model, tokenizer, dpo, root / "dpo-out", DPOOptions(steps=1, batch_size=1, device="cpu"))
             run_grpo_jsonl(
                 model, tokenizer, rl, root / "grpo-out",

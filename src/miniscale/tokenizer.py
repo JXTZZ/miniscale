@@ -18,17 +18,46 @@ class Tokenizer(Protocol):
     def decode(self, ids: Iterable[int], *, skip_special_tokens: bool = True) -> str: ...
     def convert_ids_to_tokens(self, ids: Iterable[int]) -> list[str]: ...
     def format_messages(self, messages: Sequence[dict[str, object]], *, generation_prompt: bool = False) -> str: ...
-    def encode_sft(self, messages: Sequence[dict[str, object]]) -> tuple[list[int], list[int]]: ...
+    def encode_sft(
+        self,
+        messages: Sequence[dict[str, object]],
+        *,
+        target_mode: str = "reasoning_and_response",
+        target_assistant_index: int | None = None,
+    ) -> tuple[list[int], list[int]]: ...
     def format_tool_observation(self, observation: str, *, assistant_closed: bool = False) -> str: ...
 
 
-def _message_content(message: dict[str, object]) -> str:
+def _message_content(message: dict[str, object], *, include_reasoning: bool = True) -> str:
     content = message.get("content") or ""
+    if (
+        not include_reasoning
+        and message.get("role") == "assistant"
+        and isinstance(content, str)
+        and "</think>" in content
+    ):
+        content = content.split("</think>", 1)[1].lstrip("\n")
+    reasoning = message.get("reasoning_content") or ""
+    if include_reasoning and message.get("role") == "assistant" and reasoning:
+        content = f"<think>\n{str(reasoning).strip()}\n</think>\n\n{content}"
     if message.get("tools"):
         content = f"{content}\n{message['tools']}".strip()
     if message.get("tool_calls"):
         content = f"{content}<tool_call>{message['tool_calls']}</tool_call>"
     return str(content)
+
+
+def _assistant_target_indices(assistant_count: int, requested: int | None) -> set[int]:
+    """Resolve one assistant turn, or all turns, into zero-based indices."""
+
+    if requested is None:
+        return set(range(assistant_count))
+    index = requested if requested >= 0 else assistant_count + requested
+    if not 0 <= index < assistant_count:
+        raise ValueError(
+            f"target_assistant_index {requested} is invalid for {assistant_count} assistant messages"
+        )
+    return {index}
 
 
 class ChatTemplateMixin:
@@ -38,18 +67,41 @@ class ChatTemplateMixin:
             text += "<|assistant|>\n"
         return text
 
-    def encode_sft(self, messages: Sequence[dict[str, object]]) -> tuple[list[int], list[int]]:
+    def encode_sft(
+        self,
+        messages: Sequence[dict[str, object]],
+        *,
+        target_mode: str = "reasoning_and_response",
+        target_assistant_index: int | None = None,
+    ) -> tuple[list[int], list[int]]:
+        if target_mode not in {"reasoning_and_response", "response_only"}:
+            raise ValueError("target_mode must be 'reasoning_and_response' or 'response_only'")
+        assistant_count = sum(message.get("role") == "assistant" for message in messages)
+        targets = _assistant_target_indices(assistant_count, target_assistant_index)
         input_ids = [self.bos_token_id]
         labels = [-100]
+        assistant_index = 0
         for message in messages:
             prefix = self.encode(f"<|{message['role']}|>\n")
-            body = self.encode(f"{_message_content(message)}<|end|>\n")
+            is_assistant = message.get("role") == "assistant"
+            is_target = is_assistant and assistant_index in targets
+            body = self.encode(
+                f"{_message_content(message, include_reasoning=target_mode != 'response_only' or not is_target)}"
+                "<|end|>\n"
+            )
             input_ids.extend(prefix)
             input_ids.extend(body)
             labels.extend([-100] * len(prefix))
-            labels.extend(body if message["role"] == "assistant" else [-100] * len(body))
+            labels.extend(body if is_target else [-100] * len(body))
+            if is_assistant:
+                assistant_index += 1
         input_ids.append(self.eos_token_id)
-        labels.append(self.eos_token_id if messages and messages[-1]["role"] == "assistant" else -100)
+        last_is_target = bool(
+            messages
+            and messages[-1].get("role") == "assistant"
+            and assistant_count - 1 in targets
+        )
+        labels.append(self.eos_token_id if last_is_target else -100)
         return input_ids, labels
 
     def format_tool_observation(self, observation: str, *, assistant_closed: bool = False) -> str:
@@ -218,12 +270,36 @@ class HuggingFaceTokenizer:
             raise TypeError("chat template must render text when tokenize=False")
         return rendered
 
-    def encode_sft(self, messages: Sequence[dict[str, object]]) -> tuple[list[int], list[int]]:
-        input_ids = self.encode(self.format_messages(messages))
+    def encode_sft(
+        self,
+        messages: Sequence[dict[str, object]],
+        *,
+        target_mode: str = "reasoning_and_response",
+        target_assistant_index: int | None = None,
+    ) -> tuple[list[int], list[int]]:
+        if target_mode not in {"reasoning_and_response", "response_only"}:
+            raise ValueError("target_mode must be 'reasoning_and_response' or 'response_only'")
+        assistant_count = sum(message.get("role") == "assistant" for message in messages)
+        targets = _assistant_target_indices(assistant_count, target_assistant_index)
+        prepared_messages = [dict(message) for message in messages]
+        if target_mode == "response_only":
+            assistant_index = 0
+            for message in prepared_messages:
+                if message.get("role") != "assistant":
+                    continue
+                if assistant_index in targets:
+                    message["reasoning_content"] = ""
+                    content = message.get("content")
+                    if isinstance(content, str) and "</think>" in content:
+                        message["content"] = content.split("</think>", 1)[1].lstrip("\n")
+                assistant_index += 1
+
+        input_ids = self.encode(self.format_messages(prepared_messages))
         labels = [-100] * len(input_ids)
         assistant_prefix = self.encode(f"{self.processor.bos_token}assistant\n")
         assistant_end = self.encode(f"{self.processor.eos_token}\n")
         index = 0
+        assistant_index = 0
         while index < len(input_ids):
             if input_ids[index : index + len(assistant_prefix)] != assistant_prefix:
                 index += 1
@@ -232,9 +308,23 @@ class HuggingFaceTokenizer:
             end = start
             while end < len(input_ids) and input_ids[end : end + len(assistant_end)] != assistant_end:
                 end += 1
+            if end >= len(input_ids):
+                raise ValueError("chat template produced an unterminated assistant span")
             supervised_end = min(end + len(assistant_end), len(input_ids))
-            labels[start:supervised_end] = input_ids[start:supervised_end]
+            if assistant_index in targets:
+                if target_mode == "response_only":
+                    empty_thinking = self.encode("<think>\n\n</think>\n\n")
+                    if input_ids[start : start + len(empty_thinking)] != empty_thinking:
+                        raise ValueError("chat template response-only thinking prefix changed unexpectedly")
+                    start += len(empty_thinking)
+                labels[start:supervised_end] = input_ids[start:supervised_end]
+            assistant_index += 1
             index = supervised_end
+        if assistant_index != assistant_count:
+            raise ValueError(
+                "chat template assistant span count does not match input messages: "
+                f"rendered={assistant_index}, messages={assistant_count}"
+            )
         return input_ids, labels
 
     def format_tool_observation(self, observation: str, *, assistant_closed: bool = False) -> str:
