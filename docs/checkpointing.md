@@ -1,7 +1,7 @@
 # Checkpoint and resume contract
 
 MiniScale treats "resume" as continuation of the same training experiment, not
-as loading weights for a new experiment. Production pretraining and SFT
+as loading weights for a new experiment. Production pretraining, SFT, and DPO
 checkpoints therefore use checkpoint format v2 and stage-specific versioned
 resume identities.
 
@@ -20,12 +20,18 @@ SFT additionally verifies the parent initialization checkpoint, assistant-turn
 example format, reasoning target mode, structured mask and truncation versions,
 exact-dedup policy, global indexed data order, and minimum retained context.
 
+DPO additionally verifies the parent SFT checkpoint, frozen reference identity,
+shared-prompt pair format, target mode, pair-aware truncation, beta, prompt-hash
+split, exact-dedup policy, and global indexed pair order. `reference.pt` is an
+immutable model-only snapshot stored once in the DPO output directory; exact
+resume verifies its SHA-256 before restoring optimizer state.
+
 Paths are recorded for provenance, but compatibility uses content identities, so
 moving an unchanged dataset or tokenizer does not invalidate a checkpoint.
 Logging, W&B, generation, checkpoint-retention, and output cadence may be changed
 when resuming because they do not alter optimizer updates.
 
-Every run also writes `pretrain_run.json` or `sft_run.json`, a human-readable resolved recipe and
+Every run also writes `pretrain_run.json`, `sft_run.json`, or `dpo_run.json`, a human-readable resolved recipe and
 input identity manifest. Full checkpoints contain the same identity plus model,
 optimizer, scheduler, progress counters, and Python/NumPy/PyTorch/CUDA RNG state.
 
@@ -77,3 +83,8 @@ For SFT, `--checkpoint` starts a new run from model weights and creates a new
 optimizer/scheduler. `--resume` requires a full SFT checkpoint and restores the
 same run exactly. A legacy pretraining `best.pt` is therefore a valid SFT
 `--checkpoint`, but it is never an SFT `--resume` checkpoint.
+
+For DPO, `--checkpoint` must be an SFT checkpoint and creates both the initial
+policy and frozen `reference.pt`. `--resume` requires a full DPO checkpoint plus
+the unchanged `reference.pt` in the same output directory. Final `dpo.pt` keeps
+top-level model/config fields for inference and GRPO hand-off.

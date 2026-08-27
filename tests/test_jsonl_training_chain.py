@@ -19,7 +19,7 @@ from miniscale.training import (
     run_pretrain_jsonl,
     run_sft_jsonl,
 )
-from miniscale.training.common import save_checkpoint
+from miniscale.training.common import load_checkpoint, save_checkpoint
 
 
 def write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
@@ -136,7 +136,23 @@ class JsonlTrainingChainTests(unittest.TestCase):
                     device="cpu",
                 ),
             )
-            run_dpo_jsonl(model, tokenizer, dpo, root / "dpo-out", DPOOptions(steps=1, batch_size=1, device="cpu"))
+            dpo_result = run_dpo_jsonl(
+                model,
+                tokenizer,
+                dpo,
+                root / "dpo-out",
+                DPOOptions(
+                    steps=1,
+                    batch_size=1,
+                    gradient_accumulation_steps=1,
+                    validation_fraction=0,
+                    warmup_steps=0,
+                    save_every=0,
+                    generation_every=0,
+                    device="cpu",
+                ),
+            )
+            model = load_checkpoint(dpo_result["checkpoint"])
             run_grpo_jsonl(
                 model, tokenizer, rl, root / "grpo-out",
                 GRPOOptions(steps=1, group_size=2, max_new_tokens=4, data_limit=1, device="cpu"),

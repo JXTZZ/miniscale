@@ -160,6 +160,7 @@ def save_checkpoint(
 ) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(f"{target.suffix}.tmp")
     torch.save(
         {
             "stage": stage,
@@ -168,8 +169,9 @@ def save_checkpoint(
             "config": model.config,
             "model": model.state_dict(),
         },
-        target,
+        temporary,
     )
+    temporary.replace(target)
     return target
 
 

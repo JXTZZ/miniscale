@@ -171,6 +171,42 @@ class TrackingTests(unittest.TestCase):
             self.assertEqual([step for _, step in recovered_run.logged], [10, 11, 12])
             self.assertFalse((Path(directory) / "pending.jsonl").exists())
 
+    def test_dpo_metrics_and_comparison_generations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            generation = Path(directory) / "dpo-generation.json"
+            generation.write_text(json.dumps({
+                "stage": "dpo",
+                "step": 5,
+                "samples": [{
+                    "language": "zh",
+                    "name": "comparison",
+                    "prompt": "你好",
+                    "policy_response": "新回答",
+                    "reference_response": "旧回答",
+                    "policy_generated_tokens": 3,
+                    "reference_generated_tokens": 3,
+                }],
+            }), encoding="utf-8")
+            run = FakeRun()
+            tracker = WandbTracker(FakeWandb(), run)
+            value = metric(5)
+            value.update({
+                "pairs_seen": 16,
+                "preference_accuracy": 0.75,
+                "reward_margin": 0.2,
+                "validation_loss": 0.6,
+                "validation_reward_accuracy": 0.8,
+                "validation_reward_margin": 0.3,
+                "validation_pairs": 10,
+                "best_val_loss": 0.6,
+            })
+            tracker.log(value, generation_path=generation)
+            scalars, _ = run.logged[0]
+            table, _ = run.logged[1]
+            self.assertEqual(scalars["train/pairs_seen"], 16)
+            self.assertEqual(scalars["eval/reward_accuracy"], 0.8)
+            self.assertIn("reference_response", table["eval/generations"]["columns"])
+
     def test_pending_queue_survives_process_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             pending = Path(directory) / "wandb_pending.jsonl"

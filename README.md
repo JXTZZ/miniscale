@@ -116,6 +116,12 @@ uv run miniscale sft --steps 3000 --batch-size 1 \
   --output artifacts/sft
 
 uv run miniscale dpo --steps 1000 --batch-size 1 \
+  --gradient-accumulation 16 --max-length 512 \
+  --precision bf16 \
+  --learning-rate 5e-6 --min-learning-rate 5e-7 --beta 0.1 \
+  --warmup-steps 50 \
+  --validation-every 100 --validation-batches 100 \
+  --save-every 200 --keep-last 3 --generation-every 500 \
   --checkpoint artifacts/sft/sft.pt \
   --output artifacts/dpo
 
@@ -133,6 +139,10 @@ uv run miniscale agent-rl --steps 500 --batch-size 1 --group-size 4 \
 跳过 exact duplicate，并在超过 context 时同时保留最近 prompt 和回复开头。训练前建议先运行
 `audit-sft-data`；reasoning mask、旧 10k 权重启动、3050 Ti/5070 配置和精确恢复命令见
 [`docs/sft.md`](docs/sft.md)。
+
+正式 DPO 会校验 chosen/rejected 的共享 prompt，执行 pair-aware 安全截断和 prompt-hash 验证切分，
+并支持 BF16、梯度累计、best/periodic/final checkpoint、固定 reference 与精确恢复。MiniMind 数据
+审计、3050 Ti/5070 配置、指标解释和恢复命令见 [`docs/dpo.md`](docs/dpo.md)。
 
 预训练前 200 step 线性 warmup 到 `3e-4`，之后 cosine decay 到 `3e-5`。每 200 step
 计算 `validation_loss` 和 `perplexity`；只要 validation loss 创历史最低，就立即覆盖 `best.pt`。

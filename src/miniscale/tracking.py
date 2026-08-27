@@ -188,17 +188,17 @@ class WandbTracker:
             if not isinstance(path, str):
                 raise ValueError("pending W&B generation path is malformed")
             generation = json.loads(Path(path).read_text(encoding="utf-8"))
+            if generation.get("stage") == "dpo":
+                columns = [
+                    "step", "language", "name", "prompt", "policy_response",
+                    "reference_response", "policy_generated_tokens", "reference_generated_tokens",
+                ]
+            else:
+                columns = ["step", "language", "name", "prompt", "response", "generated_tokens"]
             table = self._wandb.Table(
-                columns=["step", "language", "name", "prompt", "response", "generated_tokens"],
+                columns=columns,
                 data=[
-                    [
-                        generation["step"],
-                        sample["language"],
-                        sample["name"],
-                        sample["prompt"],
-                        sample["response"],
-                        sample["generated_tokens"],
-                    ]
+                    [generation["step"], *[sample[column] for column in columns[1:]]]
                     for sample in generation["samples"]
                 ],
             )
@@ -218,25 +218,53 @@ class WandbTracker:
         }
         optional_metrics = {
             "examples_seen": "train/examples_seen",
+            "pairs_seen": "train/pairs_seen",
             "target_tokens_seen": "train/target_tokens_seen",
             "grad_was_clipped": "train/grad_was_clipped",
             "update_seconds": "performance/update_seconds",
             "tokens_per_second": "performance/tokens_per_second",
             "supervised_tokens_per_second": "performance/supervised_tokens_per_second",
             "samples_per_second": "performance/samples_per_second",
+            "pairs_per_second": "performance/pairs_per_second",
             "cuda_peak_memory_mb": "performance/cuda_peak_memory_mb",
+            "preference_accuracy": "train/preference_accuracy",
+            "reward_accuracy": "train/reward_accuracy",
+            "reward_margin": "train/reward_margin",
+            "chosen_reward": "train/chosen_reward",
+            "rejected_reward": "train/rejected_reward",
+            "policy_chosen_logp": "train/policy_chosen_logp",
+            "policy_rejected_logp": "train/policy_rejected_logp",
+            "policy_logp_margin": "train/policy_logp_margin",
+            "reference_logp_margin": "train/reference_logp_margin",
+            "policy_preference_accuracy": "train/policy_preference_accuracy",
         }
         for source, target in optional_metrics.items():
             if source in metric:
                 values[target] = metric[source]
         if "validation_loss" in metric:
             values["eval/loss"] = metric["validation_loss"]
-            values["eval/perplexity"] = metric["perplexity"]
             values["eval/best_loss"] = metric["best_val_loss"]
+            if "perplexity" in metric:
+                values["eval/perplexity"] = metric["perplexity"]
             if "validation_token_accuracy" in metric:
                 values["eval/token_accuracy"] = metric["validation_token_accuracy"]
             if "validation_target_tokens" in metric:
                 values["eval/target_tokens"] = metric["validation_target_tokens"]
+            dpo_validation_metrics = {
+                "validation_reward_accuracy": "eval/reward_accuracy",
+                "validation_reward_margin": "eval/reward_margin",
+                "validation_chosen_reward": "eval/chosen_reward",
+                "validation_rejected_reward": "eval/rejected_reward",
+                "validation_policy_logp_margin": "eval/policy_logp_margin",
+                "validation_reference_logp_margin": "eval/reference_logp_margin",
+                "validation_policy_preference_accuracy": "eval/policy_preference_accuracy",
+                "validation_pairs": "eval/pairs",
+                "validation_chosen_tokens": "eval/chosen_tokens",
+                "validation_rejected_tokens": "eval/rejected_tokens",
+            }
+            for source, target in dpo_validation_metrics.items():
+                if source in metric:
+                    values[target] = metric[source]
         return values
 
     def _schedule_retry(self, step: int) -> None:

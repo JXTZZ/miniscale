@@ -10,6 +10,7 @@ import torch
 from .agent_env import CalculatorEnv
 from .config import MiniScaleConfig
 from .data_audit import audit_pretrain_jsonl, save_data_audit
+from .dpo_data_audit import audit_dpo_jsonl, save_dpo_data_audit
 from .inference import GenerationOptions, generate_from_checkpoint
 from .model import MiniScaleForCausalLM
 from .pipeline import run_training_pipeline
@@ -22,6 +23,7 @@ from .training import (
 )
 from .training.common import load_checkpoint, seed_everything
 from .training.pretrain import pretrain_option_default
+from .training.dpo_config import dpo_option_default
 from .training.sft_config import sft_option_default
 
 
@@ -98,6 +100,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="case-insensitive identity/brand substring to count; repeat for multiple patterns",
     )
+    audit_dpo = subcommands.add_parser(
+        "audit-dpo-data", help="scan preference JSONL and report pair validity, splits, and truncation"
+    )
+    audit_dpo.add_argument("--data", type=Path, default=DEFAULT_DATA / "preference/dpo.jsonl")
+    audit_dpo.add_argument("--tokenizer", type=Path, default=Path("data/tokenizer/minimind"))
+    audit_dpo.add_argument("--output", type=Path)
+    audit_dpo.add_argument("--max-length", type=int, default=512)
+    audit_dpo.add_argument(
+        "--min-context-tokens", type=int, default=dpo_option_default("min_context_tokens")
+    )
+    audit_dpo.add_argument(
+        "--target-mode",
+        choices=("reasoning_and_response", "response_only"),
+        default="reasoning_and_response",
+    )
+    audit_dpo.add_argument(
+        "--validation-fraction", type=float, default=dpo_option_default("validation_fraction")
+    )
+    audit_dpo.add_argument("--sample-size", type=int, default=2000)
+    audit_dpo.add_argument("--seed", type=int, default=dpo_option_default("seed"))
     prepare_sft = subcommands.add_parser(
         "prepare-sft-data", help="write a deduplicated and optionally filtered derived SFT JSONL"
     )
@@ -263,16 +285,71 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sft.add_argument("--wandb-retry-every", type=int, default=sft_option_default("wandb_retry_every_steps"))
     dpo = training_parser("dpo", "preference optimization from sft.pt", DEFAULT_DATA / "preference/dpo.jsonl")
-    dpo.add_argument("--checkpoint", type=Path, required=True)
-    dpo.add_argument("--learning-rate", type=float, default=5e-6)
-    dpo.add_argument("--beta", type=float, default=0.1)
+    dpo.set_defaults(
+        batch_size=dpo_option_default("batch_size"),
+        log_every=dpo_option_default("log_every"),
+    )
+    dpo_source = dpo.add_mutually_exclusive_group(required=True)
+    dpo_source.add_argument("--checkpoint", type=Path, help="initialize a new DPO run from SFT weights")
+    dpo_source.add_argument("--resume", type=Path, help="resume the exact state of a full DPO checkpoint")
+    dpo.add_argument("--max-length", type=int, help="defaults to the checkpoint context length")
+    dpo.add_argument(
+        "--gradient-accumulation", type=int,
+        default=dpo_option_default("gradient_accumulation_steps"),
+    )
+    dpo.add_argument("--learning-rate", type=float, default=dpo_option_default("learning_rate"))
+    dpo.add_argument("--min-learning-rate", type=float, default=dpo_option_default("min_learning_rate"))
+    dpo.add_argument("--weight-decay", type=float, default=dpo_option_default("weight_decay"))
+    dpo.add_argument("--adam-beta1", type=float, default=dpo_option_default("adam_beta1"))
+    dpo.add_argument("--adam-beta2", type=float, default=dpo_option_default("adam_beta2"))
+    dpo.add_argument("--adam-eps", type=float, default=dpo_option_default("adam_eps"))
+    dpo.add_argument("--beta", type=float, default=dpo_option_default("beta"))
+    dpo.add_argument("--grad-clip", type=float, default=dpo_option_default("grad_clip"))
+    dpo.add_argument("--warmup-steps", type=int, default=dpo_option_default("warmup_steps"))
+    dpo.add_argument(
+        "--precision", choices=("fp32", "bf16"), default=dpo_option_default("precision")
+    )
     dpo.add_argument(
         "--target-mode",
         choices=("reasoning_and_response", "response_only"),
-        default="reasoning_and_response",
-        help="must match the completion semantics used by the parent SFT run",
+        default=None,
+        help="defaults to and must match the completion semantics stored by the parent SFT run",
     )
-    dpo.add_argument("--min-context-tokens", type=int, default=32)
+    dpo.add_argument(
+        "--min-context-tokens", type=int, default=dpo_option_default("min_context_tokens")
+    )
+    dpo.add_argument(
+        "--validation-fraction", type=float, default=dpo_option_default("validation_fraction")
+    )
+    dpo.add_argument("--validation-data", type=Path, help="optional dedicated DPO validation JSONL")
+    dpo.add_argument("--validation-every", type=int, default=dpo_option_default("validation_every"))
+    dpo.add_argument("--validation-batches", type=int, default=dpo_option_default("validation_batches"))
+    dpo.add_argument("--save-every", type=int, default=dpo_option_default("save_every"))
+    dpo.add_argument("--keep-last", type=int, default=dpo_option_default("keep_last_checkpoints"))
+    dpo.add_argument("--generation-every", type=int, default=dpo_option_default("generation_every"))
+    dpo.add_argument(
+        "--generation-max-new-tokens", type=int,
+        default=dpo_option_default("generation_max_new_tokens"),
+    )
+    dpo.add_argument(
+        "--deduplicate-exact",
+        action=argparse.BooleanOptionalAction,
+        default=dpo_option_default("deduplicate_exact"),
+    )
+    dpo.add_argument("--seed", type=int, default=dpo_option_default("seed"))
+    dpo.add_argument("--num-workers", type=int, default=dpo_option_default("num_workers"))
+    dpo.add_argument("--wandb", action="store_true", default=dpo_option_default("wandb_enabled"))
+    dpo.add_argument("--wandb-project", default=dpo_option_default("wandb_project"))
+    dpo.add_argument("--wandb-entity")
+    dpo.add_argument("--wandb-run-name")
+    dpo.add_argument("--wandb-run-id")
+    dpo.add_argument(
+        "--wandb-mode", choices=("online", "offline", "disabled"),
+        default=dpo_option_default("wandb_mode"),
+    )
+    dpo.add_argument(
+        "--wandb-retry-every", type=int, default=dpo_option_default("wandb_retry_every_steps")
+    )
     grpo = training_parser(
         "grpo", "online GRPO with verifiable math rewards", DEFAULT_DATA / "agent/agent_rl_math.jsonl"
     )
@@ -356,6 +433,21 @@ def main(argv: list[str] | None = None) -> None:
         if arguments.output is not None:
             save_sft_data_audit(result, arguments.output)
             result["report"] = str(arguments.output)
+    elif arguments.command == "audit-dpo-data":
+        tokenizer = load_tokenizer(arguments.tokenizer)
+        result = audit_dpo_jsonl(
+            arguments.data,
+            tokenizer,
+            max_length=arguments.max_length,
+            min_context_tokens=arguments.min_context_tokens,
+            target_mode=arguments.target_mode,
+            validation_fraction=arguments.validation_fraction,
+            sample_size=arguments.sample_size,
+            seed=arguments.seed,
+        )
+        if arguments.output is not None:
+            save_dpo_data_audit(result, arguments.output)
+            result["report"] = str(arguments.output)
     elif arguments.command == "prepare-sft-data":
         result = prepare_sft_jsonl(
             arguments.data,
@@ -407,7 +499,8 @@ def main(argv: list[str] | None = None) -> None:
             ), validation_path=arguments.validation_data)
         else:
             checkpoint_source = (
-                arguments.resume if arguments.command == "sft" and arguments.resume is not None
+                arguments.resume
+                if arguments.command in {"sft", "dpo"} and arguments.resume is not None
                 else arguments.checkpoint
             )
             model = load_checkpoint(checkpoint_source)
@@ -452,12 +545,52 @@ def main(argv: list[str] | None = None) -> None:
                     resume_from=arguments.resume,
                 ), validation_path=arguments.validation_data, initial_checkpoint_path=arguments.checkpoint)
             elif arguments.command == "dpo":
-                result = run_dpo_jsonl(model, tokenizer, arguments.data, arguments.output, DPOOptions(
-                    steps=arguments.steps, batch_size=arguments.batch_size, learning_rate=arguments.learning_rate,
-                    beta=arguments.beta, target_mode=arguments.target_mode,
-                    min_context_tokens=arguments.min_context_tokens,
-                    log_every=arguments.log_every, device=arguments.device,
-                ))
+                result = run_dpo_jsonl(
+                    model,
+                    tokenizer,
+                    arguments.data,
+                    arguments.output,
+                    DPOOptions(
+                        steps=arguments.steps,
+                        batch_size=arguments.batch_size,
+                        max_length=arguments.max_length,
+                        min_context_tokens=arguments.min_context_tokens,
+                        target_mode=arguments.target_mode,
+                        learning_rate=arguments.learning_rate,
+                        min_learning_rate=arguments.min_learning_rate,
+                        weight_decay=arguments.weight_decay,
+                        adam_beta1=arguments.adam_beta1,
+                        adam_beta2=arguments.adam_beta2,
+                        adam_eps=arguments.adam_eps,
+                        beta=arguments.beta,
+                        grad_clip=arguments.grad_clip,
+                        warmup_steps=arguments.warmup_steps,
+                        precision=arguments.precision,
+                        gradient_accumulation_steps=arguments.gradient_accumulation,
+                        validation_fraction=arguments.validation_fraction,
+                        validation_every=arguments.validation_every,
+                        validation_batches=arguments.validation_batches,
+                        save_every=arguments.save_every,
+                        keep_last_checkpoints=arguments.keep_last,
+                        generation_every=arguments.generation_every,
+                        generation_max_new_tokens=arguments.generation_max_new_tokens,
+                        deduplicate_exact=arguments.deduplicate_exact,
+                        log_every=arguments.log_every,
+                        num_workers=arguments.num_workers,
+                        seed=arguments.seed,
+                        device=arguments.device,
+                        wandb_enabled=arguments.wandb,
+                        wandb_project=arguments.wandb_project,
+                        wandb_entity=arguments.wandb_entity,
+                        wandb_run_name=arguments.wandb_run_name,
+                        wandb_run_id=arguments.wandb_run_id,
+                        wandb_mode=arguments.wandb_mode,
+                        wandb_retry_every_steps=arguments.wandb_retry_every,
+                        resume_from=arguments.resume,
+                    ),
+                    validation_path=arguments.validation_data,
+                    initial_checkpoint_path=arguments.checkpoint,
+                )
             elif arguments.command == "grpo":
                 result = run_grpo_jsonl(model, tokenizer, arguments.data, arguments.output, GRPOOptions(
                     steps=arguments.steps, batch_size=arguments.batch_size, group_size=arguments.group_size,
