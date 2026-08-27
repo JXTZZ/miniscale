@@ -22,6 +22,7 @@ from .training import (
     run_pretrain,
     run_sft,
 )
+from .training.common import save_checkpoint
 
 
 PRETRAIN_TEXTS = [
@@ -90,16 +91,24 @@ def run_training_pipeline(output_dir: str | Path, *, device: str = "auto") -> di
         model,
         tokenizer,
         RL_TASKS,
-        output,
+        output / "grpo",
         GRPOOptions(steps=1, group_size=2, max_new_tokens=16, device=device),
+    )
+    save_checkpoint(
+        output / "rl.pt", model, stage="grpo", step=1,
+        metrics={"reward_mean": float(stages["rl"]["reward_mean"])},
     )
     stages["agent_rl"] = _timed_stage(
         run_agent_grpo,
         model,
         tokenizer,
         AGENT_TASKS,
-        output,
+        output / "agent_rl",
         AgentRLOptions(steps=1, group_size=2, max_turns=2, max_new_tokens=100, device=device),
+    )
+    save_checkpoint(
+        output / "agent_rl.pt", model, stage="agent_rl", step=1,
+        metrics={"reward_mean": float(stages["agent_rl"]["reward_mean"])},
     )
     prompt_ids = tokenizer.encode("<|user|>\n2+3?<|end|>\n<|assistant|>\n", bos=True)
     prompt = torch.tensor([prompt_ids], device=next(model.parameters()).device)

@@ -11,7 +11,7 @@ def main() -> None:
         MiniScaleForCausalLM(MiniScaleConfig.smoke()),
         ByteTokenizer(),
         tasks,
-        "artifacts",
+        "artifacts/agent-rl-smoke",
         AgentRLOptions(steps=1, group_size=2, max_turns=2, max_new_tokens=12),
     )
     print(metrics)

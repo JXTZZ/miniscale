@@ -237,6 +237,22 @@ class WandbTracker:
             "policy_logp_margin": "train/policy_logp_margin",
             "reference_logp_margin": "train/reference_logp_margin",
             "policy_preference_accuracy": "train/policy_preference_accuracy",
+            "reward_mean": "train/reward_mean",
+            "reward_std": "train/reward_std",
+            "reward_max": "train/reward_max",
+            "policy_loss": "train/policy_loss",
+            "kl": "train/kl",
+            "clip_fraction": "train/clip_fraction",
+            "zero_advantage_group_rate": "train/zero_advantage_group_rate",
+            "prompts_seen": "train/prompts_seen",
+            "rollouts_seen": "train/rollouts_seen",
+            "action_tokens_seen": "train/action_tokens_seen",
+            "optimizer_steps": "train/optimizer_steps",
+            "success_rate": "train/success_rate",
+            "tool_call_rate": "train/tool_call_rate",
+            "invalid_call_rate": "train/invalid_call_rate",
+            "mean_turns": "train/mean_turns",
+            "rollouts_per_second": "performance/rollouts_per_second",
         }
         for source, target in optional_metrics.items():
             if source in metric:
@@ -265,6 +281,18 @@ class WandbTracker:
             for source, target in dpo_validation_metrics.items():
                 if source in metric:
                     values[target] = metric[source]
+        rl_validation_metrics = {
+            "validation_reward": "eval/reward",
+            "validation_exact_match": "eval/exact_match",
+            "validation_success_rate": "eval/success_rate",
+            "validation_tool_call_rate": "eval/tool_call_rate",
+            "validation_invalid_call_rate": "eval/invalid_call_rate",
+            "validation_mean_turns": "eval/mean_turns",
+            "best_validation_reward": "eval/best_reward",
+        }
+        for source, target in rl_validation_metrics.items():
+            if source in metric:
+                values[target] = metric[source]
         return values
 
     def _schedule_retry(self, step: int) -> None:

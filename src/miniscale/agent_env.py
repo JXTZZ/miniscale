@@ -3,8 +3,11 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 import json
+import math
 import operator
 import re
+
+from .rewards import MathReward, score_math_answer
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,6 +17,19 @@ class CalculatorTask:
     answer: str | tuple[str, ...]
     system_prompt: str | None = None
     tools: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    name: str
+    arguments: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecution:
+    observation: str | None
+    valid: bool
+    error: str | None = None
 
 
 _BINARY_OPERATORS = {
@@ -27,6 +43,7 @@ _BINARY_OPERATORS = {
 }
 _UNARY_OPERATORS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
 _TOOL_CALL = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+CALCULATOR_NAMES = frozenset({"calculator", "calculate_math"})
 
 
 def safe_calculate(expression: str) -> int | float:
@@ -46,22 +63,65 @@ def safe_calculate(expression: str) -> int | float:
 
     if len(expression) > 100:
         raise ValueError("expression is too long")
-    return evaluate(ast.parse(expression, mode="eval").body)
+    result = evaluate(ast.parse(expression, mode="eval").body)
+    if type(result) not in {int, float} or not math.isfinite(result):
+        raise ValueError("calculation result must be a finite real number")
+    if abs(result) > 1_000_000_000_000:
+        raise ValueError("calculation result is too large")
+    return result
+
+
+def parse_tool_call_payload(text: str) -> ToolCall | None:
+    matches = _TOOL_CALL.findall(text)
+    if len(matches) != 1:
+        return None
+    try:
+        payload = json.loads(matches[0])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    name = payload.get("name", "calculator")
+    arguments = payload.get("arguments", payload)
+    if not isinstance(name, str) or not isinstance(arguments, dict):
+        return None
+    return ToolCall(name=name, arguments=arguments)
 
 
 def parse_tool_call(text: str) -> str | None:
-    match = _TOOL_CALL.search(text)
-    if match is None:
+    call = parse_tool_call_payload(text)
+    if call is None or call.name not in CALCULATOR_NAMES:
         return None
-    try:
-        payload = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return None
-    if payload.get("name", "calculator") not in {"calculator", "calculate_math"}:
-        return None
-    arguments = payload.get("arguments", payload)
-    expression = arguments.get("expression") if isinstance(arguments, dict) else None
+    expression = call.arguments.get("expression")
     return expression if isinstance(expression, str) else None
+
+
+def filter_calculator_tools(tools: object | None) -> list[dict[str, object]] | None:
+    """Return only schemas executable by CalculatorEnv.
+
+    MiniMind math rows also advertise weather. Exposing that schema while the
+    environment cannot execute it teaches an impossible action, so it is
+    deliberately removed at the data boundary.
+    """
+
+    if tools is None:
+        return None
+    if isinstance(tools, str):
+        try:
+            tools = json.loads(tools)
+        except json.JSONDecodeError as error:
+            raise ValueError("tools must contain valid JSON") from error
+    if not isinstance(tools, list):
+        raise ValueError("tools must be a list")
+    supported: list[dict[str, object]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function", tool)
+        name = function.get("name") if isinstance(function, dict) else None
+        if name in CALCULATOR_NAMES:
+            supported.append(tool)
+    return supported or None
 
 
 class CalculatorEnv:
@@ -74,33 +134,48 @@ class CalculatorEnv:
         self.task = task
         self.valid_calls = 0
         self.invalid_calls = 0
+        self.last_error: str | None = None
 
-    def execute(self, assistant_text: str) -> str | None:
-        expression = parse_tool_call(assistant_text)
-        if expression is None:
+    def step(self, assistant_text: str) -> ToolExecution:
+        call = parse_tool_call_payload(assistant_text)
+        if call is None:
             if "<tool_call>" in assistant_text:
                 self.invalid_calls += 1
-            return None
+                self.last_error = "invalid_tool_call"
+                return ToolExecution("error: invalid tool call", False, self.last_error)
+            return ToolExecution(None, False, None)
+        if call.name not in CALCULATOR_NAMES:
+            self.invalid_calls += 1
+            self.last_error = "unsupported_tool"
+            return ToolExecution(f"error: unsupported tool {call.name}", False, self.last_error)
+        expression = call.arguments.get("expression")
+        if not isinstance(expression, str) or not expression.strip():
+            self.invalid_calls += 1
+            self.last_error = "invalid_arguments"
+            return ToolExecution("error: expression must be a non-empty string", False, self.last_error)
         try:
             value = safe_calculate(expression)
         except (SyntaxError, ValueError, ZeroDivisionError, OverflowError):
             self.invalid_calls += 1
-            return "error: invalid arithmetic expression"
+            self.last_error = "execution_error"
+            return ToolExecution("error: invalid arithmetic expression", False, self.last_error)
         self.valid_calls += 1
-        return str(value)
+        self.last_error = None
+        return ToolExecution(str(value), True)
+
+    def execute(self, assistant_text: str) -> str | None:
+        return self.step(assistant_text).observation
+
+    def reward_components(self, final_answer: str) -> dict[str, float]:
+        base: MathReward = score_math_answer(final_answer, self.task.answer)
+        tool_bonus = 0.2 * base.correctness if self.valid_calls else 0.0
+        invalid_penalty = 0.1 * self.invalid_calls
+        return {
+            **base.metrics(),
+            "tool_bonus": tool_bonus,
+            "invalid_tool_penalty": invalid_penalty,
+            "total": base.total + tool_bonus - invalid_penalty,
+        }
 
     def reward(self, final_answer: str) -> float:
-        numbers = re.findall(r"(?<![\w.])-?\d+(?:\.\d+)?(?![\w.])", final_answer)
-        expected = (self.task.answer,) if isinstance(self.task.answer, str) else self.task.answer
-
-        def normalize(value: str) -> float | str:
-            try:
-                return float(value)
-            except ValueError:
-                return value.lstrip("+")
-
-        normalized_numbers = [normalize(number) for number in numbers]
-        matched = sum(normalize(item) in normalized_numbers for item in expected)
-        correctness = matched / len(expected) if expected else 0.0
-        tool_bonus = 0.2 * min(self.valid_calls / max(len(expected), 1), 1.0)
-        return correctness + tool_bonus - 0.1 * self.invalid_calls
+        return self.reward_components(final_answer)["total"]

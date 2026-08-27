@@ -29,6 +29,30 @@ class InferenceTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             generate_from_checkpoint("does-not-exist.pt", "hello")
 
+    def test_calculator_mode_runs_bounded_agent_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = save_checkpoint(
+                Path(directory) / "model.pt",
+                MiniScaleForCausalLM(MiniScaleConfig.smoke()),
+                stage="agent_rl",
+                step=0,
+                metrics={},
+            )
+            result = generate_from_checkpoint(
+                checkpoint,
+                "Calculate 2+3",
+                GenerationOptions(
+                    max_new_tokens=4,
+                    max_turns=2,
+                    temperature=0,
+                    calculator=True,
+                    device="cpu",
+                ),
+            )
+            self.assertIn("tool_calls", result)
+            self.assertLessEqual(result["turns"], 2)
+            self.assertIsInstance(result["transcript"], str)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,13 +7,15 @@ import platform
 
 import torch
 
-from .agent_env import CalculatorEnv
+from .agent_data import audit_agent_jsonl, save_agent_data_audit
 from .config import MiniScaleConfig
 from .data_audit import audit_pretrain_jsonl, save_data_audit
 from .dpo_data_audit import audit_dpo_jsonl, save_dpo_data_audit
+from .evaluation import evaluate_rl_checkpoints
 from .inference import GenerationOptions, generate_from_checkpoint
 from .model import MiniScaleForCausalLM
 from .pipeline import run_training_pipeline
+from .rl_data import audit_rl_jsonl, save_rl_data_audit
 from .sft_data_audit import audit_sft_jsonl, save_sft_data_audit
 from .sft_data_prepare import prepare_sft_jsonl
 from .tokenizer import load_tokenizer, train_sentencepiece
@@ -25,6 +27,7 @@ from .training.common import load_checkpoint, seed_everything
 from .training.pretrain import pretrain_option_default
 from .training.dpo_config import dpo_option_default
 from .training.sft_config import sft_option_default
+from .training.rl_config import agent_rl_option_default, grpo_option_default
 
 
 DEFAULT_DATA = Path("data/raw/minimind")
@@ -51,15 +54,33 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--checkpoint", type=Path, required=True)
     generate.add_argument("--tokenizer", type=Path, help="tokenizer directory or SentencePiece .model")
     generate.add_argument("--prompt", required=True)
-    system = generate.add_mutually_exclusive_group()
-    system.add_argument("--system-prompt")
-    system.add_argument("--calculator", action="store_true", help="inject the calculator tool schema")
+    generate.add_argument("--system-prompt")
+    generate.add_argument(
+        "--calculator", action="store_true",
+        help="execute calculator calls in a bounded multi-turn inference loop",
+    )
+    generate.add_argument("--max-turns", type=int, default=6)
     generate.add_argument("--max-new-tokens", type=int, default=128)
     generate.add_argument("--temperature", type=float, default=0.7)
     generate.add_argument("--top-k", type=int, default=50, help="use 0 to disable top-k sampling")
     generate.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     generate.add_argument("--raw-prompt", action="store_true", help="skip the chat template (useful for base models)")
     generate.add_argument("--raw", action="store_true", help="print only the generated response")
+    evaluate = subcommands.add_parser(
+        "evaluate", help="compare checkpoints on a fixed verifiable or tool-use validation suite"
+    )
+    evaluate.add_argument("--checkpoint", type=Path, action="append", required=True)
+    evaluate.add_argument("--kind", choices=("grpo", "agent"), default="grpo")
+    evaluate.add_argument("--data", type=Path, default=DEFAULT_DATA / "agent/agent_rl_math.jsonl")
+    evaluate.add_argument("--tokenizer", type=Path, default=Path("data/tokenizer/minimind"))
+    evaluate.add_argument("--output", type=Path)
+    evaluate.add_argument("--validation-fraction", type=float, default=0.05)
+    evaluate.add_argument("--prompts", type=int, default=100)
+    evaluate.add_argument("--max-new-tokens", type=int, default=128)
+    evaluate.add_argument("--max-turns", type=int, default=6)
+    evaluate.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
+    evaluate.add_argument("--seed", type=int, default=42)
+    evaluate.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     inspect_tokenizer = subcommands.add_parser("tokenize", help="inspect token ids and pieces for text")
     inspect_tokenizer.add_argument("--tokenizer", type=Path, default=Path("data/tokenizer/minimind"))
     inspect_tokenizer.add_argument("--text", required=True)
@@ -120,6 +141,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audit_dpo.add_argument("--sample-size", type=int, default=2000)
     audit_dpo.add_argument("--seed", type=int, default=dpo_option_default("seed"))
+    audit_grpo = subcommands.add_parser(
+        "audit-grpo-data", help="scan verifiable RL data, stable splits, duplicates, and invalid rows"
+    )
+    audit_grpo.add_argument("--data", type=Path, default=DEFAULT_DATA / "agent/agent_rl_math.jsonl")
+    audit_grpo.add_argument("--output", type=Path)
+    audit_grpo.add_argument(
+        "--validation-fraction", type=float, default=grpo_option_default("validation_fraction")
+    )
+    audit_grpo.add_argument("--sample-size", type=int, default=2000)
+    audit_grpo.add_argument("--seed", type=int, default=grpo_option_default("seed"))
+    audit_agent = subcommands.add_parser(
+        "audit-agent-data", help="scan Agent-RL rows and verify executable tool capabilities"
+    )
+    audit_agent.add_argument("--data", type=Path, default=DEFAULT_DATA / "agent/agent_rl_math.jsonl")
+    audit_agent.add_argument("--output", type=Path)
+    audit_agent.add_argument(
+        "--validation-fraction", type=float, default=agent_rl_option_default("validation_fraction")
+    )
+    audit_agent.add_argument("--seed", type=int, default=agent_rl_option_default("seed"))
     prepare_sft = subcommands.add_parser(
         "prepare-sft-data", help="write a deduplicated and optionally filtered derived SFT JSONL"
     )
@@ -350,19 +390,67 @@ def build_parser() -> argparse.ArgumentParser:
     dpo.add_argument(
         "--wandb-retry-every", type=int, default=dpo_option_default("wandb_retry_every_steps")
     )
+
+    def add_rl_arguments(command: argparse.ArgumentParser, *, agent_stage: bool = False) -> None:
+        default = agent_rl_option_default if agent_stage else grpo_option_default
+        command.set_defaults(batch_size=default("batch_size"), log_every=default("log_every"))
+        source = command.add_mutually_exclusive_group(required=True)
+        source.add_argument("--checkpoint", type=Path, help="initialize from the previous stage")
+        source.add_argument("--resume", type=Path, help="resume an exact full-stage checkpoint")
+        command.add_argument("--group-size", type=int, default=default("group_size"))
+        command.add_argument("--max-new-tokens", type=int, default=default("max_new_tokens"))
+        command.add_argument("--policy-epochs", type=int, default=default("policy_epochs"))
+        command.add_argument("--learning-rate", type=float, default=default("learning_rate"))
+        command.add_argument("--min-learning-rate", type=float, default=default("min_learning_rate"))
+        command.add_argument("--weight-decay", type=float, default=default("weight_decay"))
+        command.add_argument("--adam-beta1", type=float, default=default("adam_beta1"))
+        command.add_argument("--adam-beta2", type=float, default=default("adam_beta2"))
+        command.add_argument("--adam-eps", type=float, default=default("adam_eps"))
+        command.add_argument("--warmup-steps", type=int, default=default("warmup_steps"))
+        command.add_argument("--clip-epsilon", type=float, default=default("clip_epsilon"))
+        command.add_argument("--beta", type=float, default=default("beta"))
+        command.add_argument("--temperature", type=float, default=default("temperature"))
+        command.add_argument(
+            "--top-k", type=int, default=default("top_k"), help="use 0 to disable top-k sampling"
+        )
+        command.add_argument("--grad-clip", type=float, default=default("grad_clip"))
+        command.add_argument(
+            "--precision", choices=("fp32", "bf16"), default=default("precision")
+        )
+        command.add_argument(
+            "--reference-device", choices=("same", "cpu"), default=default("reference_device"),
+            help="use cpu to reduce GPU memory at the cost of slower reference scoring",
+        )
+        command.add_argument(
+            "--validation-fraction", type=float, default=default("validation_fraction")
+        )
+        command.add_argument("--validation-data", type=Path)
+        command.add_argument("--validation-every", type=int, default=default("validation_every"))
+        command.add_argument("--validation-prompts", type=int, default=default("validation_prompts"))
+        command.add_argument("--save-every", type=int, default=default("save_every"))
+        command.add_argument("--keep-last", type=int, default=default("keep_last_checkpoints"))
+        command.add_argument("--data-limit", type=int, default=default("data_limit"))
+        command.add_argument("--seed", type=int, default=default("seed"))
+        command.add_argument("--wandb", action="store_true", default=default("wandb_enabled"))
+        command.add_argument("--wandb-project", default=default("wandb_project"))
+        command.add_argument("--wandb-entity")
+        command.add_argument("--wandb-run-name")
+        command.add_argument("--wandb-run-id")
+        command.add_argument(
+            "--wandb-mode", choices=("online", "offline", "disabled"),
+            default=default("wandb_mode"),
+        )
+        command.add_argument(
+            "--wandb-retry-every", type=int, default=default("wandb_retry_every_steps")
+        )
+
     grpo = training_parser(
         "grpo", "online GRPO with verifiable math rewards", DEFAULT_DATA / "agent/agent_rl_math.jsonl"
     )
-    grpo.add_argument("--checkpoint", type=Path, required=True)
-    grpo.add_argument("--group-size", type=int, default=4)
-    grpo.add_argument("--max-new-tokens", type=int, default=128)
-    grpo.add_argument("--data-limit", type=int, default=1000)
+    add_rl_arguments(grpo)
     agent = training_parser("agent-rl", "tool-use Agent GRPO", DEFAULT_DATA / "agent/agent_rl_math.jsonl")
-    agent.add_argument("--checkpoint", type=Path, required=True)
-    agent.add_argument("--group-size", type=int, default=4)
-    agent.add_argument("--max-new-tokens", type=int, default=128)
-    agent.add_argument("--max-turns", type=int, default=6)
-    agent.add_argument("--data-limit", type=int, default=1000)
+    add_rl_arguments(agent, agent_stage=True)
+    agent.add_argument("--max-turns", type=int, default=agent_rl_option_default("max_turns"))
     return parser
 
 
@@ -372,6 +460,21 @@ def main(argv: list[str] | None = None) -> None:
         result = environment_report()
     elif arguments.command == "pipeline":
         result = run_training_pipeline(arguments.output, device=arguments.device)
+    elif arguments.command == "evaluate":
+        result = evaluate_rl_checkpoints(
+            arguments.checkpoint,
+            arguments.data,
+            arguments.tokenizer,
+            kind=arguments.kind,
+            validation_fraction=arguments.validation_fraction,
+            prompts=arguments.prompts,
+            max_new_tokens=arguments.max_new_tokens,
+            max_turns=arguments.max_turns,
+            precision=arguments.precision,
+            seed=arguments.seed,
+            device=arguments.device,
+            output_path=arguments.output,
+        )
     elif arguments.command == "generate":
         result = generate_from_checkpoint(
             arguments.checkpoint,
@@ -381,9 +484,11 @@ def main(argv: list[str] | None = None) -> None:
                 temperature=arguments.temperature,
                 top_k=arguments.top_k or None,
                 device=arguments.device,
-                system_prompt=CalculatorEnv.tool_prompt if arguments.calculator else arguments.system_prompt,
+                system_prompt=arguments.system_prompt,
                 tokenizer_path=arguments.tokenizer,
                 raw_prompt=arguments.raw_prompt,
+                calculator=arguments.calculator,
+                max_turns=arguments.max_turns,
             ),
         )
         if arguments.raw:
@@ -448,6 +553,25 @@ def main(argv: list[str] | None = None) -> None:
         if arguments.output is not None:
             save_dpo_data_audit(result, arguments.output)
             result["report"] = str(arguments.output)
+    elif arguments.command == "audit-grpo-data":
+        result = audit_rl_jsonl(
+            arguments.data,
+            validation_fraction=arguments.validation_fraction,
+            sample_size=arguments.sample_size,
+            seed=arguments.seed,
+        )
+        if arguments.output is not None:
+            save_rl_data_audit(result, arguments.output)
+            result["report"] = str(arguments.output)
+    elif arguments.command == "audit-agent-data":
+        result = audit_agent_jsonl(
+            arguments.data,
+            validation_fraction=arguments.validation_fraction,
+            seed=arguments.seed,
+        )
+        if arguments.output is not None:
+            save_agent_data_audit(result, arguments.output)
+            result["report"] = str(arguments.output)
     elif arguments.command == "prepare-sft-data":
         result = prepare_sft_jsonl(
             arguments.data,
@@ -498,11 +622,7 @@ def main(argv: list[str] | None = None) -> None:
                 num_workers=arguments.num_workers, device=arguments.device,
             ), validation_path=arguments.validation_data)
         else:
-            checkpoint_source = (
-                arguments.resume
-                if arguments.command in {"sft", "dpo"} and arguments.resume is not None
-                else arguments.checkpoint
-            )
+            checkpoint_source = arguments.resume if arguments.resume is not None else arguments.checkpoint
             model = load_checkpoint(checkpoint_source)
             if model.config.vocab_size != tokenizer.vocab_size:
                 raise ValueError("checkpoint vocabulary does not match tokenizer")
@@ -594,16 +714,52 @@ def main(argv: list[str] | None = None) -> None:
             elif arguments.command == "grpo":
                 result = run_grpo_jsonl(model, tokenizer, arguments.data, arguments.output, GRPOOptions(
                     steps=arguments.steps, batch_size=arguments.batch_size, group_size=arguments.group_size,
-                    max_new_tokens=arguments.max_new_tokens,
-                    data_limit=arguments.data_limit, log_every=arguments.log_every, device=arguments.device,
-                ))
+                    max_new_tokens=arguments.max_new_tokens, policy_epochs=arguments.policy_epochs,
+                    learning_rate=arguments.learning_rate, min_learning_rate=arguments.min_learning_rate,
+                    weight_decay=arguments.weight_decay, adam_beta1=arguments.adam_beta1,
+                    adam_beta2=arguments.adam_beta2, adam_eps=arguments.adam_eps,
+                    warmup_steps=arguments.warmup_steps, clip_epsilon=arguments.clip_epsilon,
+                    beta=arguments.beta, temperature=arguments.temperature,
+                    top_k=arguments.top_k or None, grad_clip=arguments.grad_clip,
+                    precision=arguments.precision, reference_device=arguments.reference_device,
+                    validation_fraction=arguments.validation_fraction,
+                    validation_every=arguments.validation_every,
+                    validation_prompts=arguments.validation_prompts,
+                    save_every=arguments.save_every, keep_last_checkpoints=arguments.keep_last,
+                    data_limit=arguments.data_limit, log_every=arguments.log_every,
+                    seed=arguments.seed, device=arguments.device,
+                    wandb_enabled=arguments.wandb, wandb_project=arguments.wandb_project,
+                    wandb_entity=arguments.wandb_entity, wandb_run_name=arguments.wandb_run_name,
+                    wandb_run_id=arguments.wandb_run_id, wandb_mode=arguments.wandb_mode,
+                    wandb_retry_every_steps=arguments.wandb_retry_every,
+                    resume_from=arguments.resume,
+                ), validation_path=arguments.validation_data,
+                    initial_checkpoint_path=arguments.checkpoint)
             else:
                 result = run_agent_grpo_jsonl(model, tokenizer, arguments.data, arguments.output, AgentRLOptions(
                     steps=arguments.steps, batch_size=arguments.batch_size, group_size=arguments.group_size,
-                    max_new_tokens=arguments.max_new_tokens,
-                    max_turns=arguments.max_turns, data_limit=arguments.data_limit,
-                    log_every=arguments.log_every, device=arguments.device,
-                ))
+                    max_new_tokens=arguments.max_new_tokens, max_turns=arguments.max_turns,
+                    policy_epochs=arguments.policy_epochs,
+                    learning_rate=arguments.learning_rate, min_learning_rate=arguments.min_learning_rate,
+                    weight_decay=arguments.weight_decay, adam_beta1=arguments.adam_beta1,
+                    adam_beta2=arguments.adam_beta2, adam_eps=arguments.adam_eps,
+                    warmup_steps=arguments.warmup_steps, clip_epsilon=arguments.clip_epsilon,
+                    beta=arguments.beta, temperature=arguments.temperature,
+                    top_k=arguments.top_k or None, grad_clip=arguments.grad_clip,
+                    precision=arguments.precision, reference_device=arguments.reference_device,
+                    validation_fraction=arguments.validation_fraction,
+                    validation_every=arguments.validation_every,
+                    validation_prompts=arguments.validation_prompts,
+                    save_every=arguments.save_every, keep_last_checkpoints=arguments.keep_last,
+                    data_limit=arguments.data_limit, log_every=arguments.log_every,
+                    seed=arguments.seed, device=arguments.device,
+                    wandb_enabled=arguments.wandb, wandb_project=arguments.wandb_project,
+                    wandb_entity=arguments.wandb_entity, wandb_run_name=arguments.wandb_run_name,
+                    wandb_run_id=arguments.wandb_run_id, wandb_mode=arguments.wandb_mode,
+                    wandb_retry_every_steps=arguments.wandb_retry_every,
+                    resume_from=arguments.resume,
+                ), validation_path=arguments.validation_data,
+                    initial_checkpoint_path=arguments.checkpoint)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

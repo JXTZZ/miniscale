@@ -125,12 +125,28 @@ uv run miniscale dpo --steps 1000 --batch-size 1 \
   --checkpoint artifacts/sft/sft.pt \
   --output artifacts/dpo
 
+uv run miniscale audit-grpo-data \
+  --data data/raw/minimind/agent/agent_rl_math.jsonl \
+  --output artifacts/grpo-data-audit.json
+
 uv run miniscale grpo --steps 500 --batch-size 1 --group-size 4 \
+  --policy-epochs 2 --max-new-tokens 96 \
+  --precision bf16 --reference-device cpu \
+  --validation-every 100 --validation-prompts 100 \
+  --save-every 100 --keep-last 3 \
   --checkpoint artifacts/dpo/dpo.pt \
   --output artifacts/grpo
 
-uv run miniscale agent-rl --steps 500 --batch-size 1 --group-size 4 \
-  --checkpoint artifacts/grpo/rl.pt \
+uv run miniscale audit-agent-data \
+  --data data/raw/minimind/agent/agent_rl_math.jsonl \
+  --output artifacts/agent-data-audit.json
+
+uv run miniscale agent-rl --steps 500 --batch-size 1 --group-size 2 \
+  --policy-epochs 2 --max-turns 3 --max-new-tokens 64 \
+  --precision bf16 --reference-device cpu \
+  --validation-every 50 --validation-prompts 50 \
+  --save-every 50 --keep-last 3 \
+  --checkpoint artifacts/grpo/best.pt \
   --output artifacts/agent-rl
 ```
 
@@ -143,6 +159,12 @@ uv run miniscale agent-rl --steps 500 --batch-size 1 --group-size 4 \
 正式 DPO 会校验 chosen/rejected 的共享 prompt，执行 pair-aware 安全截断和 prompt-hash 验证切分，
 并支持 BF16、梯度累计、best/periodic/final checkpoint、固定 reference 与精确恢复。MiniMind 数据
 审计、3050 Ti/5070 配置、指标解释和恢复命令见 [`docs/dpo.md`](docs/dpo.md)。
+
+正式 GRPO/Agent-RL 同样支持稳定验证切分、BF16、冻结 reference、重复 policy epoch、best/periodic/
+final checkpoint、W&B 和严格恢复。数学 verifier、防 reward hacking、3050 Ti/5070 配置见
+[`docs/grpo.md`](docs/grpo.md)；工具能力审计、多轮环境和真实计算器推理见
+[`docs/agent_rl.md`](docs/agent_rl.md)。跨阶段固定验证集比较与发布选择见
+[`docs/evaluation.md`](docs/evaluation.md)。
 
 预训练前 200 step 线性 warmup 到 `3e-4`，之后 cosine decay 到 `3e-5`。每 200 step
 计算 `validation_loss` 和 `perplexity`；只要 validation loss 创历史最低，就立即覆盖 `best.pt`。
@@ -245,10 +267,12 @@ W&B run ID 会写进所有完整 checkpoint。使用 `--resume` 时不需要再�
 Table 上传超时不会挡住 loss 曲线。可用 `--wandb-retry-every` 修改重试间隔。无法联网时也可以使用
 `--wandb-mode offline`，之后再运行 `uv run wandb sync <离线 run 目录>`。
 
-当前 GRPO 默认使用 `agent_rl_math.jsonl`，因为其中的 `gt` 能形成确定的 verifier reward。
+当前 GRPO 默认使用 `agent_rl_math.jsonl`，因为其中的 `gt` 能形成确定的 verifier reward。全量审计
+发现 20,000 行中有 19,430 个去重有效任务，默认稳定切分为 18,484 train / 946 validation。
 `rlaif.jsonl` 是开放式回答，不能拿“有没有数字”充当质量奖励；要使用它，应另接冻结的
 reward model 或 LLM-as-a-judge。混合 `agent_rl.jsonl` 还包含当前 calculator sandbox 不支持的
-工具，所以 Agent RL 也默认使用数学子集。
+工具，所以 Agent RL 也默认使用数学子集。数学数据中附带的天气、翻译、汇率等非计算器 schema 会在
+加载边界被剥离并写入审计报告，不会暴露给只能执行计算器的环境。
 
 训练时终端会打印指标，并追加写入 `artifacts/<stage>/*_metrics.jsonl`。另开终端可以这样观察：
 
@@ -277,11 +301,11 @@ checkpoint 路径。
 
 ```bash
 uv run miniscale generate \
-  --checkpoint artifacts/sft/sft.pt \
+  --checkpoint artifacts/agent-rl/best.pt \
   --tokenizer data/tokenizer/minimind \
-  --prompt "你好，中国的首都是哪里？" \
-  --temperature 0 \
-  --max-new-tokens 100
+  --prompt "请计算 7109*2920，只给最终结果。" \
+  --calculator --max-turns 3 \
+  --temperature 0 --max-new-tokens 64
 
 # 也可以使用独立脚本；--raw 只打印模型回答
 uv run python generate.py \
@@ -311,15 +335,16 @@ uv run python generate.py \
 
 ## 与工业训练栈的边界
 
-这个小型实现保留了工业界最重要的语义：阶段化 checkpoint、assistant/action masking、
-old/reference policy、可验证 reward、受限工具执行和端到端测试。但真正扩大训练规模前还需要：
+这个小型实现保留了阶段化完整 checkpoint、严格恢复、assistant/action masking、old/reference
+policy、稳定 held-out validation、可验证 reward、受限工具执行和端到端测试。但真正扩大训练规模前
+还需要：
 
 - 为现有 BPE/JSONL 数据加入去重、质量过滤、数据配比和评测污染检测；
 - 加入 gradient checkpointing、显式 FlashAttention backend、FSDP/DeepSpeed 和 MFU 统计；
 - 将 rollout 与 learner 解耦，用 vLLM/SGLang 一类推理服务异步采样，并处理 policy weight 同步；
 - 对工具执行使用进程/容器级 sandbox、超时、资源限额和审计，而不仅是当前的 AST 白名单；
-- 建立固定 held-out eval、pass@k、tool-call success、KL/entropy、吞吐和显存监控；
-- 对 reward hacking、长度偏置、全组同分和训练/推理 chat template 不一致做专项回归。
+- 建立覆盖通用聊天回归的跨阶段 benchmark、pass@k 和最终发布门禁；
+- 将规则 verifier 扩展到更多可验证领域，并持续扩充 reward-hacking 失败样本。
 
 求职展示时，应把 `pipeline_manifest.json`、测试、消融实验和失败案例作为证据；“能运行”只是
 第一层，能解释 reward、mask、KL、采样吞吐和评测可信度才是 Agentic RL 岗位更看重的部分。

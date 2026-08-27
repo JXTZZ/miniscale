@@ -5,7 +5,13 @@ import unittest
 import torch
 
 from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.agent_env import CalculatorTask, parse_tool_call, safe_calculate
+from miniscale.agent_env import (
+    CalculatorTask,
+    filter_calculator_tools,
+    parse_tool_call,
+    parse_tool_call_payload,
+    safe_calculate,
+)
 from miniscale.training.agent_rl import AgentRLOptions, rollout_agent, run_agent_grpo
 
 
@@ -18,6 +24,19 @@ class AgentRLTests(unittest.TestCase):
             parse_tool_call('<tool_call>{"name":"calculator","arguments":{"expression":"2+3"}}</tool_call>'),
             "2+3",
         )
+        self.assertIsNone(parse_tool_call_payload(
+            '<tool_call>{"name":"calculator","arguments":{"expression":"2+3"}}</tool_call>'
+            '<tool_call>{"name":"calculator","arguments":{"expression":"3+4"}}</tool_call>'
+        ))
+
+    def test_unsupported_tool_schemas_are_not_exposed(self) -> None:
+        tools = [
+            {"function": {"name": "calculate_math"}},
+            {"function": {"name": "get_current_weather"}},
+        ]
+        filtered = filter_calculator_tools(tools)
+        self.assertIsNotNone(filtered)
+        self.assertEqual(len(filtered or []), 1)
 
     def test_scripted_multiturn_rollout_masks_observation(self) -> None:
         responses = [

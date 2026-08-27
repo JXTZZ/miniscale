@@ -5,7 +5,9 @@ from contextlib import nullcontext
 from pathlib import Path
 import json
 import math
+import os
 import random
+import shutil
 
 import numpy as np
 import torch
@@ -343,6 +345,23 @@ def prune_periodic_checkpoints(path: str | Path, keep_last: int) -> None:
     checkpoint_dir = Path(path)
     for checkpoint in sorted(checkpoint_dir.glob("step_*.pt"))[:-keep_last]:
         checkpoint.unlink()
+
+
+def mirror_checkpoint(source: str | Path, destination: str | Path) -> Path:
+    """Atomically expose a second checkpoint name without duplicating disk use when possible."""
+
+    source_path = Path(source)
+    target = Path(destination)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    if temporary.exists():
+        temporary.unlink()
+    try:
+        os.link(source_path, temporary)
+    except OSError:
+        shutil.copyfile(source_path, temporary)
+    temporary.replace(target)
+    return target
 
 
 @torch.no_grad()

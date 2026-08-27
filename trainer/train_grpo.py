@@ -11,7 +11,7 @@ def main() -> None:
         model,
         ByteTokenizer(),
         tasks,
-        "artifacts",
+        "artifacts/grpo-smoke",
         GRPOOptions(steps=1, group_size=2, max_new_tokens=8),
     )
     print(metrics)

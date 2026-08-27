@@ -6,7 +6,10 @@ from pathlib import Path
 import torch
 
 from .tokenizer import ByteTokenizer, load_tokenizer
+from .agent_env import CalculatorTask
+from .training.agent_rl import rollout_agent
 from .training.common import load_checkpoint, resolve_device
+from .training.rl_config import AgentRLOptions
 
 
 @dataclass(slots=True)
@@ -18,6 +21,8 @@ class GenerationOptions:
     system_prompt: str | None = None
     tokenizer_path: str | Path | None = None
     raw_prompt: bool = False
+    calculator: bool = False
+    max_turns: int = 6
 
 
 def generate_from_checkpoint(
@@ -31,6 +36,10 @@ def generate_from_checkpoint(
         raise FileNotFoundError(f"checkpoint does not exist: {checkpoint_path}")
     if options.max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
+    if options.max_turns < 1:
+        raise ValueError("max_turns must be positive")
+    if options.calculator and options.raw_prompt:
+        raise ValueError("calculator inference requires the chat template")
 
     device = resolve_device(options.device)
     model = load_checkpoint(checkpoint_path, device).eval()
@@ -39,6 +48,34 @@ def generate_from_checkpoint(
         raise ValueError(
             f"checkpoint vocabulary ({model.config.vocab_size}) does not match tokenizer ({tokenizer.vocab_size})"
         )
+    if options.calculator:
+        trajectory = rollout_agent(
+            model,
+            tokenizer,
+            CalculatorTask(prompt, "", "", options.system_prompt),
+            AgentRLOptions(
+                max_turns=options.max_turns,
+                max_new_tokens=options.max_new_tokens,
+                temperature=options.temperature,
+                top_k=options.top_k,
+                device=str(device),
+            ),
+            device,
+        )
+        return {
+            "checkpoint": str(checkpoint_path),
+            "prompt": prompt,
+            "response": trajectory.final_answer,
+            "prompt_tokens": len(trajectory.input_ids) - sum(trajectory.action_mask),
+            "generated_tokens": sum(trajectory.action_mask),
+            "temperature": options.temperature,
+            "top_k": options.top_k,
+            "device": str(device),
+            "tool_calls": trajectory.valid_calls,
+            "invalid_tool_calls": trajectory.invalid_calls,
+            "turns": trajectory.turns,
+            "transcript": trajectory.transcript,
+        }
     if options.raw_prompt:
         formatted_prompt = prompt
     else:
