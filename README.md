@@ -38,6 +38,9 @@ uv run python -m unittest discover -s tests -v
 uv run miniscale pipeline --device cpu --output artifacts/run
 ```
 
+代码目录的职责、兼容入口以及“优先复用现存库”的判断原则见
+[`docs/architecture.md`](docs/architecture.md)。
+
 有可用 CUDA 时可将 `cpu` 改为 `cuda`。约 64M 参数的默认结构是 20 层、hidden size 512、
 8 个 attention heads、2 个 KV heads、词表 6400；正式 CLI 默认上下文 768，并按命令中的
 `--sequence-length` 构造模型。4GB 显存应从 batch size 1

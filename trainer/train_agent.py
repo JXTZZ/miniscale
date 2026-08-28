@@ -2,7 +2,8 @@
 
 from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
 from miniscale.agent_env import CalculatorTask
-from miniscale.training.agent_rl import AgentRLOptions, run_agent_grpo
+from miniscale.training.configs.rl import AgentRLOptions
+from miniscale.training.stages.agent_rl import run_agent_grpo
 
 
 def main() -> None:

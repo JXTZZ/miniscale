@@ -1,20 +1,47 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import hashlib
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any
 
 from .tokenizer import Tokenizer
 
 
-def atomic_write_json(path: str | Path, value: dict[str, object]) -> Path:
+@contextmanager
+def atomic_output_path(path: str | Path) -> Iterator[Path]:
+    """Yield a same-directory temporary path and atomically replace the target on success."""
+
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(target.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(target)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        yield temporary
+        temporary.replace(target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def atomic_write_text(path: str | Path, text: str) -> Path:
+    target = Path(path)
+    with atomic_output_path(target) as temporary:
+        temporary.write_text(text, encoding="utf-8")
     return target
+
+
+def atomic_write_json(path: str | Path, value: dict[str, object]) -> Path:
+    return atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
 def _update_hash_from_file(digest: Any, path: Path) -> int:

@@ -32,7 +32,7 @@ uv run python -m unittest discover -s tests -v
 
 ```bash
 # 单文件快速反馈
-uv run python -m unittest tests.test_pretrain -v
+uv run python -m unittest tests.training.test_pretrain -v
 
 # 合入前完整回归
 uv run python -m unittest discover -s tests -v

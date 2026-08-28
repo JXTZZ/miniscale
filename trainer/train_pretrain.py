@@ -3,8 +3,9 @@
 from miniscale.config import MiniScaleConfig
 from miniscale.model import MiniScaleForCausalLM
 from miniscale.tokenizer import ByteTokenizer
-from miniscale.training.common import seed_everything
-from miniscale.training.pretrain import SmokePretrainOptions, run_pretrain
+from miniscale.training.configs.pretrain import SmokePretrainOptions
+from miniscale.training.core.runtime import seed_everything
+from miniscale.training.stages.pretrain import run_pretrain
 
 
 def main() -> None:

@@ -1,7 +1,8 @@
 """Small standalone SFT example."""
 
 from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.training.sft import SFTOptions, run_sft
+from miniscale.training.configs.sft import SFTOptions
+from miniscale.training.stages.sft import run_sft
 
 
 def main() -> None:

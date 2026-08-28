@@ -1,7 +1,9 @@
 """Small standalone single-turn GRPO/RLVR example."""
 
 from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.training.grpo import GRPOOptions, RLTask, run_grpo
+from miniscale.data.rl import RLTask
+from miniscale.training.configs.rl import GRPOOptions
+from miniscale.training.stages.grpo import run_grpo
 
 
 def main() -> None:

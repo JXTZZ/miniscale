@@ -6,6 +6,8 @@ import secrets
 from typing import Any
 import warnings
 
+from .integrity import atomic_write_text
+
 
 class WandbTracker:
     """Fault-tolerant W&B adapter backed by a persistent local upload queue."""
@@ -333,9 +335,7 @@ class WandbTracker:
         if not records:
             self._pending_path.unlink(missing_ok=True)
             return
-        temporary = self._pending_path.with_suffix(self._pending_path.suffix + ".tmp")
-        temporary.write_text(
+        atomic_write_text(
+            self._pending_path,
             "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
-            encoding="utf-8",
         )
-        temporary.replace(self._pending_path)

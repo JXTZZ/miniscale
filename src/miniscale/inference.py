@@ -7,9 +7,10 @@ import torch
 
 from .tokenizer import ByteTokenizer, load_tokenizer
 from .agent_env import CalculatorTask
-from .training.agent_rl import rollout_agent
-from .training.common import load_checkpoint, resolve_device
-from .training.rl_config import AgentRLOptions
+from .training.configs.rl import AgentRLOptions
+from .training.core.checkpoint import load_checkpoint
+from .training.core.runtime import resolve_device
+from .training.stages.agent_rl import rollout_agent
 
 
 @dataclass(slots=True)

@@ -22,7 +22,7 @@ from .training import (
     run_pretrain,
     run_sft,
 )
-from .training.common import save_checkpoint
+from .training.core.checkpoint import save_checkpoint
 
 
 PRETRAIN_TEXTS = [
