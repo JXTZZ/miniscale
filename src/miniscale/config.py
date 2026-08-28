@@ -22,6 +22,8 @@ class MiniScaleConfig:
     eos_token_id: int = 2
 
     def __post_init__(self) -> None:
+        if self.num_hidden_layers < 1:
+            raise ValueError("num_hidden_layers must be positive")
         if self.hidden_size % self.num_attention_heads != 0:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
         if self.num_attention_heads % self.num_key_value_heads != 0:
@@ -44,16 +46,17 @@ class MiniScaleConfig:
         vocab_size: int = 6400,
         max_position_embeddings: int = 512,
         *,
+        num_hidden_layers: int = 20,
         pad_token_id: int = 0,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
     ) -> "MiniScaleConfig":
-        """The project training configuration: about 63.6M tied parameters with the MiniMind vocabulary."""
+        """The project base geometry, with about 63.6M parameters at the default 20 layers."""
         return cls(
             vocab_size=vocab_size,
             hidden_size=512,
             intermediate_size=1536,
-            num_hidden_layers=20,
+            num_hidden_layers=num_hidden_layers,
             num_attention_heads=8,
             num_key_value_heads=2,
             max_position_embeddings=max_position_embeddings,

@@ -99,6 +99,7 @@ uv run miniscale audit-pretrain-data \
 
 ```bash
 uv run miniscale pretrain --steps 10000 --batch-size 1 \
+  --num-hidden-layers 20 \
   --gradient-accumulation 16 --sequence-length 768 \
   --precision bf16 \
   --learning-rate 3e-4 --min-learning-rate 3e-5 \
@@ -198,6 +199,7 @@ checkpoint，不会删除 `best.pt`、`final.pt` 或 generations。按 `Ctrl+C` 
 
 ```bash
 uv run miniscale pretrain --steps 10000 --batch-size 1 \
+  --num-hidden-layers 20 \
   --gradient-accumulation 16 --sequence-length 768 \
   --precision bf16 \
   --learning-rate 3e-4 --min-learning-rate 3e-5 \
@@ -252,6 +254,7 @@ tokens seen 和 generation tables：
 
 ```bash
 uv run miniscale pretrain --steps 10000 --batch-size 4 \
+  --num-hidden-layers 20 \
   --gradient-accumulation 4 --sequence-length 768 \
   --learning-rate 3e-4 --min-learning-rate 3e-5 \
   --warmup-steps 200 --validation-every 200 \

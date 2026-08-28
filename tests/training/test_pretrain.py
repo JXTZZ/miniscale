@@ -73,6 +73,30 @@ class PretrainTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "precision"):
             resolve_autocast_dtype("fp16", torch.device("cuda"))
 
+    def test_pretrain_cli_exposes_model_depth(self) -> None:
+        arguments = build_parser().parse_args(
+            ["pretrain", "--steps", "1", "--num-hidden-layers", "16"]
+        )
+        self.assertEqual(arguments.num_hidden_layers, 16)
+        self.assertEqual(MiniScaleConfig.small_64m(num_hidden_layers=16).num_hidden_layers, 16)
+
+        with (
+            patch("miniscale.cli.load_tokenizer", return_value=ByteTokenizer()),
+            patch(
+                "miniscale.cli.MiniScaleConfig.small_64m",
+                return_value=MiniScaleConfig.smoke(),
+            ) as config_factory,
+            patch("miniscale.cli.run_pretrain_jsonl", return_value={"checkpoint": "unused.pt"}),
+            redirect_stdout(StringIO()),
+        ):
+            main(["pretrain", "--steps", "1", "--num-hidden-layers", "16"])
+
+        self.assertEqual(config_factory.call_args.kwargs["num_hidden_layers"], 16)
+
+    def test_model_depth_must_be_positive(self) -> None:
+        with self.assertRaisesRegex(ValueError, "num_hidden_layers"):
+            MiniScaleConfig.small_64m(num_hidden_layers=0)
+
     def test_optimizer_excludes_norms_and_tied_embedding_from_weight_decay(self) -> None:
         model = MiniScaleForCausalLM(MiniScaleConfig.smoke())
         optimizer = build_pretrain_optimizer(model, PretrainOptions(steps=1))

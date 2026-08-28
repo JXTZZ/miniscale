@@ -168,6 +168,12 @@ def build_parser() -> argparse.ArgumentParser:
         batch_size=pretrain_option_default("batch_size"),
         log_every=pretrain_option_default("log_every"),
     )
+    pretrain.add_argument(
+        "--num-hidden-layers",
+        type=int,
+        default=20,
+        help="decoder layer count for a new model (default: 20; must match when resuming)",
+    )
     pretrain.add_argument("--sequence-length", type=int, default=pretrain_option_default("sequence_length"))
     pretrain.add_argument(
         "--gradient-accumulation", type=int,

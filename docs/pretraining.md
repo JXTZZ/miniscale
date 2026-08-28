@@ -47,6 +47,7 @@ exact duplicate 数。它只做审计，不会静默修改语料。当前仍未�
 
 | 项目 | 默认值 |
 | --- | ---: |
+| decoder layers | 20 |
 | micro batch | 1 sequence |
 | gradient accumulation | 16 micro-batches |
 | sequence length | 768 tokens |
@@ -62,6 +63,9 @@ exact duplicate 数。它只做审计，不会静默修改语料。当前仍未�
 `steps × batch_size × accumulation × sequence_length`；真正的 next-token targets 使用
 `sequence_length - 1`，并同时记录为 `target_tokens_seen`。`pretrain_run.json` 保存解析后的 recipe、
 planned tokens 和 tokens/parameter，避免只看到 micro batch 就误判训练规模。
+
+新模型可用 `--num-hidden-layers` 调整 decoder 深度；默认 20 层约 63.6M 参数。层数会进入模型配置与
+严格 resume identity，因此恢复时必须传入与原 run 相同的值，已有 checkpoint 不能跨层数加载。
 
 ## Optimizer, initialization, precision
 
