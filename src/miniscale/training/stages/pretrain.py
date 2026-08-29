@@ -21,6 +21,7 @@ from miniscale.model import MiniScaleForCausalLM
 from miniscale.tokenizer import ByteTokenizer, Tokenizer
 from miniscale.tracking import WandbTracker
 from ..core.artifacts import append_metric, prune_periodic_checkpoints, truncate_metrics_after
+from ..core.logging import format_training_metric
 from ..core.checkpoint import (
     TRAINING_CHECKPOINT_FORMAT_VERSION,
     read_training_checkpoint,
@@ -772,7 +773,7 @@ def run_pretrain_jsonl(
                 append_metric(metrics_path, metric)
                 if tracker is not None:
                     tracker.log(metric, generation_path=generation_path)
-                print(metric, flush=True)
+                print(format_training_metric(metric), flush=True)
             if options.save_every and step % options.save_every == 0:
                 checkpoint = save_training_checkpoint(
                     checkpoint_dir / f"step_{step:08d}.pt",

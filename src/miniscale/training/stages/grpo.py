@@ -24,6 +24,7 @@ from ..core.artifacts import (
     prune_periodic_checkpoints,
     truncate_metrics_after,
 )
+from ..core.logging import format_training_metric
 from ..core.checkpoint import (
     TRAINING_CHECKPOINT_FORMAT_VERSION,
     read_training_checkpoint,
@@ -451,7 +452,7 @@ def run_grpo(
                 append_metric(metrics_path, metric)
                 if tracker is not None:
                     tracker.log(metric)
-                print(metric, flush=True)
+                print(format_training_metric(metric), flush=True)
             if options.save_every and step % options.save_every == 0:
                 _save_grpo_checkpoint(
                     checkpoint_dir / f"step_{step:08d}.pt", model, optimizer, scheduler,

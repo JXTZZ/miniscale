@@ -14,6 +14,7 @@ from .checkpoint import (
     save_training_checkpoint,
     signature_differences,
 )
+from .logging import format_training_metric
 from .runtime import (
     autocast_context,
     build_adamw_optimizer,
@@ -35,6 +36,7 @@ __all__ = [
     "build_adamw_optimizer",
     "build_warmup_cosine_scheduler",
     "evaluate_lm",
+    "format_training_metric",
     "infinite_batches",
     "load_checkpoint",
     "load_training_checkpoint",

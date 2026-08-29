@@ -280,7 +280,13 @@ reward model 或 LLM-as-a-judge。混合 `agent_rl.jsonl` 还包含当前 calcul
 工具，所以 Agent RL 也默认使用数学子集。数学数据中附带的天气、翻译、汇率等非计算器 schema 会在
 加载边界被剥离并写入审计报告，不会暴露给只能执行计算器的环境。
 
-训练时终端会打印指标，并追加写入 `artifacts/<stage>/*_metrics.jsonl`。另开终端可以这样观察：
+训练终端使用统一的紧凑格式，只显示 loss、LR、gradient norm、吞吐、CUDA peak memory 和少量
+阶段关键指标；gradient clipping 发生时会在 grad 后显示 `*`。完整累计计数、性能和验证统计仍原样
+追加写入 `artifacts/<stage>/*_metrics.jsonl`，供后续分析和画图。另开终端可以这样观察：
+
+```text
+[pretrain] step 1900 | loss 3.218 | lr 3.00e-4 | grad 0.79 | tok/s 39.9k | mem 5290MB
+```
 
 ```bash
 tail -f artifacts/pretrain/pretrain_metrics.jsonl
