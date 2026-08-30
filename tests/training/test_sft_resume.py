@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -182,6 +183,70 @@ class SFTResumeTests(unittest.TestCase):
                     root / "run",
                     options(resume=checkpoint, learning_rate=2e-4),
                 )
+
+    def test_quality_and_loss_patience_stop_training_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "sft.jsonl"
+            validation = root / "validation.jsonl"
+            write_corpus(corpus)
+            validation.write_text(
+                json.dumps({
+                    "conversations": [
+                        {"role": "user", "content": "held out"},
+                        {"role": "assistant", "content": "answer"},
+                    ]
+                }) + "\n",
+                encoding="utf-8",
+            )
+            summary = {
+                "generation_eos_rate": 1.0,
+                "generation_max_length_rate": 0.0,
+                "generation_loop_rate": 0.0,
+                "generation_repeated_4gram_fraction": 0.0,
+                "generation_task_pass_rate": 1.0,
+                "generation_prompt_echo_rate": 0.0,
+                "generation_special_token_leak_rate": 0.0,
+                "generation_think_leak_rate": 0.0,
+                "generation_average_tokens": 4.0,
+            }
+            run_options = SFTOptions(
+                steps=6,
+                batch_size=1,
+                max_length=128,
+                min_context_tokens=8,
+                gradient_accumulation_steps=1,
+                validation_fraction=0,
+                validation_every=1,
+                validation_batches=1,
+                generation_every=1,
+                generation_suite=None,
+                save_every=0,
+                early_stopping_patience=2,
+                early_stopping_min_steps=1,
+                early_stopping_validation_min_delta=0.01,
+                early_stopping_quality_min_delta=0.01,
+                device="cpu",
+            )
+            with (
+                patch("miniscale.training.stages.sft.evaluate_sft", return_value=(2.0, 0.5, 10)),
+                patch(
+                    "miniscale.training.stages.sft.run_sft_generation_evaluation",
+                    return_value=(root / "generation.json", summary),
+                ),
+            ):
+                result = run_sft_jsonl(
+                    new_model(),
+                    ByteTokenizer(),
+                    corpus,
+                    root / "run",
+                    run_options,
+                    validation_path=validation,
+                )
+
+            payload = torch.load(result["checkpoint"], map_location="cpu", weights_only=False)
+            self.assertEqual(payload["step"], 3)
+            self.assertEqual(result["stopped_early"], 1.0)
 
 
 if __name__ == "__main__":

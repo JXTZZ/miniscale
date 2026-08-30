@@ -18,6 +18,10 @@ class GenerationOptions:
     max_new_tokens: int = 128
     temperature: float = 0.7
     top_k: int | None = 50
+    top_p: float = 1.0
+    repetition_penalty: float = 1.0
+    no_repeat_ngram_size: int = 0
+    seed: int | None = None
     device: str = "auto"
     system_prompt: str | None = None
     tokenizer_path: str | Path | None = None
@@ -91,14 +95,28 @@ def generate_from_checkpoint(
         raise ValueError("max_new_tokens must be smaller than the model context window")
     prompt_ids = prompt_ids[-prompt_budget:]
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    generator = None
+    if options.seed is not None:
+        generator = torch.Generator(device=device).manual_seed(options.seed)
     with torch.inference_mode():
         generated = model.generate(
             input_ids,
             max_new_tokens=options.max_new_tokens,
             temperature=options.temperature,
             top_k=options.top_k,
+            top_p=options.top_p,
+            repetition_penalty=options.repetition_penalty,
+            no_repeat_ngram_size=options.no_repeat_ngram_size,
+            generator=generator,
         )
-    response_ids = generated[0, len(prompt_ids) :].tolist()
+    raw_response_ids = generated[0, len(prompt_ids) :].tolist()
+    finish_reason = "max_tokens"
+    if tokenizer.eos_token_id in raw_response_ids:
+        eos_index = raw_response_ids.index(tokenizer.eos_token_id)
+        response_ids = raw_response_ids[: eos_index + 1]
+        finish_reason = "eos"
+    else:
+        response_ids = raw_response_ids
     response = tokenizer.decode(response_ids)
     if "<|end|>" in response:
         response = response.split("<|end|>", 1)[0]
@@ -110,5 +128,10 @@ def generate_from_checkpoint(
         "generated_tokens": len(response_ids),
         "temperature": options.temperature,
         "top_k": options.top_k,
+        "top_p": options.top_p,
+        "repetition_penalty": options.repetition_penalty,
+        "no_repeat_ngram_size": options.no_repeat_ngram_size,
+        "seed": options.seed,
+        "finish_reason": finish_reason,
         "device": str(device),
     }

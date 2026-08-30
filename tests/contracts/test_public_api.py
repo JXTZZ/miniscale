@@ -58,6 +58,7 @@ class PublicAPIContractTests(unittest.TestCase):
                 "pipeline",
                 "generate",
                 "evaluate",
+                "evaluate-sft",
                 "tokenize",
                 "audit-pretrain-data",
                 "audit-sft-data",

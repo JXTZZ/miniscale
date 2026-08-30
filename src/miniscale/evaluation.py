@@ -13,6 +13,8 @@ from .training.core.checkpoint import load_checkpoint
 from .training.core.runtime import resolve_autocast_dtype, resolve_device
 from .training.stages.agent_rl import evaluate_agent
 from .training.stages.grpo import evaluate_grpo
+from .training.evaluators.generation_quality import load_generation_suite
+from .training.evaluators.sft import evaluate_sft_generation_quality
 
 
 def evaluate_rl_checkpoints(
@@ -102,6 +104,88 @@ def evaluate_rl_checkpoints(
             "device": str(resolved_device),
         },
         "data": {"path": str(Path(data_path).resolve()), **data_identity},
+        "tokenizer": tokenizer_identity(tokenizer),
+        "results": results,
+    }
+    if output_path is not None:
+        atomic_write_json(output_path, report)
+        report["report"] = str(output_path)
+    return report
+
+
+def evaluate_sft_checkpoints(
+    checkpoints: list[str | Path],
+    suite_path: str | Path,
+    tokenizer_path: str | Path,
+    *,
+    max_new_tokens: int = 160,
+    precision: str = "fp32",
+    seed: int = 42,
+    device: str = "auto",
+    output_path: str | Path | None = None,
+) -> dict[str, object]:
+    """Compare SFT checkpoints under raw and deployment-oriented decoding."""
+
+    if not checkpoints:
+        raise ValueError("at least one SFT checkpoint is required")
+    resolved_device = resolve_device(device)
+    autocast_dtype = resolve_autocast_dtype(precision, resolved_device)
+    tokenizer = load_tokenizer(tokenizer_path)
+    probes = load_generation_suite(suite_path)
+    profiles = {
+        "raw_greedy": {
+            "temperature": 0.0,
+            "top_k": None,
+            "top_p": 1.0,
+            "repetition_penalty": 1.0,
+            "no_repeat_ngram_size": 0,
+        },
+        "serving": {
+            "temperature": 0.6,
+            "top_k": 50,
+            "top_p": 0.9,
+            "repetition_penalty": 1.1,
+            "no_repeat_ngram_size": 4,
+        },
+    }
+    results: list[dict[str, object]] = []
+    for checkpoint in checkpoints:
+        checkpoint_path = Path(checkpoint)
+        model = load_checkpoint(checkpoint_path, resolved_device).eval()
+        if model.config.vocab_size != tokenizer.vocab_size:
+            raise ValueError(f"checkpoint vocabulary does not match tokenizer: {checkpoint_path}")
+        profile_results: dict[str, object] = {}
+        for name, profile in profiles.items():
+            samples, summary = evaluate_sft_generation_quality(
+                model,
+                tokenizer,
+                probes,
+                device=resolved_device,
+                max_new_tokens=max_new_tokens,
+                autocast_dtype=autocast_dtype,
+                seed=seed,
+                **profile,
+            )
+            profile_results[name] = {
+                "decoding": profile,
+                "summary": summary,
+                "samples": samples,
+            }
+        results.append({
+            "checkpoint": str(checkpoint_path.resolve()),
+            "identity": path_identity(checkpoint_path),
+            "profiles": profile_results,
+        })
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "sft_checkpoint_quality_comparison",
+        "configuration": {
+            "suite": path_identity(suite_path),
+            "max_new_tokens": max_new_tokens,
+            "precision": precision,
+            "seed": seed,
+            "device": str(resolved_device),
+        },
         "tokenizer": tokenizer_identity(tokenizer),
         "results": results,
     }

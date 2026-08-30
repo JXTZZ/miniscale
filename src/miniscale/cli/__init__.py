@@ -14,7 +14,7 @@ from ..data.pretrain_audit import audit_pretrain_jsonl, save_data_audit
 from ..data.rl import audit_rl_jsonl, save_rl_data_audit
 from ..data.sft_audit import audit_sft_jsonl, save_sft_data_audit
 from ..data.sft_prepare import prepare_sft_jsonl
-from ..evaluation import evaluate_rl_checkpoints
+from ..evaluation import evaluate_rl_checkpoints, evaluate_sft_checkpoints
 from ..inference import GenerationOptions, generate_from_checkpoint
 from ..model import MiniScaleForCausalLM
 from ..pipeline import run_training_pipeline
@@ -59,6 +59,17 @@ def main(argv: list[str] | None = None) -> None:
             device=arguments.device,
             output_path=arguments.output,
         )
+    elif arguments.command == "evaluate-sft":
+        result = evaluate_sft_checkpoints(
+            arguments.checkpoint,
+            arguments.suite,
+            arguments.tokenizer,
+            max_new_tokens=arguments.max_new_tokens,
+            precision=arguments.precision,
+            seed=arguments.seed,
+            device=arguments.device,
+            output_path=arguments.output,
+        )
     elif arguments.command == "generate":
         result = generate_from_checkpoint(
             arguments.checkpoint,
@@ -67,6 +78,10 @@ def main(argv: list[str] | None = None) -> None:
                 max_new_tokens=arguments.max_new_tokens,
                 temperature=arguments.temperature,
                 top_k=arguments.top_k or None,
+                top_p=arguments.top_p,
+                repetition_penalty=arguments.repetition_penalty,
+                no_repeat_ngram_size=arguments.no_repeat_ngram_size,
+                seed=arguments.seed,
                 device=arguments.device,
                 system_prompt=arguments.system_prompt,
                 tokenizer_path=arguments.tokenizer,
@@ -157,12 +172,18 @@ def main(argv: list[str] | None = None) -> None:
             save_agent_data_audit(result, arguments.output)
             result["report"] = str(arguments.output)
     elif arguments.command == "prepare-sft-data":
+        quality_tokenizer = (
+            load_tokenizer(arguments.tokenizer) if arguments.quality_policy is not None else None
+        )
         result = prepare_sft_jsonl(
             arguments.data,
             arguments.output,
             manifest_path=arguments.manifest,
             deduplicate_exact=arguments.deduplicate_exact,
             exclude_patterns=arguments.exclude_pattern,
+            replace_patterns=arguments.replace_pattern,
+            quality_policy=arguments.quality_policy,
+            tokenizer=quality_tokenizer,
         )
     elif arguments.command == "train-tokenizer":
         result = {"tokenizer": str(train_sentencepiece(
@@ -235,6 +256,12 @@ def main(argv: list[str] | None = None) -> None:
                     keep_last_checkpoints=arguments.keep_last,
                     generation_every=arguments.generation_every,
                     generation_max_new_tokens=arguments.generation_max_new_tokens,
+                    generation_suite=arguments.generation_suite,
+                    early_stopping_patience=arguments.early_stopping_patience,
+                    early_stopping_min_steps=arguments.early_stopping_min_steps,
+                    early_stopping_validation_min_delta=arguments.early_stopping_validation_min_delta,
+                    early_stopping_quality_min_delta=arguments.early_stopping_quality_min_delta,
+                    severe_loop_rate_threshold=arguments.severe_loop_rate_threshold,
                     deduplicate_exact=arguments.deduplicate_exact,
                     log_every=arguments.log_every,
                     num_workers=arguments.num_workers,

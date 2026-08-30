@@ -17,6 +17,7 @@ from miniscale.sft_data import (
 )
 from miniscale.sft_data_audit import audit_sft_jsonl
 from miniscale.sft_data_prepare import prepare_sft_jsonl
+from miniscale.data.sft_quality import response_has_severe_repetition
 
 
 def write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
@@ -59,6 +60,103 @@ class SFTDataTests(unittest.TestCase):
             self.assertTrue(Path(str(report["manifest"])).is_file())
             with self.assertRaises(FileExistsError):
                 prepare_sft_jsonl(source, output)
+
+    def test_prepare_replaces_nested_text_then_deduplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "raw.jsonl"
+            output = root / "prepared.jsonl"
+            branded = {
+                "conversations": [
+                    {"role": "user", "content": "Who built MINIMIND?"},
+                    {
+                        "role": "assistant",
+                        "content": "MiniMind was built by jingyaogong.",
+                        "reasoning_content": "Ask JingYaoGong about minimind.",
+                    },
+                ]
+            }
+            already_clean = {
+                "conversations": [
+                    {"role": "user", "content": "Who built MiniScale?"},
+                    {
+                        "role": "assistant",
+                        "content": "MiniScale was built by LoTusY.",
+                        "reasoning_content": "Ask LoTusY about MiniScale.",
+                    },
+                ]
+            }
+            write_jsonl(source, [branded, already_clean, conversation(3)])
+
+            report = prepare_sft_jsonl(
+                source,
+                output,
+                replace_patterns=[("MiniMind", "MiniScale"), ("jingyaogong", "LoTusY")],
+            )
+
+            prepared = output.read_text(encoding="utf-8")
+            self.assertNotIn("minimind", prepared.casefold())
+            self.assertNotIn("jingyaogong", prepared.casefold())
+            self.assertIn("MiniScale", prepared)
+            self.assertIn("LoTusY", prepared)
+            self.assertEqual(report["counts"]["replaced_rows"], 1)
+            self.assertEqual(report["counts"]["duplicate_rows"], 1)
+            self.assertEqual(report["counts"]["written_rows"], 2)
+            self.assertEqual(
+                report["counts"]["replacement_occurrences"],
+                {"MiniMind": 3, "jingyaogong": 2},
+            )
+
+    def test_quality_prepare_selects_targets_and_rejects_repetition(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "raw.jsonl"
+            output = root / "quality.jsonl"
+            loop = "北京是首都。北京是首都。北京是首都。"
+            rows = [
+                conversation(1),
+                conversation(2),
+                {
+                    "conversations": [
+                        {"role": "user", "content": "loop"},
+                        {"role": "assistant", "content": loop},
+                    ]
+                },
+            ]
+            write_jsonl(source, rows)
+            policy = {
+                "version": "sft_quality_policy_v1",
+                "seed": 7,
+                "max_targets": 2,
+                "max_targets_per_conversation": 1,
+                "max_prompt_occurrences": 3,
+                "max_tool_prompt_occurrences": 3,
+                "max_response_occurrences": 3,
+                "max_short_response_occurrences": 3,
+                "max_identity_response_occurrences": 3,
+                "short_response_characters": 16,
+                "max_target_tokens": 64,
+                "reject_severe_repetition": True,
+            }
+
+            report = prepare_sft_jsonl(
+                source,
+                output,
+                quality_policy=policy,
+                tokenizer=ByteTokenizer(),
+            )
+
+            prepared = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual(report["counts"]["selected_targets"], 2)
+            self.assertEqual(report["counts"]["rejected_targets"]["severe_repetition"], 1)
+            self.assertTrue(all("sft_selection" in row for row in prepared))
+            self.assertTrue(response_has_severe_repetition({"content": loop}))
+            self.assertTrue(response_has_severe_repetition({
+                "content": "传统媒体、传统媒体、传统媒体、传统媒体、传统媒体。"
+            }))
+            self.assertFalse(response_has_severe_repetition({
+                "content": "传统媒体在数字化转型中仍承担公共信息传播职责。"
+            }))
 
     def test_truncation_keeps_context_and_target_prefix(self) -> None:
         input_ids = list(range(30))
@@ -110,6 +208,33 @@ class SFTDataTests(unittest.TestCase):
             self.assertIn("a1", supervised)
             self.assertNotIn("q1", supervised)
             dataset.close()
+
+    def test_index_honors_selected_target_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "selected.jsonl"
+            row = {
+                "conversations": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "answer one"},
+                    {"role": "user", "content": "second"},
+                    {"role": "assistant", "content": "answer two"},
+                ],
+                "sft_selection": {"target_positions": [3]},
+            }
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            index = SFTCorpusIndex.build(
+                path,
+                validation_fraction=0,
+                target_mode="response_only",
+                destination="train",
+            )
+
+            self.assertEqual(index.stats.assistant_messages, 2)
+            self.assertEqual(index.stats.selected_assistant_messages, 1)
+            self.assertEqual(index.stats.unselected_assistant_messages, 1)
+            self.assertEqual(index.stats.train_examples, 1)
+            self.assertEqual(list(index.train_message_positions), [3])
 
     def test_hash_split_and_fixed_validation_are_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

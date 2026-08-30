@@ -17,8 +17,9 @@ from . import collate_lm_batch
 
 
 SFT_DATA_ORDER_VERSION = "indexed_global_permutation_v1"
-SFT_EXAMPLE_FORMAT_VERSION = "assistant_turn_v1"
+SFT_EXAMPLE_FORMAT_VERSION = "assistant_turn_selection_v2"
 SFT_TRUNCATION_VERSION = "preserve_recent_context_and_target_prefix_v1"
+SFT_SELECTION_VERSION = "target_positions_v1"
 
 
 def canonical_conversation(messages: Sequence[dict[str, object]]) -> bytes:
@@ -56,6 +57,8 @@ class SFTIndexStats:
     invalid_conversations: int
     duplicate_conversations: int
     assistant_messages: int
+    selected_assistant_messages: int
+    unselected_assistant_messages: int
     empty_target_messages: int
     train_examples: int
     validation_examples: int
@@ -98,7 +101,8 @@ class SFTCorpusIndex:
         seen: set[bytes] = set()
         raw_digest = hashlib.sha256()
         size_bytes = 0
-        rows = conversations = invalid = duplicates = assistant_messages = empty_targets = 0
+        rows = conversations = invalid = duplicates = assistant_messages = selected_messages = 0
+        unselected_messages = empty_targets = 0
 
         with source_path.open("rb") as source:
             line_number = 0
@@ -127,6 +131,18 @@ class SFTCorpusIndex:
                     invalid += 1
                     continue
                 conversations += 1
+                selected_positions: set[int] | None = None
+                selection = row.get("sft_selection")
+                if selection is not None:
+                    raw_positions = selection.get("target_positions") if isinstance(selection, dict) else None
+                    if not isinstance(raw_positions, list) or not all(
+                        isinstance(position, int) and 0 <= position < len(messages)
+                        for position in raw_positions
+                    ):
+                        invalid += 1
+                        conversations -= 1
+                        continue
+                    selected_positions = set(raw_positions)
                 semantic_digest = conversation_digest(messages)
                 duplicate = semantic_digest in seen
                 if duplicate:
@@ -148,6 +164,10 @@ class SFTCorpusIndex:
                     if message.get("role") != "assistant":
                         continue
                     assistant_messages += 1
+                    if selected_positions is not None and message_position not in selected_positions:
+                        unselected_messages += 1
+                        continue
+                    selected_messages += 1
                     if not _assistant_has_target(message, target_mode):
                         empty_targets += 1
                         continue
@@ -160,6 +180,8 @@ class SFTCorpusIndex:
             invalid_conversations=invalid,
             duplicate_conversations=duplicates,
             assistant_messages=assistant_messages,
+            selected_assistant_messages=selected_messages,
+            unselected_assistant_messages=unselected_messages,
             empty_target_messages=empty_targets,
             train_examples=len(train_offsets),
             validation_examples=len(validation_offsets),

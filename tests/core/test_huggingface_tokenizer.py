@@ -93,6 +93,31 @@ class HuggingFaceTokenizerTests(unittest.TestCase):
         self.assertNotIn("private reasoning", response_target)
         self.assertNotIn("first answer", response_target)
 
+    def test_response_only_mask_handles_leading_spaces_at_thinking_boundary(self) -> None:
+        tokenizer = HuggingFaceTokenizer(TOKENIZER_DIR)
+        messages = [
+            {"role": "user", "content": "提取文章中的交通运输部分。"},
+            {
+                "role": "assistant",
+                "content": "  在交通运输领域，人工智能可以提高交通效率。",
+                "reasoning_content": "先定位相关段落。",
+            },
+        ]
+
+        _, labels = tokenizer.encode_sft(
+            messages,
+            target_mode="response_only",
+            target_assistant_index=-1,
+        )
+        response_target = tokenizer.decode(
+            [label for label in labels if label != -100], skip_special_tokens=False
+        )
+
+        self.assertIn("在交通运输领域", response_target)
+        self.assertNotIn("先定位相关段落", response_target)
+        self.assertNotIn("<think>", response_target)
+        self.assertNotIn("</think>", response_target)
+
     def test_generation_loads_tokenizer_directory(self) -> None:
         tokenizer = HuggingFaceTokenizer(TOKENIZER_DIR)
         config = MiniScaleConfig.smoke()

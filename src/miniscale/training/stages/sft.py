@@ -19,7 +19,12 @@ from miniscale.data.sft import (
 )
 from miniscale.tokenizer import ByteTokenizer, Tokenizer
 from miniscale.tracking import WandbTracker
-from ..core.artifacts import append_metric, prune_periodic_checkpoints, truncate_metrics_after
+from ..core.artifacts import (
+    append_metric,
+    mirror_checkpoint,
+    prune_periodic_checkpoints,
+    truncate_metrics_after,
+)
 from ..core.logging import format_training_metric
 from ..core.checkpoint import (
     TRAINING_CHECKPOINT_FORMAT_VERSION,
@@ -50,6 +55,7 @@ from ..configs.sft import (
     validate_sft_options,
 )
 from ..evaluators.sft import evaluate_sft, run_sft_generation_evaluation
+from ..evaluators.generation_quality import generation_quality_score
 
 
 def run_sft(
@@ -118,7 +124,14 @@ def run_sft_jsonl(
     if options.resume_from is None:
         existing = [
             path
-            for path in (manifest_path, metrics_path, output / "best.pt", output / "sft.pt")
+            for path in (
+                manifest_path,
+                metrics_path,
+                output / "best.pt",
+                output / "best_loss.pt",
+                output / "best_quality.pt",
+                output / "sft.pt",
+            )
             if path.exists()
         ]
         existing.extend(checkpoint_dir.glob("*.pt") if checkpoint_dir.exists() else ())
@@ -202,6 +215,8 @@ def run_sft_jsonl(
             pad_token_id=tokenizer.pad_token_id,
             seed=options.seed + 1,
         )
+    if options.early_stopping_patience and validation_batches is None:
+        raise ValueError("early stopping requires a non-empty validation dataset")
 
     model.to(device).train()
     optimizer = build_adamw_optimizer(
@@ -258,6 +273,11 @@ def run_sft_jsonl(
 
     completed_step = micro_batches_seen = examples_seen = input_tokens_seen = target_tokens_seen = 0
     best_val_loss = float("inf")
+    best_quality_score = float("-inf")
+    best_quality_step = 0
+    early_best_quality_score = float("-inf")
+    stale_quality_evaluations = severe_loop_evaluations = clipped_steps = 0
+    recent_validation_losses: list[float] = []
     last_loss = float("nan")
     saved_wandb_run_id: str | None = None
     last_metrics: dict[str, float] = {"loss": last_loss}
@@ -273,6 +293,15 @@ def run_sft_jsonl(
         input_tokens_seen = int(state.get("tokens_seen", 0))
         target_tokens_seen = int(state.get("target_tokens_seen", 0))
         best_val_loss = float(state.get("best_val_loss", float("inf")))
+        best_quality_score = float(state.get("best_quality_score", float("-inf")))
+        best_quality_step = int(state.get("best_quality_step", 0))
+        early_best_quality_score = float(state.get("early_best_quality_score", best_quality_score))
+        stale_quality_evaluations = int(state.get("stale_quality_evaluations", 0))
+        severe_loop_evaluations = int(state.get("severe_loop_evaluations", 0))
+        clipped_steps = int(state.get("clipped_steps", 0))
+        recent_validation_losses = [
+            float(value) for value in state.get("recent_validation_losses", [])
+        ]
         if state.get("wandb_run_id") is not None:
             saved_wandb_run_id = str(state["wandb_run_id"])
         last_metrics = {name: float(value) for name, value in payload.get("metrics", {}).items()}
@@ -338,6 +367,13 @@ def run_sft_jsonl(
             "examples_seen": examples_seen,
             "micro_batches_seen": micro_batches_seen,
             "best_val_loss": best_val_loss,
+            "best_quality_score": best_quality_score,
+            "best_quality_step": best_quality_step,
+            "early_best_quality_score": early_best_quality_score,
+            "stale_quality_evaluations": stale_quality_evaluations,
+            "severe_loop_evaluations": severe_loop_evaluations,
+            "recent_validation_losses": recent_validation_losses,
+            "clipped_steps": clipped_steps,
             "wandb_run_id": wandb_run_id,
             "initial_checkpoint_source": initial_checkpoint_source,
             "resolved_options": resolved_sft_options(options),
@@ -413,6 +449,8 @@ def run_sft_jsonl(
                 "supervised_tokens_per_second": total_targets / max(update_seconds, 1e-12),
                 "samples_per_second": step_examples / max(update_seconds, 1e-12),
             }
+            clipped_steps += int(bool(metric["grad_was_clipped"]))
+            metric["grad_clip_fraction"] = clipped_steps / completed_step
             if device.type == "cuda":
                 metric["cuda_peak_memory_mb"] = torch.cuda.max_memory_allocated(device) / 2**20
             validation_due = validation_batches is not None and (
@@ -428,6 +466,9 @@ def run_sft_jsonl(
                     "validation_target_tokens": val_targets,
                     "perplexity": math.exp(val_loss) if val_loss < 709 else float("inf"),
                 })
+                recent_validation_losses.append(val_loss)
+                maximum_losses = max(options.early_stopping_patience + 1, 2)
+                recent_validation_losses = recent_validation_losses[-maximum_losses:]
                 if math.isfinite(val_loss) and val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_metrics = {
@@ -437,7 +478,7 @@ def run_sft_jsonl(
                         "best_val_loss": best_val_loss,
                     }
                     best_checkpoint = save_training_checkpoint(
-                        output / "best.pt",
+                        output / "best_loss.pt",
                         model,
                         optimizer,
                         scheduler,
@@ -446,7 +487,7 @@ def run_sft_jsonl(
                         metrics=best_metrics,
                         training_state=training_state(),
                     )
-                    print(f"saved best SFT checkpoint: {best_checkpoint}", flush=True)
+                    print(f"saved best-loss SFT checkpoint: {best_checkpoint}", flush=True)
                 metric["best_val_loss"] = best_val_loss
 
             last_metrics = {
@@ -466,7 +507,7 @@ def run_sft_jsonl(
 
             generation_path: Path | None = None
             if options.generation_every and step % options.generation_every == 0:
-                generation_path = run_sft_generation_evaluation(
+                generation_path, generation_summary = run_sft_generation_evaluation(
                     model,
                     tokenizer,
                     output,
@@ -474,7 +515,49 @@ def run_sft_jsonl(
                     device=device,
                     max_new_tokens=options.generation_max_new_tokens,
                     autocast_dtype=autocast_dtype,
+                    suite_path=options.generation_suite,
                 )
+                metric.update(generation_summary)
+                quality_score = generation_quality_score(generation_summary)
+                metric["generation_quality_score"] = quality_score
+                if quality_score >= early_best_quality_score + options.early_stopping_quality_min_delta:
+                    early_best_quality_score = quality_score
+                    stale_quality_evaluations = 0
+                else:
+                    stale_quality_evaluations += 1
+                if generation_summary["generation_loop_rate"] > options.severe_loop_rate_threshold:
+                    severe_loop_evaluations += 1
+                else:
+                    severe_loop_evaluations = 0
+                if quality_score > best_quality_score:
+                    best_quality_score = quality_score
+                    best_quality_step = step
+                    quality_metrics = {
+                        "loss": last_loss,
+                        "best_val_loss": best_val_loss,
+                        "best_quality_score": best_quality_score,
+                        "best_quality_step": float(best_quality_step),
+                        **generation_summary,
+                    }
+                    quality_checkpoint = save_training_checkpoint(
+                        output / "best_quality.pt",
+                        model,
+                        optimizer,
+                        scheduler,
+                        stage="sft",
+                        step=step,
+                        metrics=quality_metrics,
+                        training_state=training_state(),
+                    )
+                    mirror_checkpoint(quality_checkpoint, output / "best.pt")
+                    print(
+                        f"saved best-quality SFT checkpoint: {quality_checkpoint} "
+                        f"(score={best_quality_score:.4f})",
+                        flush=True,
+                    )
+                metric["best_quality_score"] = best_quality_score
+                metric["best_quality_step"] = best_quality_step
+                metric["stale_quality_evaluations"] = stale_quality_evaluations
             log_due = (
                 step == 1
                 or step % options.log_every == 0
@@ -500,6 +583,29 @@ def run_sft_jsonl(
                 )
                 prune_periodic_checkpoints(checkpoint_dir, options.keep_last_checkpoints)
                 print(f"saved SFT checkpoint: {checkpoint}", flush=True)
+            if (
+                options.early_stopping_patience
+                and step >= options.early_stopping_min_steps
+                and validation_due
+                and generation_path is not None
+            ):
+                loss_stalled = (
+                    len(recent_validation_losses) >= options.early_stopping_patience + 1
+                    and recent_validation_losses[0] - recent_validation_losses[-1]
+                    < options.early_stopping_validation_min_delta
+                )
+                patience_exhausted = (
+                    stale_quality_evaluations >= options.early_stopping_patience and loss_stalled
+                )
+                severe_regression = severe_loop_evaluations >= 2
+                if patience_exhausted or severe_regression:
+                    print(
+                        f"early stopping SFT at step={step}: "
+                        f"quality_stale={stale_quality_evaluations}, "
+                        f"loss_stalled={loss_stalled}, severe_loop={severe_regression}",
+                        flush=True,
+                    )
+                    break
     except (KeyboardInterrupt, FloatingPointError):
         emergency = save_training_checkpoint(
             checkpoint_dir / f"emergency_step_{completed_step:08d}.pt",
@@ -523,6 +629,10 @@ def run_sft_jsonl(
         "examples_seen": float(examples_seen),
         "learning_rate": float(last_metrics["learning_rate"]),
         "best_val_loss": best_val_loss,
+        "best_quality_score": best_quality_score,
+        "best_quality_step": float(best_quality_step),
+        "stopped_early": float(completed_step < options.steps),
+        "grad_clip_fraction": clipped_steps / max(completed_step, 1),
     }
     checkpoint = save_training_checkpoint(
         output / "sft.pt",
@@ -530,12 +640,12 @@ def run_sft_jsonl(
         optimizer,
         scheduler,
         stage="sft",
-        step=options.steps,
+        step=completed_step,
         metrics=metrics,
         training_state=training_state(),
     )
     if tracker is not None:
-        tracker.finish(summary={**metrics, "final_step": options.steps})
+        tracker.finish(summary={**metrics, "final_step": completed_step})
     result: dict[str, float | str] = {
         **metrics,
         "checkpoint": str(checkpoint),

@@ -294,32 +294,42 @@ class HuggingFaceTokenizer:
                         message["content"] = content.split("</think>", 1)[1].lstrip("\n")
                 assistant_index += 1
 
-        input_ids = self.encode(self.format_messages(prepared_messages))
+        rendered = self.format_messages(prepared_messages)
+        encoded = self.processor(
+            rendered,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_offsets_mapping=True,
+            return_token_type_ids=False,
+        )
+        input_ids = [int(token_id) for token_id in encoded["input_ids"]]
+        offsets = [(int(start), int(end)) for start, end in encoded["offset_mapping"]]
         labels = [-100] * len(input_ids)
-        assistant_prefix = self.encode(f"{self.processor.bos_token}assistant\n")
-        assistant_end = self.encode(f"{self.processor.eos_token}\n")
-        index = 0
+        assistant_prefix = f"{self.processor.bos_token}assistant\n"
+        assistant_end = f"{self.processor.eos_token}\n"
+        empty_thinking = "<think>\n\n</think>\n\n"
+        character_index = 0
         assistant_index = 0
-        while index < len(input_ids):
-            if input_ids[index : index + len(assistant_prefix)] != assistant_prefix:
-                index += 1
-                continue
-            start = index + len(assistant_prefix)
-            end = start
-            while end < len(input_ids) and input_ids[end : end + len(assistant_end)] != assistant_end:
-                end += 1
-            if end >= len(input_ids):
+        while True:
+            prefix_start = rendered.find(assistant_prefix, character_index)
+            if prefix_start < 0:
+                break
+            start = prefix_start + len(assistant_prefix)
+            end = rendered.find(assistant_end, start)
+            if end < 0:
                 raise ValueError("chat template produced an unterminated assistant span")
-            supervised_end = min(end + len(assistant_end), len(input_ids))
+            supervised_start = start
+            supervised_end = end + len(assistant_end)
             if assistant_index in targets:
                 if target_mode == "response_only":
-                    empty_thinking = self.encode("<think>\n\n</think>\n\n")
-                    if input_ids[start : start + len(empty_thinking)] != empty_thinking:
+                    if not rendered.startswith(empty_thinking, start):
                         raise ValueError("chat template response-only thinking prefix changed unexpectedly")
-                    start += len(empty_thinking)
-                labels[start:supervised_end] = input_ids[start:supervised_end]
+                    supervised_start += len(empty_thinking)
+                for token_index, (token_start, token_end) in enumerate(offsets):
+                    if token_end > supervised_start and token_start < supervised_end:
+                        labels[token_index] = input_ids[token_index]
             assistant_index += 1
-            index = supervised_end
+            character_index = supervised_end
         if assistant_index != assistant_count:
             raise ValueError(
                 "chat template assistant span count does not match input messages: "

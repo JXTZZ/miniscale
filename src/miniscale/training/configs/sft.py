@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import MISSING, asdict, dataclass, fields
 from pathlib import Path
 
-from miniscale.integrity import tokenizer_identity
+from miniscale.integrity import path_identity, tokenizer_identity
 from miniscale.model import MiniScaleForCausalLM
 from miniscale.data.sft import (
     SFT_DATA_ORDER_VERSION,
     SFT_EXAMPLE_FORMAT_VERSION,
+    SFT_SELECTION_VERSION,
     SFT_TRUNCATION_VERSION,
     SFTCorpusIndex,
 )
@@ -15,7 +16,7 @@ from miniscale.tokenizer import Tokenizer
 
 
 SFT_RESUME_SIGNATURE_VERSION = 1
-SFT_IMPLEMENTATION_VERSION = 1
+SFT_IMPLEMENTATION_VERSION = 2
 SFT_MASK_VERSION = "structured_assistant_span_v1"
 SFT_OPTIMIZER_GROUPING = "matrix_weights_decay_norm_embedding_no_decay_v1"
 
@@ -46,6 +47,12 @@ class SFTOptions:
     keep_last_checkpoints: int = 3
     generation_every: int = 1000
     generation_max_new_tokens: int = 96
+    generation_suite: str | Path | None = Path("data/eval/sft_generation_v1.jsonl")
+    early_stopping_patience: int = 0
+    early_stopping_min_steps: int = 1000
+    early_stopping_validation_min_delta: float = 0.002
+    early_stopping_quality_min_delta: float = 0.005
+    severe_loop_rate_threshold: float = 0.20
     deduplicate_exact: bool = True
     log_every: int = 10
     num_workers: int = 0
@@ -107,6 +114,18 @@ def validate_sft_options(
         raise ValueError("save_every must be non-negative and keep_last_checkpoints must be positive")
     if options.generation_every < 0 or options.generation_max_new_tokens < 1:
         raise ValueError("generation settings must be non-negative with a positive token limit")
+    if options.generation_every and options.generation_suite is not None and not Path(
+        options.generation_suite
+    ).is_file():
+        raise FileNotFoundError(f"SFT generation suite does not exist: {options.generation_suite}")
+    if options.early_stopping_patience < 0 or options.early_stopping_min_steps < 0:
+        raise ValueError("early stopping patience and minimum steps must be non-negative")
+    if options.early_stopping_validation_min_delta < 0 or options.early_stopping_quality_min_delta < 0:
+        raise ValueError("early stopping minimum deltas must be non-negative")
+    if not 0 <= options.severe_loop_rate_threshold <= 1:
+        raise ValueError("severe_loop_rate_threshold must be in [0, 1]")
+    if options.early_stopping_patience and not options.generation_every:
+        raise ValueError("early stopping requires generation evaluation")
     if options.num_workers < 0:
         raise ValueError("num_workers must be non-negative")
     if options.learning_rate <= 0 or not 0 <= options.min_learning_rate <= options.learning_rate:
@@ -167,6 +186,7 @@ def sft_resume_signature(
         "min_context_tokens": options.min_context_tokens,
         "target_mode": options.target_mode,
         "example_format": SFT_EXAMPLE_FORMAT_VERSION,
+        "selection_version": SFT_SELECTION_VERSION,
         "mask_version": SFT_MASK_VERSION,
         "truncation_version": SFT_TRUNCATION_VERSION,
         "data_order": SFT_DATA_ORDER_VERSION,
@@ -185,6 +205,18 @@ def sft_resume_signature(
         "validation_every": options.validation_every,
         "validation_batches": options.validation_batches,
         "validation_sampling": "fixed_global_sample_v1",
+        "generation_suite": (
+            path_identity(options.generation_suite)
+            if options.generation_suite is not None
+            else {"kind": "builtin_smoke_v1"}
+        ),
+        "generation_every": options.generation_every,
+        "generation_max_new_tokens": options.generation_max_new_tokens,
+        "early_stopping_patience": options.early_stopping_patience,
+        "early_stopping_min_steps": options.early_stopping_min_steps,
+        "early_stopping_validation_min_delta": options.early_stopping_validation_min_delta,
+        "early_stopping_quality_min_delta": options.early_stopping_quality_min_delta,
+        "severe_loop_rate_threshold": options.severe_loop_rate_threshold,
         "seed": options.seed,
         "precision": resolved_precision,
         "world_size": 1,

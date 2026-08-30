@@ -1,0 +1,23 @@
+{
+  "version": "sft_quality_policy_v1",
+  "seed": 42,
+  "max_targets": 250000,
+  "max_targets_per_conversation": 3,
+  "max_prompt_occurrences": 3,
+  "max_tool_prompt_occurrences": 20,
+  "max_response_occurrences": 5,
+  "max_short_response_occurrences": 20,
+  "max_identity_response_occurrences": 20,
+  "short_response_characters": 16,
+  "max_target_tokens": 736,
+  "reject_severe_repetition": true,
+  "category_max_targets": {
+    "knowledge_chat": 125000,
+    "writing_translation": 37500,
+    "math_reasoning": 37500,
+    "code": 30000,
+    "tool": 12500,
+    "safety": 5000,
+    "identity": 2500
+  }
+}

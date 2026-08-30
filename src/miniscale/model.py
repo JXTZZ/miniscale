@@ -178,14 +178,54 @@ class MiniScaleForCausalLM(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: int | None = None,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
         eos_token_id: int | None = None,
         do_sample: bool | None = None,
+        generator: torch.Generator | None = None,
     ) -> Tensor:
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive")
+        if temperature < 0:
+            raise ValueError("temperature must be non-negative")
+        if top_k is not None and top_k < 1:
+            raise ValueError("top_k must be positive when set")
+        if not 0 < top_p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
+        if repetition_penalty < 1:
+            raise ValueError("repetition_penalty must be at least 1")
+        if no_repeat_ngram_size < 0:
+            raise ValueError("no_repeat_ngram_size must be non-negative")
         generated = input_ids
+        prompt_length = input_ids.shape[1]
         eos_token_id = self.config.eos_token_id if eos_token_id is None else eos_token_id
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         for _ in range(max_new_tokens):
             window = generated[:, -self.config.max_position_embeddings :]
             logits = self(window).logits[:, -1]
+            completion = generated[:, prompt_length:]
+            if repetition_penalty != 1.0 and completion.numel():
+                for row in range(logits.shape[0]):
+                    repeated = completion[row].unique()
+                    values = logits[row, repeated]
+                    logits[row, repeated] = torch.where(
+                        values < 0,
+                        values * repetition_penalty,
+                        values / repetition_penalty,
+                    )
+            if no_repeat_ngram_size and completion.shape[1] + 1 >= no_repeat_ngram_size:
+                for row in range(logits.shape[0]):
+                    tokens = completion[row].tolist()
+                    prefix_size = no_repeat_ngram_size - 1
+                    prefix = tokens[-prefix_size:] if prefix_size else []
+                    banned: set[int] = set()
+                    prior_ngrams = len(tokens) - no_repeat_ngram_size + 1
+                    for start in range(max(0, prior_ngrams)):
+                        if tokens[start : start + prefix_size] == prefix:
+                            banned.add(tokens[start + prefix_size])
+                    if banned:
+                        logits[row, list(banned)] = -math.inf
             if do_sample is False or temperature <= 0:
                 next_token = logits.argmax(dim=-1, keepdim=True)
             else:
@@ -193,9 +233,27 @@ class MiniScaleForCausalLM(nn.Module):
                 if top_k is not None:
                     threshold = torch.topk(logits, min(top_k, logits.size(-1))).values[:, -1, None]
                     logits = logits.masked_fill(logits < threshold, -math.inf)
-                next_token = torch.multinomial(F.softmax(logits, dim=-1), 1)
+                probabilities = F.softmax(logits, dim=-1)
+                if top_p < 1.0:
+                    sorted_probabilities, sorted_indices = torch.sort(
+                        probabilities, descending=True, dim=-1
+                    )
+                    cumulative = sorted_probabilities.cumsum(dim=-1)
+                    remove = cumulative - sorted_probabilities >= top_p
+                    sorted_probabilities = sorted_probabilities.masked_fill(remove, 0)
+                    probabilities = torch.zeros_like(probabilities).scatter(
+                        -1, sorted_indices, sorted_probabilities
+                    )
+                    probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
+                next_token = torch.multinomial(probabilities, 1, generator=generator)
+            next_token = torch.where(
+                finished[:, None],
+                torch.full_like(next_token, eos_token_id),
+                next_token,
+            )
             generated = torch.cat((generated, next_token), dim=1)
-            if bool((next_token == eos_token_id).all()):
+            finished |= next_token.squeeze(-1).eq(eos_token_id)
+            if bool(finished.all()):
                 break
         return generated
 

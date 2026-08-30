@@ -14,6 +14,13 @@ from ..training.configs.sft import sft_option_default
 DEFAULT_DATA = Path("data/raw/minimind")
 
 
+def _text_replacement(value: str) -> tuple[str, str]:
+    source, separator, replacement = value.partition("=")
+    if not separator or not source.strip():
+        raise argparse.ArgumentTypeError("replacement must use non-empty OLD=NEW syntax")
+    return source, replacement
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="miniscale", description="MiniScale training stack")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -34,6 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--max-new-tokens", type=int, default=128)
     generate.add_argument("--temperature", type=float, default=0.7)
     generate.add_argument("--top-k", type=int, default=50, help="use 0 to disable top-k sampling")
+    generate.add_argument("--top-p", type=float, default=1.0)
+    generate.add_argument("--repetition-penalty", type=float, default=1.0)
+    generate.add_argument("--no-repeat-ngram-size", type=int, default=0)
+    generate.add_argument("--seed", type=int)
     generate.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     generate.add_argument("--raw-prompt", action="store_true", help="skip the chat template (useful for base models)")
     generate.add_argument("--raw", action="store_true", help="print only the generated response")
@@ -52,6 +63,19 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
     evaluate.add_argument("--seed", type=int, default=42)
     evaluate.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    evaluate_sft = subcommands.add_parser(
+        "evaluate-sft", help="compare SFT checkpoints on raw and guarded generation quality"
+    )
+    evaluate_sft.add_argument("--checkpoint", type=Path, action="append", required=True)
+    evaluate_sft.add_argument(
+        "--suite", type=Path, default=Path("data/eval/sft_generation_v1.jsonl")
+    )
+    evaluate_sft.add_argument("--tokenizer", type=Path, default=Path("data/tokenizer/minimind"))
+    evaluate_sft.add_argument("--output", type=Path)
+    evaluate_sft.add_argument("--max-new-tokens", type=int, default=160)
+    evaluate_sft.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
+    evaluate_sft.add_argument("--seed", type=int, default=42)
+    evaluate_sft.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     inspect_tokenizer = subcommands.add_parser("tokenize", help="inspect token ids and pieces for text")
     inspect_tokenizer.add_argument("--tokenizer", type=Path, default=Path("data/tokenizer/minimind"))
     inspect_tokenizer.add_argument("--text", required=True)
@@ -135,6 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
         "prepare-sft-data", help="write a deduplicated and optionally filtered derived SFT JSONL"
     )
     prepare_sft.add_argument("--data", type=Path, default=DEFAULT_DATA / "sft/sft_t2t_mini.jsonl")
+    prepare_sft.add_argument("--tokenizer", type=Path, default=Path("data/tokenizer/minimind"))
     prepare_sft.add_argument("--output", type=Path, required=True)
     prepare_sft.add_argument("--manifest", type=Path)
     prepare_sft.add_argument(
@@ -145,6 +170,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="case-insensitive identity/brand substring to exclude; repeat for multiple patterns",
+    )
+    prepare_sft.add_argument(
+        "--replace-pattern",
+        action="append",
+        default=[],
+        type=_text_replacement,
+        metavar="OLD=NEW",
+        help="case-insensitive conversation text replacement; repeat for multiple rules",
+    )
+    prepare_sft.add_argument(
+        "--quality-policy",
+        type=Path,
+        help="JSON policy for deterministic target filtering, caps, and global selection",
     )
     tokenizer = subcommands.add_parser("train-tokenizer", help="train SentencePiece from pretraining JSONL")
     tokenizer.add_argument("--data", type=Path, default=DEFAULT_DATA / "pretrain/pretrain_t2t_mini.jsonl")
@@ -282,6 +320,34 @@ def build_parser() -> argparse.ArgumentParser:
     sft.add_argument("--generation-every", type=int, default=sft_option_default("generation_every"))
     sft.add_argument(
         "--generation-max-new-tokens", type=int, default=sft_option_default("generation_max_new_tokens")
+    )
+    sft.add_argument(
+        "--generation-suite",
+        type=Path,
+        default=sft_option_default("generation_suite"),
+        help="fixed JSONL probe suite used for generation quality and checkpoint selection",
+    )
+    sft.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=sft_option_default("early_stopping_patience"),
+        help="quality evaluations without improvement before stopping; 0 disables",
+    )
+    sft.add_argument(
+        "--early-stopping-min-steps", type=int,
+        default=sft_option_default("early_stopping_min_steps"),
+    )
+    sft.add_argument(
+        "--early-stopping-validation-min-delta", type=float,
+        default=sft_option_default("early_stopping_validation_min_delta"),
+    )
+    sft.add_argument(
+        "--early-stopping-quality-min-delta", type=float,
+        default=sft_option_default("early_stopping_quality_min_delta"),
+    )
+    sft.add_argument(
+        "--severe-loop-rate-threshold", type=float,
+        default=sft_option_default("severe_loop_rate_threshold"),
     )
     sft.add_argument(
         "--deduplicate-exact",

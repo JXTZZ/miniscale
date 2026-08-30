@@ -11,6 +11,13 @@ from ..integrity import atomic_write_json
 from ..tokenizer import Tokenizer
 from .metrics import integer_percentiles
 from .sft import SFTCorpusIndex, truncate_sft_example
+from .sft_quality import (
+    repeated_character_ngram_fraction,
+    repeated_sentence_coverage,
+    response_has_severe_repetition,
+    stable_text_digest,
+    target_category,
+)
 
 
 def audit_sft_jsonl(
@@ -43,7 +50,13 @@ def audit_sft_jsonl(
     target_examples_seen = 0
     role_counts: Counter[str] = Counter()
     identity_counts: Counter[str] = Counter()
+    prompt_digests: Counter[int] = Counter()
+    response_digests: Counter[int] = Counter()
+    category_counts: Counter[str] = Counter()
     reasoning_messages = empty_content_messages = tool_call_messages = 0
+    severe_repetition_messages = 0
+    repeated_ngram_values: list[float] = []
+    repeated_sentence_values: list[float] = []
 
     with Path(path).open(encoding="utf-8") as source:
         for line in source:
@@ -53,6 +66,10 @@ def audit_sft_jsonl(
             messages = row.get("conversations") if isinstance(row, dict) else None
             if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
                 continue
+            selection = row.get("sft_selection") if isinstance(row, dict) else None
+            selected_positions = (
+                set(selection.get("target_positions", [])) if isinstance(selection, dict) else None
+            )
             searchable = json.dumps(messages, ensure_ascii=False).casefold()
             for pattern in identity_patterns:
                 if pattern.casefold() in searchable:
@@ -71,11 +88,29 @@ def audit_sft_jsonl(
                     reasoning_messages += 1
                 if role != "assistant":
                     continue
+                if selected_positions is not None and position not in selected_positions:
+                    continue
                 has_response = (isinstance(content, str) and bool(content.strip())) or bool(message.get("tool_calls"))
                 has_reasoning = isinstance(reasoning, str) and bool(reasoning.strip())
                 if not has_response and not (target_mode == "reasoning_and_response" and has_reasoning):
                     continue
                 target_examples_seen += 1
+                latest_user = next(
+                    (
+                        str(previous.get("content") or "")
+                        for previous in reversed(messages[:position])
+                        if previous.get("role") == "user"
+                    ),
+                    "",
+                )
+                prompt_digests[stable_text_digest(latest_user)] += 1
+                response_text = str(content or "")
+                if response_text.strip():
+                    response_digests[stable_text_digest(response_text)] += 1
+                    repeated_ngram_values.append(repeated_character_ngram_fraction(response_text))
+                    repeated_sentence_values.append(repeated_sentence_coverage(response_text))
+                    severe_repetition_messages += response_has_severe_repetition(message)
+                category_counts[target_category(messages, position)] += 1
                 candidate = [dict(item) for item in messages[: position + 1]]
                 if len(sample) < sample_size:
                     sample.append(candidate)
@@ -113,6 +148,18 @@ def audit_sft_jsonl(
 
     retained = sum(retained_supervised_lengths)
     original = sum(supervised_lengths)
+
+    def duplicate_summary(counts: Counter[int]) -> dict[str, object]:
+        total = counts.total()
+        duplicate_instances = sum(count for count in counts.values() if count > 1)
+        return {
+            "unique": len(counts),
+            "duplicate_groups": sum(count > 1 for count in counts.values()),
+            "instances_in_duplicate_groups": duplicate_instances,
+            "duplicate_group_fraction": duplicate_instances / total if total else 0.0,
+            "excess_duplicates": sum(count - 1 for count in counts.values() if count > 1),
+            "largest_group": max(counts.values(), default=0),
+        }
     return {
         "schema_version": 1,
         "kind": "sft_data_audit",
@@ -146,6 +193,24 @@ def audit_sft_jsonl(
             "supervised_token_retention": retained / original if original else 0.0,
             "dropped_context_tokens": dropped_context_tokens,
             "dropped_target_tokens": dropped_target_tokens,
+        },
+        "quality": {
+            "normalization": "unicode_nfkc_casefold_alphanumeric_v1",
+            "normalized_prompt_duplicates": duplicate_summary(prompt_digests),
+            "normalized_response_duplicates": duplicate_summary(response_digests),
+            "category_counts": dict(category_counts),
+            "severe_repetition_messages": severe_repetition_messages,
+            "severe_repetition_fraction": (
+                severe_repetition_messages / target_examples_seen if target_examples_seen else 0.0
+            ),
+            "character_4gram_repetition": integer_percentiles(
+                [round(value * 1_000_000) for value in repeated_ngram_values]
+            ),
+            "sentence_repetition_coverage": integer_percentiles(
+                [round(value * 1_000_000) for value in repeated_sentence_values]
+            ),
+            "fraction_scale": 1_000_000,
+            "near_duplicate_check": False,
         },
     }
 

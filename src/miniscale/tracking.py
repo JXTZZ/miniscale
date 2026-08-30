@@ -195,12 +195,18 @@ class WandbTracker:
                     "step", "language", "name", "prompt", "policy_response",
                     "reference_response", "policy_generated_tokens", "reference_generated_tokens",
                 ]
+            elif generation.get("stage") == "sft" and generation.get("schema_version") == 2:
+                columns = [
+                    "step", "id", "category", "language", "prompt", "response",
+                    "finish_reason", "eos", "generated_tokens", "repeated_4gram_fraction",
+                    "loop", "task_pass",
+                ]
             else:
                 columns = ["step", "language", "name", "prompt", "response", "generated_tokens"]
             table = self._wandb.Table(
                 columns=columns,
                 data=[
-                    [generation["step"], *[sample[column] for column in columns[1:]]]
+                    [generation["step"], *[sample.get(column) for column in columns[1:]]]
                     for sample in generation["samples"]
                 ],
             )
@@ -223,6 +229,7 @@ class WandbTracker:
             "pairs_seen": "train/pairs_seen",
             "target_tokens_seen": "train/target_tokens_seen",
             "grad_was_clipped": "train/grad_was_clipped",
+            "grad_clip_fraction": "train/grad_clip_fraction",
             "update_seconds": "performance/update_seconds",
             "tokens_per_second": "performance/tokens_per_second",
             "supervised_tokens_per_second": "performance/supervised_tokens_per_second",
@@ -255,6 +262,18 @@ class WandbTracker:
             "invalid_call_rate": "train/invalid_call_rate",
             "mean_turns": "train/mean_turns",
             "rollouts_per_second": "performance/rollouts_per_second",
+            "generation_eos_rate": "eval/gen_raw/eos_rate",
+            "generation_max_length_rate": "eval/gen_raw/max_length_rate",
+            "generation_loop_rate": "eval/gen_raw/loop_rate",
+            "generation_repeated_4gram_fraction": "eval/gen_raw/repeated_4gram_fraction",
+            "generation_task_pass_rate": "eval/gen_raw/task_pass_rate",
+            "generation_prompt_echo_rate": "eval/gen_raw/prompt_echo_rate",
+            "generation_special_token_leak_rate": "eval/gen_raw/special_token_leak_rate",
+            "generation_think_leak_rate": "eval/gen_raw/think_leak_rate",
+            "generation_average_tokens": "eval/gen_raw/average_tokens",
+            "generation_quality_score": "eval/gen_raw/quality_score",
+            "best_quality_score": "eval/best_quality_score",
+            "best_quality_step": "eval/best_quality_step",
         }
         for source, target in optional_metrics.items():
             if source in metric:

@@ -20,10 +20,20 @@ class InferenceTests(unittest.TestCase):
             result = generate_from_checkpoint(
                 checkpoint,
                 "2+3?",
-                GenerationOptions(max_new_tokens=4, temperature=0, device="cpu"),
+                GenerationOptions(
+                    max_new_tokens=4,
+                    temperature=0.7,
+                    top_p=0.9,
+                    repetition_penalty=1.1,
+                    no_repeat_ngram_size=4,
+                    seed=7,
+                    device="cpu",
+                ),
             )
             self.assertIsInstance(result["response"], str)
             self.assertEqual(result["generated_tokens"], 4)
+            self.assertEqual(result["top_p"], 0.9)
+            self.assertEqual(result["finish_reason"], "max_tokens")
 
     def test_missing_checkpoint_is_rejected(self) -> None:
         with self.assertRaises(FileNotFoundError):

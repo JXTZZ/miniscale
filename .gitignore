@@ -8,6 +8,12 @@ build/
 dist/
 artifacts/
 data/*
+!data/eval/
+data/eval/*
+!data/eval/sft_generation_v1.jsonl
+!data/policies/
+data/policies/*
+!data/policies/sft_quality_v1.json
 !data/tokenizer/
 data/tokenizer/*
 !data/tokenizer/minimind/

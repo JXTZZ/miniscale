@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -24,6 +25,47 @@ class ModelAndDataTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(output.loss))
         output.loss.backward()
         self.assertIsNotNone(self.model.embedding.weight.grad)
+
+    def test_no_repeat_ngram_blocks_completion_loops(self) -> None:
+        def repeated_forward(input_ids: torch.Tensor, **_kwargs: object) -> object:
+            logits = torch.zeros(
+                (*input_ids.shape, self.config.vocab_size), dtype=torch.float32
+            )
+            logits[:, -1, 5] = 10
+            return SimpleNamespace(logits=logits)
+
+        self.model.forward = repeated_forward  # type: ignore[method-assign]
+        prompt = torch.tensor([[10, 11]])
+        generated = self.model.generate(
+            prompt,
+            max_new_tokens=3,
+            temperature=0,
+            no_repeat_ngram_size=1,
+            eos_token_id=259,
+        )
+        completion = generated[0, prompt.shape[1] :].tolist()
+        self.assertEqual(len(completion), len(set(completion)))
+        self.assertEqual(completion[0], 5)
+
+    def test_sampling_with_a_private_generator_is_reproducible(self) -> None:
+        prompt = torch.tensor([[10, 11]])
+        first = self.model.generate(
+            prompt,
+            max_new_tokens=4,
+            temperature=0.7,
+            top_p=0.9,
+            generator=torch.Generator().manual_seed(123),
+            eos_token_id=259,
+        )
+        second = self.model.generate(
+            prompt,
+            max_new_tokens=4,
+            temperature=0.7,
+            top_p=0.9,
+            generator=torch.Generator().manual_seed(123),
+            eos_token_id=259,
+        )
+        self.assertTrue(torch.equal(first, second))
 
     def test_tied_embedding_is_initialized_once_with_zero_padding_row(self) -> None:
         self.assertIs(self.model.lm_head.weight, self.model.embedding.weight)
