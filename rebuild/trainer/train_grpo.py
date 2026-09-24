@@ -1,0 +1,23 @@
+"""Small standalone single-turn GRPO/RLVR example."""
+
+from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
+from miniscale.data.rl import RLTask
+from miniscale.training.core.rl_config import GRPOOptions
+from miniscale.training.grpo import run_grpo
+
+
+def main() -> None:
+    model = MiniScaleForCausalLM(MiniScaleConfig.smoke())
+    tasks = [RLTask("Return only the result: 2+3", "5"), RLTask("Return only the result: 3*4", "12")]
+    metrics = run_grpo(
+        model,
+        ByteTokenizer(),
+        tasks,
+        "artifacts/grpo-smoke",
+        GRPOOptions(steps=1, group_size=2, max_new_tokens=8),
+    )
+    print(metrics)
+
+
+if __name__ == "__main__":
+    main()
