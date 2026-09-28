@@ -11,6 +11,21 @@ GRPO 目标和工具环境均在本仓库独立实现，不是对上游源码的
 直接读取本地数据，不会把十几 GB 数据一次性装入内存；训练步数必须显式指定，避免误启动
 长任务。
 
+## 从这里开始阅读
+
+- [重构检查与训练效果判断](docs/rebuild-review.md)：与根目录实现的对照结果、真实数据审计和限制。
+- [阅读与动手顺序](docs/learning-guide.md)：从 token、模型、预训练走到 SFT、DPO、GRPO、Agent RL。
+- [分支对比、推送与合并](docs/git-workflow.md)：先阅读差异，再推送；合并留到确认之后。
+
+数据可用标准库脚本下载，包含 mini 预训练、mini SFT 以及现有后续阶段所需的数据文件：
+
+```bash
+python scripts/download_minimind.py
+```
+
+脚本支持中断续传，并校验 ModelScope 的 SHA-256；来源、版本和文件身份写到
+`data/raw/minimind/download_manifest.json`。数据和训练产物不进入 Git。
+
 ## 已打通的流水线
 
 ```text
@@ -28,6 +43,9 @@ tied embeddings。真实训练默认使用 MiniMind 已训练好的 6400 词表 
 本仓库训练 SentencePiece 的入口则保留为对照实验。
 
 ## 立即运行
+
+`pipeline` 是小模型集成检查，依次运行 pretrain → SFT → GRPO → Agent RL。
+正式 JSONL 训练需使用后文的各阶段命令，DPO 也通过独立命令运行。
 
 项目固定 Python `>=3.11,<3.13`，`.python-version` 为 3.12。请始终通过 `uv run` 或
 激活 `.venv` 运行；终端裸执行 `python` 若仍显示 3.14，只表示 base 环境在 PATH 前面，
@@ -155,6 +173,11 @@ uv run miniscale agent-rl --steps 500 --batch-size 1 --group-size 2 \
   --checkpoint artifacts/grpo/best.pt \
   --output artifacts/agent-rl
 ```
+
+本次 mini 数据的全局抽样显示，SFT 长度 512 会截断约 21.9% 的目标回复，768 约为 0.95%。
+若预训练 checkpoint 的上下文至少为 768，建议将上例 SFT 参数改为 `--max-length 768` 后建立基线。
+上述 10,000/3,000 steps 是短实验预算，不代表完整学过一遍 mini 数据；覆盖率与测量条件见
+[检查报告](docs/rebuild-review.md)。
 
 正式 SFT 会把 conversation 展开为 assistant-turn 样本，只监督当前 assistant 回复；训练数据使用
 全局确定性 permutation，而不是只读取 JSONL 前部。默认按 conversation hash 留出 0.5% validation、
