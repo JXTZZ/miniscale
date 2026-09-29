@@ -160,13 +160,13 @@ uv run miniscale sft \
   --target-mode response_only \
   --precision bf16 \
   --learning-rate 1e-5 \
-  --min-learning-rate 1e-6 \
+  --min-learning-rate 2e-6 \
   --warmup-steps 500 \
-  --validation-every 500 \
+  --validation-every 200 \
   --validation-batches 100 \
-  --save-every 1000 \
+  --save-every 500 \
   --keep-last 3 \
-  --generation-every 500 \
+  --generation-every 1000 \
   --generation-suite data/eval/sft_generation_v1.jsonl \
   --early-stopping-patience 4 \
   --early-stopping-min-steps 12000 \

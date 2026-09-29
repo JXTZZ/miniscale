@@ -22,6 +22,7 @@ from miniscale.tracking import WandbTracker
 from ..core.artifacts import append_metric, prune_periodic_checkpoints, truncate_metrics_after
 from ..core.logging import format_training_metric
 from ..core.checkpoint import (
+    UpdateBoundary,
     TRAINING_CHECKPOINT_FORMAT_VERSION,
     read_training_checkpoint,
     restore_rng_state,
@@ -31,6 +32,7 @@ from ..core.checkpoint import (
     signature_differences,
 )
 from ..core.runtime import (
+    runtime_metadata,
     autocast_context,
     build_adamw_optimizer,
     build_warmup_cosine_scheduler,
@@ -150,7 +152,9 @@ def run_dpo_jsonl(
     parent_target_mode: str | None = None
     initial_checkpoint_source: str | None = None
     if options.resume_from is not None:
-        payload = read_training_checkpoint(options.resume_from, device)
+        payload = read_training_checkpoint(options.resume_from, "cpu")
+        if payload["step"] >= options.steps:
+            raise ValueError("resume checkpoint is already at or beyond the requested total steps")
         if payload.get("stage") != "dpo":
             raise ValueError("--resume requires a full DPO checkpoint")
         state = payload.get("training_state")
@@ -295,7 +299,7 @@ def run_dpo_jsonl(
         current_reference_identity = path_identity(reference_path)
         if current_reference_identity != saved_reference_identity:
             raise ValueError("DPO frozen reference snapshot does not match the resume checkpoint")
-        reference_payload = torch.load(reference_path, map_location=device, weights_only=False)
+        reference_payload = torch.load(reference_path, map_location="cpu", weights_only=False)
         if reference_payload.get("stage") != "dpo_reference":
             raise ValueError("DPO reference snapshot has an invalid stage")
         restore_training_checkpoint(payload, model, optimizer, scheduler, restore_rng=False)
@@ -343,6 +347,7 @@ def run_dpo_jsonl(
         "implementation_version": DPO_IMPLEMENTATION_VERSION,
         "model": asdict(model.config),
         "num_parameters": model.num_parameters,
+        "runtime": runtime_metadata(device),
         "training": resolved_dpo_options(options, target_mode=target_mode),
         "resolved": {"precision": resolved_precision, "max_length": max_length, "world_size": 1},
         "data": {
@@ -389,8 +394,10 @@ def run_dpo_jsonl(
             "resume_signature": signature,
         }
 
+    boundary = UpdateBoundary()
     try:
         for step in range(completed_step + 1, options.steps + 1):
+            boundary.begin()
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
                 torch.cuda.synchronize(device)
@@ -445,6 +452,7 @@ def run_dpo_jsonl(
                 raise FloatingPointError(
                     f"non-finite DPO gradient norm at optimizer step {step}"
                 ) from error
+            boundary.mark_mutating()
             optimizer.step()
             scheduler.step()
             if device.type == "cuda":
@@ -539,6 +547,7 @@ def run_dpo_jsonl(
                     max_new_tokens=options.generation_max_new_tokens,
                     autocast_dtype=autocast_dtype,
                 )
+            boundary.commit()
             log_due = (
                 step == 1
                 or step % options.log_every == 0
@@ -564,6 +573,10 @@ def run_dpo_jsonl(
                 prune_periodic_checkpoints(checkpoint_dir, options.keep_last_checkpoints)
                 print(f"saved DPO checkpoint: {checkpoint}", flush=True)
     except (KeyboardInterrupt, FloatingPointError):
+        if not boundary.prepare_emergency():
+            if tracker is not None:
+                tracker.finish(exit_code=1, summary={"interrupted_step": completed_step})
+            raise
         emergency = _save_dpo_checkpoint(
             checkpoint_dir / f"emergency_step_{completed_step:08d}.pt",
             model,

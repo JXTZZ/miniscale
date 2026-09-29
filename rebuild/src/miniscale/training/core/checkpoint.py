@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import random
+import warnings
 
 import numpy as np
 import torch
@@ -61,12 +62,7 @@ def save_training_checkpoint(
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "training_state": training_state,
-        "rng_state": {
-            "python": random.getstate(),
-            "numpy": np.random.get_state(),
-            "torch": torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-        },
+        "rng_state": capture_rng_state(),
     }
     for name in ("tokens_seen", "best_val_loss"):
         if name in training_state:
@@ -80,10 +76,17 @@ def read_training_checkpoint(
     path: str | Path,
     device: str | torch.device,
 ) -> dict[str, object]:
-    """Read and structurally validate a resumable checkpoint without mutation."""
+    """Validate without mutation; tensors stay on CPU until restoration.
 
-    payload = torch.load(path, map_location=device, weights_only=False)
-    required = {"model", "optimizer", "scheduler", "training_state", "step"}
+    ``device`` is retained for compatibility with existing callers.
+    """
+
+    # Keep serialized optimizer tensors off the GPU. load_state_dict moves
+    # only the live state to each parameter's device after identity validation.
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError("training checkpoint must be a mapping")
+    required = {"config", "model", "optimizer", "scheduler", "training_state", "step"}
     missing = required.difference(payload)
     if missing:
         raise ValueError(f"checkpoint cannot resume training; missing: {', '.join(sorted(missing))}")
@@ -95,6 +98,17 @@ def read_training_checkpoint(
             f"checkpoint format {version} is newer than supported format "
             f"{TRAINING_CHECKPOINT_FORMAT_VERSION}"
         )
+    for name in ("model", "optimizer", "scheduler", "training_state"):
+        if not isinstance(payload[name], dict):
+            raise ValueError(f"checkpoint {name} must be a mapping")
+    if type(payload["step"]) is not int or payload["step"] < 0:
+        raise ValueError("checkpoint step must be a non-negative integer")
+    if version >= 2:
+        rng = payload.get("rng_state")
+        if not isinstance(rng, dict) or not {"python", "numpy", "torch", "cuda"} <= rng.keys():
+            raise ValueError("checkpoint is missing complete rng_state for exact resume")
+        if not isinstance(rng["torch"], torch.Tensor) or rng["torch"].dtype != torch.uint8:
+            raise ValueError("checkpoint torch RNG must be a byte tensor")
     return payload
 
 
@@ -129,6 +143,54 @@ def load_training_checkpoint(
     return payload
 
 
+def capture_rng_state() -> dict[str, object]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+class UpdateBoundary:
+    """Track whether an interrupted update can produce an exact checkpoint.
+
+    Before optimizer mutation, discard partial gradients and rewind RNG to the
+    update start. During optimizer mutation (or between RL policy epochs), the
+    last periodic checkpoint is the recovery point; copying AdamW every step
+    would be too expensive for this single-device trainer.
+    """
+
+    def __init__(self) -> None:
+        self.rng_state: dict[str, object] | None = None
+        self.mutating = False
+
+    def begin(self) -> None:
+        self.rng_state = capture_rng_state()
+        self.mutating = False
+
+    def mark_mutating(self) -> None:
+        self.mutating = True
+
+    def commit(self) -> None:
+        self.rng_state = None
+        self.mutating = False
+
+    def prepare_emergency(self) -> bool:
+        if self.mutating:
+            warnings.warn(
+                "update interrupted after optimizer mutation began, before update bookkeeping completed; "
+                "emergency checkpoint was not saved. "
+                "Resume from the last complete periodic/best checkpoint.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return False
+        if self.rng_state is not None:
+            restore_rng_state(self.rng_state)
+        return True
+
+
 def restore_rng_state(rng_state: object) -> None:
     """Restore Python, NumPy, CPU and CUDA RNG state captured in a checkpoint."""
 
@@ -145,12 +207,16 @@ def restore_rng_state(rng_state: object) -> None:
 
 
 def load_checkpoint(path: str | Path, device: str | torch.device = "cpu") -> MiniScaleForCausalLM:
-    payload = torch.load(path, map_location=device, weights_only=False)
+    # A full training payload includes AdamW state that inference never uses.
+    payload = torch.load(path, map_location="cpu", weights_only=False)
     config = payload["config"]
     if isinstance(config, dict):
         config = MiniScaleConfig(**config)
-    model = MiniScaleForCausalLM(config)
+    # Loading weights must not advance the caller's random stream.
+    with torch.random.fork_rng(devices=[]):
+        model = MiniScaleForCausalLM(config)
     model.load_state_dict(payload["model"])
+    del payload
     return model.to(device)
 
 

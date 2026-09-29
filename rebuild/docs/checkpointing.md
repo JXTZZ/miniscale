@@ -88,3 +88,38 @@ For DPO, `--checkpoint` must be an SFT checkpoint and creates both the initial
 policy and frozen `reference.pt`. `--resume` requires a full DPO checkpoint plus
 the unchanged `reference.pt` in the same output directory. Final `dpo.pt` keeps
 top-level model/config fields for inference and GRPO hand-off.
+
+## Implementation v3 boundary
+
+All five production stages now record implementation version 3. RoPE preserves
+BF16 Q/K dtype; generation probabilities use FP32; packed pretraining uses the
+native causal attention path. Multi-worker pretraining advances the shuffle seed
+between epochs, and dedicated validation no longer excludes a hash slice from
+the training file. RL optimization keeps dropout disabled, matching rollout and
+old-policy scoring.
+
+These changes can alter a training trajectory. Existing weights remain loadable
+for inference, HF export and stage handoff, but an implementation-v2 checkpoint
+cannot silently resume under v3. Finish an old run with its original code, or
+start a new experiment from its weights. `--allow-legacy-resume` remains limited
+to the documented legacy signature migration; it does not bypass a v2/v3
+implementation mismatch in a strict checkpoint.
+
+Emergency saving tracks optimizer update boundaries. Before optimizer mutation,
+partial gradients are discarded and RNG is rewound to the beginning of the
+unfinished update; committed data counters still identify the previous update.
+Once mutation starts, interruption can leave AdamW, an RL policy epoch, or
+validation/early-stopping bookkeeping only partially applied. No emergency
+checkpoint is published in that case: use the last complete periodic/best checkpoint. This avoids cloning all model and AdamW
+state every step. SIGKILL and power loss still require a previously saved file.
+
+Checkpoints deserialize on CPU before state restoration, so inference does not
+load optimizer tensors into GPU memory. Loading weights preserves the caller's
+CPU RNG. SFT best-loss snapshots include the same step's generation and early
+stopping counters. W&B removes queued events later than the resumed step before
+upload; history already uploaded to W&B cannot be rolled back by local code.
+
+Run manifests also record Python/PyTorch/Transformers/NumPy versions, CUDA build,
+device, thread count, TF32 and deterministic-algorithm settings. Fixed seeds and
+input identities support replay in the same runtime; they do not promise bitwise
+identity across hardware or library versions.

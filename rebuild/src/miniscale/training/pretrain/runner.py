@@ -28,6 +28,7 @@ from .config import (
 )
 from ..core.artifacts import append_metric, prune_periodic_checkpoints, truncate_metrics_after
 from ..core.checkpoint import (
+    UpdateBoundary,
     read_training_checkpoint,
     restore_rng_state,
     restore_training_checkpoint,
@@ -221,7 +222,7 @@ def run_pretrain_jsonl(
     model.to(device).train()
     train_dataset = JsonlPretrainDataset(
         train_path, tokenizer, options.sequence_length, split="train",
-        validation_fraction=options.validation_fraction,
+        validation_fraction=0 if validation_path else options.validation_fraction,
         shuffle_buffer_size=options.shuffle_buffer_size,
         seed=options.seed,
     )
@@ -262,7 +263,11 @@ def run_pretrain_jsonl(
     last_metrics: dict[str, float] = {"loss": last_loss, "tokens_seen": float(tokens_seen)}
     payload: dict[str, object] | None = None
     if options.resume_from is not None:
-        payload = read_training_checkpoint(options.resume_from, device)
+        payload = read_training_checkpoint(options.resume_from, "cpu")
+        if payload["step"] >= options.steps:
+            raise ValueError("resume checkpoint is already at or beyond the requested total steps")
+        if payload.get("stage") != "pretrain":
+            raise ValueError("--resume requires a full pretrain checkpoint")
         state = payload["training_state"]
         if not isinstance(state, dict):
             raise ValueError("checkpoint training_state must be a mapping")
@@ -363,8 +368,10 @@ def run_pretrain_jsonl(
             "resume_signature": resume_signature,
         }
 
+    boundary = UpdateBoundary()
     try:
         for step in range(completed_step + 1, options.steps + 1):
+            boundary.begin()
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
                 torch.cuda.synchronize(device)
@@ -377,7 +384,9 @@ def run_pretrain_jsonl(
             for micro_step in range(1, options.gradient_accumulation_steps + 1):
                 batch = {name: value.to(device) for name, value in next(batches).items()}
                 with _autocast_context(device, autocast_dtype):
-                    result = model(**batch)
+                    # Packed training blocks are full length: let SDPA use its
+                    # native causal path without allocating a square mask.
+                    result = model(input_ids=batch["input_ids"], labels=batch["labels"])
                 if result.loss is None:
                     raise RuntimeError("model did not return a pretraining loss")
                 if not bool(torch.isfinite(result.loss)):
@@ -392,9 +401,17 @@ def run_pretrain_jsonl(
                 loss_times_targets += float(result.loss.detach()) * target_count
                 step_tokens += int(batch["attention_mask"].sum())
                 step_target_tokens += target_count
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), options.grad_clip, error_if_nonfinite=True
-            )
+            try:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), options.grad_clip, error_if_nonfinite=True
+                )
+            except RuntimeError as error:
+                if "non-finite" not in str(error):
+                    raise
+                raise FloatingPointError(
+                    f"non-finite pretraining gradient norm at optimizer step {step}"
+                ) from error
+            boundary.mark_mutating()
             optimizer.step()
             scheduler.step()
             if device.type == "cuda":
@@ -474,6 +491,7 @@ def run_pretrain_jsonl(
                     autocast_dtype=autocast_dtype,
                 )
                 print(f"saved generation evaluation: {generation_path}", flush=True)
+            boundary.commit()
             log_due = (
                 step == 1
                 or step % options.log_every == 0
@@ -499,7 +517,11 @@ def run_pretrain_jsonl(
                 )
                 prune_periodic_checkpoints(checkpoint_dir, options.keep_last_checkpoints)
                 print(f"saved checkpoint: {checkpoint}", flush=True)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, FloatingPointError):
+        if not boundary.prepare_emergency():
+            if tracker is not None:
+                tracker.finish(exit_code=1, summary={"interrupted_step": completed_step})
+            raise
         emergency = save_training_checkpoint(
             checkpoint_dir / f"emergency_step_{completed_step:08d}.pt",
             model,

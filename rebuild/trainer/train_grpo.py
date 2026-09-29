@@ -1,5 +1,7 @@
 """Small standalone single-turn GRPO/RLVR example."""
 
+from miniscale.training.core.runtime import seed_everything
+
 from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
 from miniscale.data.rl import RLTask
 from miniscale.training.core.rl_config import GRPOOptions
@@ -7,6 +9,7 @@ from miniscale.training.grpo import run_grpo
 
 
 def main() -> None:
+    seed_everything(42)
     model = MiniScaleForCausalLM(MiniScaleConfig.smoke())
     tasks = [RLTask("Return only the result: 2+3", "5"), RLTask("Return only the result: 3*4", "12")]
     metrics = run_grpo(

@@ -40,6 +40,10 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=src \
 模型先看 `MiniScaleForCausalLM.forward`，再沿调用读 `DecoderLayer`、attention、RoPE、SwiGLU、RMSNorm。
 第一次阅读先记录张量 shape，第二遍再推公式。
 
+### 原生生成与 KV cache
+
+当前 `MiniScaleForCausalLM.generate` **没有实现 KV cache**。它每生成一个 token，都会把当前上下文窗口重新送入整个 Transformer；`logits_to_keep=1` 只减少输出层需要计算和保存的 logits，不会缓存 attention 的 key/value。因此长回复的原生推理会较慢，但这不影响训练时的 loss 计算。导出为标准 Hugging Face Llama 模型后，可以使用 Transformers 的 `generate` 和其 KV cache；这属于导出模型的推理能力，不表示原生 `generate` 已有缓存。
+
 动手练习：把一行文本编码后打印前 20 个 token；手写一个长度为 5 的序列，画出
 `logits[:, :-1]` 和 `labels[:, 1:]` 的对应关系。不要在 dataset 和模型中各 shift 一次。
 
@@ -65,6 +69,14 @@ OMP_NUM_THREADS=1 PYTHONPATH=src ../.venv/bin/python -m unittest \
 ```
 
 先复现“连续训练”和“中途保存再恢复”的权重一致，再尝试修改 batch 或学习率。
+
+### 训练文件和验证文件如何分工
+
+- 提供独立的 `validation_path` 时，训练集从 `train_path` 读取，**不会再按 `validation_fraction` 扣掉训练文件中的样本**；验证集从 `validation_path` 读取。这仍然有验证集。例子：训练文件有 10,000 条有效记录，独立验证文件有 500 条，则在没有额外 `data_limit` 等限制时，训练文件的 10,000 条都属于训练集，另一个文件的 500 条属于验证集。有限的训练步数不保证遍历全部训练样本；实际产生的预训练 block 数还受 tokenization、packing 和 `drop_last` 影响。
+- 没有独立验证文件时，才按 `validation_fraction` 从同一训练文件划出验证数据；这部分记录不参与训练。例如比例为 0.005 时，约 0.5% 的记录划给验证集。
+- 两个文件应由你在数据准备阶段去重并隔离同源样本，避免验证数据泄漏进训练集。
+
+此前“独立验证集仍导致训练数据被额外扣除”说的就是第一种场景中的旧问题；当前预训练、SFT、DPO、GRPO 和 Agent RL 训练入口都已改为使用完整的独立训练文件。
 
 ## 3. 再学习 SFT，重点看监督范围
 

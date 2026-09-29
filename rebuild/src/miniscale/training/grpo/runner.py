@@ -25,6 +25,7 @@ from ..core.artifacts import (
 )
 from ..core.logging import format_training_metric
 from ..core.checkpoint import (
+    UpdateBoundary,
     TRAINING_CHECKPOINT_FORMAT_VERSION,
     read_training_checkpoint,
     restore_rng_state,
@@ -34,6 +35,7 @@ from ..core.checkpoint import (
     signature_differences,
 )
 from ..core.runtime import (
+    runtime_metadata,
     autocast_context,
     build_adamw_optimizer,
     build_warmup_cosine_scheduler,
@@ -49,7 +51,7 @@ from .eval import evaluate_grpo
 from .rollout import collect_rollouts, math_reward
 
 
-GRPO_IMPLEMENTATION_VERSION = 2
+GRPO_IMPLEMENTATION_VERSION = 3
 GRPO_OBJECTIVE_VERSION = "sequence_balanced_clipped_grpo_v2"
 
 
@@ -148,7 +150,9 @@ def run_grpo(
     saved_reference_identity: dict[str, object] | None = None
     saved_wandb_run_id: str | None = None
     if options.resume_from is not None:
-        payload = read_training_checkpoint(options.resume_from, device)
+        payload = read_training_checkpoint(options.resume_from, "cpu")
+        if payload["step"] >= options.steps:
+            raise ValueError("resume checkpoint is already at or beyond the requested total steps")
         if payload.get("stage") != "grpo":
             raise ValueError("--resume requires a full GRPO checkpoint")
         state = payload.get("training_state")
@@ -205,7 +209,7 @@ def run_grpo(
     if payload is not None:
         if saved_reference_identity is None or path_identity(reference_path) != saved_reference_identity:
             raise ValueError("GRPO frozen reference snapshot does not match the resume checkpoint")
-        reference_payload = torch.load(reference_path, map_location=reference_device, weights_only=False)
+        reference_payload = torch.load(reference_path, map_location="cpu", weights_only=False)
         if reference_payload.get("stage") != "grpo_reference":
             raise ValueError("GRPO reference snapshot has an invalid stage")
         reference.load_state_dict(reference_payload["model"])
@@ -242,6 +246,7 @@ def run_grpo(
         "implementation_version": GRPO_IMPLEMENTATION_VERSION,
         "model": asdict(model.config),
         "num_parameters": model.num_parameters,
+        "runtime": runtime_metadata(device),
         "training": resolved_rl_options(options),
         "resolved": {"precision": resolved_precision, "device": str(device),
                      "reference_device": str(reference_device)},
@@ -270,14 +275,15 @@ def run_grpo(
             "resolved_options": resolved_rl_options(options), "resume_signature": signature,
         }
 
+    boundary = UpdateBoundary()
     try:
         for step in range(completed_step + 1, options.steps + 1):
+            boundary.begin()
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
                 torch.cuda.synchronize(device)
             started = time.perf_counter()
             selected = [tasks[(task_cursor + index) % len(tasks)] for index in range(options.batch_size)]
-            task_cursor = (task_cursor + options.batch_size) % len(tasks)
             model.eval()
             input_ids, attention_mask, action_mask, rewards = collect_rollouts(
                 model, tokenizer, selected, options, device, autocast_dtype=autocast_dtype
@@ -298,6 +304,7 @@ def run_grpo(
                 clip_epsilon=options.clip_epsilon, beta=options.beta,
                 grad_clip=options.grad_clip, device=device,
                 autocast_dtype=autocast_dtype, step=step,
+                before_optimizer_step=boundary.mark_mutating,
             )
             optimizer_steps += update.optimizer_steps
             epoch_metrics = update.metrics
@@ -310,6 +317,7 @@ def run_grpo(
             prompts_seen += len(selected)
             rollouts_seen += len(selected) * options.group_size
             action_tokens_seen += step_actions
+            task_cursor = (task_cursor + options.batch_size) % len(tasks)
             metric: dict[str, object] = {
                 "stage": "grpo", "step": step, "train_loss": epoch_metrics["loss"],
                 **{name: value for name, value in epoch_metrics.items() if name != "loss"},
@@ -358,6 +366,7 @@ def run_grpo(
                     "validation_reward": float(metric["validation_reward"]),
                     "validation_exact_match": float(metric["validation_exact_match"]),
                 })
+            boundary.commit()
             if step == 1 or step % options.log_every == 0 or step == options.steps or validation_due:
                 append_metric(metrics_path, metric)
                 if tracker is not None:
@@ -370,6 +379,10 @@ def run_grpo(
                 )
                 prune_periodic_checkpoints(checkpoint_dir, options.keep_last_checkpoints)
     except (KeyboardInterrupt, FloatingPointError):
+        if not boundary.prepare_emergency():
+            if tracker is not None:
+                tracker.finish(exit_code=1, summary={"interrupted_step": completed_step})
+            raise
         emergency = _save_grpo_checkpoint(
             checkpoint_dir / f"emergency_step_{completed_step:08d}.pt", model, optimizer, scheduler,
             step=completed_step, metrics=last_metrics, training_state=training_state(),

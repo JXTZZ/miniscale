@@ -239,5 +239,23 @@ class TrackingTests(unittest.TestCase):
             self.assertFalse(pending.exists())
 
 
+class TrackingResumeRegressionTests(unittest.TestCase):
+    def test_resume_discards_future_pending_records_before_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pending = Path(directory) / "wandb_pending.jsonl"
+            pending.write_text(''.join(json.dumps(record) + '\n' for record in [
+                {"kind": "metric", "metric": metric(2)},
+                {"kind": "metric", "metric": metric(9)},
+                {"kind": "generation", "step": 9, "path": "stale-does-not-exist.json"},
+            ]))
+            run = FakeRun()
+            with patch.dict("sys.modules", {"wandb": FakeWandb([run])}):
+                WandbTracker.start(enabled=True, project="test", entity=None, name=None,
+                                   run_id="run-123", mode="online", config={}, directory=directory,
+                                   initial_step=2)
+            self.assertEqual([step for _, step in run.logged], [2])
+            self.assertFalse(pending.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

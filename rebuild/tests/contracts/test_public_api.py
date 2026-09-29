@@ -64,6 +64,7 @@ class PublicAPIContractTests(unittest.TestCase):
             set(subcommands.choices),
             {
                 "doctor",
+                "export-hf",
                 "pipeline",
                 "generate",
                 "evaluate",

@@ -53,6 +53,12 @@ def generate_from_checkpoint(
         raise ValueError(
             f"checkpoint vocabulary ({model.config.vocab_size}) does not match tokenizer ({tokenizer.vocab_size})"
         )
+    for name in ("pad_token_id", "bos_token_id", "eos_token_id"):
+        if getattr(model.config, name) != getattr(tokenizer, name):
+            raise ValueError(f"checkpoint {name} does not match tokenizer")
+    generator = None
+    if options.seed is not None:
+        generator = torch.Generator(device=device).manual_seed(options.seed)
     if options.calculator:
         trajectory = rollout_agent(
             model,
@@ -66,6 +72,10 @@ def generate_from_checkpoint(
                 device=str(device),
             ),
             device,
+            generator=generator,
+            top_p=options.top_p,
+            repetition_penalty=options.repetition_penalty,
+            no_repeat_ngram_size=options.no_repeat_ngram_size,
         )
         return {
             "checkpoint": str(checkpoint_path),
@@ -75,6 +85,10 @@ def generate_from_checkpoint(
             "generated_tokens": sum(trajectory.action_mask),
             "temperature": options.temperature,
             "top_k": options.top_k,
+            "top_p": options.top_p,
+            "repetition_penalty": options.repetition_penalty,
+            "no_repeat_ngram_size": options.no_repeat_ngram_size,
+            "seed": options.seed,
             "device": str(device),
             "tool_calls": trajectory.valid_calls,
             "invalid_tool_calls": trajectory.invalid_calls,
@@ -95,9 +109,6 @@ def generate_from_checkpoint(
         raise ValueError("max_new_tokens must be smaller than the model context window")
     prompt_ids = prompt_ids[-prompt_budget:]
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-    generator = None
-    if options.seed is not None:
-        generator = torch.Generator(device=device).manual_seed(options.seed)
     with torch.inference_mode():
         generated = model.generate(
             input_ids,

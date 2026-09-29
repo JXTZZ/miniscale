@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from contextlib import nullcontext
 import math
+import platform
+from importlib.metadata import version
 import random
 
 import numpy as np
@@ -180,3 +182,21 @@ def evaluate_lm(
     finally:
         model.train(was_training)
     return loss_times_targets / total_targets if total_targets else float("nan")
+
+
+def runtime_metadata(device: torch.device) -> dict[str, object]:
+    """Record the numerical runtime alongside each resolved training recipe."""
+    return {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "transformers": version("transformers"),
+        "numpy": np.__version__,
+        "cuda_build": torch.version.cuda,
+        "device": str(device),
+        "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+        "torch_threads": torch.get_num_threads(),
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+    }

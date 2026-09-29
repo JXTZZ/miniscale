@@ -4,6 +4,7 @@ from array import array
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import random
 from typing import BinaryIO, Literal, Sequence
@@ -288,6 +289,7 @@ class IndexedJsonlSFTDataset(Dataset[dict[str, Tensor]]):
             index.train_message_positions if split == "train" else index.validation_message_positions
         )
         self._source: BinaryIO | None = None
+        self._source_pid: int | None = None
 
     def __len__(self) -> int:
         return len(self.offsets)
@@ -307,8 +309,10 @@ class IndexedJsonlSFTDataset(Dataset[dict[str, Tensor]]):
         self.close()
 
     def _read_messages(self, index: int) -> list[dict[str, object]]:
-        if self._source is None:
+        if self._source is None or self._source_pid != os.getpid():
+            self.close()
             self._source = self.path.open("rb")
+            self._source_pid = os.getpid()
         self._source.seek(self.offsets[index])
         row = json.loads(self._source.readline())
         messages = row.get("conversations")

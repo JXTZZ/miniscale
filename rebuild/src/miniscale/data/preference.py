@@ -4,6 +4,7 @@ from array import array
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import random
 from typing import BinaryIO, Literal, Sequence
@@ -325,6 +326,7 @@ class IndexedPreferenceDataset(Dataset[dict[str, dict[str, Tensor]]]):
         self.min_context_tokens = min_context_tokens
         self.target_mode = target_mode
         self._source: BinaryIO | None = None
+        self._source_pid: int | None = None
 
     def __len__(self) -> int:
         return len(self.offsets)
@@ -335,16 +337,19 @@ class IndexedPreferenceDataset(Dataset[dict[str, dict[str, Tensor]]]):
         return state
 
     def close(self) -> None:
-        if self._source is not None:
-            self._source.close()
+        source = getattr(self, "_source", None)
+        if source is not None:
+            source.close()
             self._source = None
 
     def __del__(self) -> None:
         self.close()
 
     def __getitem__(self, index: int) -> dict[str, dict[str, Tensor]]:
-        if self._source is None:
+        if self._source is None or self._source_pid != os.getpid():
+            self.close()
             self._source = self.path.open("rb")
+            self._source_pid = os.getpid()
         self._source.seek(self.offsets[index])
         row = json.loads(self._source.readline())
         pair = parse_preference_pair(row, target_mode=self.target_mode, location=f"{self.path}@{self.offsets[index]}")

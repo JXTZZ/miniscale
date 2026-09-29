@@ -16,7 +16,7 @@ from miniscale.tokenizer import Tokenizer
 
 
 SFT_RESUME_SIGNATURE_VERSION = 1
-SFT_IMPLEMENTATION_VERSION = 2
+SFT_IMPLEMENTATION_VERSION = 3
 SFT_MASK_VERSION = "structured_assistant_span_v1"
 SFT_OPTIMIZER_GROUPING = "matrix_weights_decay_norm_embedding_no_decay_v1"
 

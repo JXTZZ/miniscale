@@ -13,6 +13,7 @@ GRPO 目标和工具环境均在本仓库独立实现，不是对上游源码的
 
 ## 从这里开始阅读
 
+- [训练正确性与系统优化](docs/systems-review.md)：本轮修复、恢复兼容性和验证结果。
 - [重构检查与训练效果判断](docs/rebuild-review.md)：与根目录实现的对照结果、真实数据审计和限制。
 - [阅读与动手顺序](docs/learning-guide.md)：从 token、模型、预训练走到 SFT、DPO、GRPO、Agent RL。
 - [分支对比、推送与合并](docs/git-workflow.md)：先阅读差异，再推送；合并留到确认之后。
@@ -216,8 +217,9 @@ artifacts/pretrain/
 `best.pt`、`final.pt` 和周期 checkpoint 都包含模型、AdamW、scheduler、step、token 计数、
 `best_val_loss` 及 Python/NumPy/PyTorch/CUDA RNG 状态，可以用于断点续训。`pretrain_run.json`
 保存解析后的完整 recipe、模型配置和数据/tokenizer 内容指纹。`keep_last` 只清理周期
-checkpoint，不会删除 `best.pt`、`final.pt` 或 generations。按 `Ctrl+C` 时还会写入
-`emergency_step_XXXXXXXX.pt` 后再退出。完整 checkpoint 通常约 700–800MB，请预留磁盘空间。
+checkpoint，不会删除 `best.pt`、`final.pt` 或 generations。在 optimizer 更新前按 `Ctrl+C` 会回退本次 RNG 并写入
+`emergency_step_XXXXXXXX.pt`。若中断发生在 optimizer 开始更新后、验证和状态更新完成前，则保留已有完整 checkpoint 并退出，
+不把半次更新保存成可恢复断点。完整 checkpoint 通常约 700–800MB，请预留磁盘空间。
 
 从周期或 emergency checkpoint 继续时，`--steps` 仍表示原计划的总步数，其他影响训练轨迹的
 参数必须与原命令一致：
@@ -358,14 +360,41 @@ uv run python generate.py \
 但通常优先选择 `sft.pt` 或 `agent_rl.pt`。训练步数和数据量决定输出质量，文件能加载不等于
 模型已经具备泛化能力。
 
+## 导出 Hugging Face 模型
+
+使用原生 checkpoint 和训练时的本地 Hugging Face tokenizer：
+
+```bash
+uv run miniscale export-hf \
+  --checkpoint artifacts/sft/sft.pt \
+  --tokenizer data/tokenizer/minimind \
+  --output artifacts/sft-hf
+```
+
+输出包含标准 Llama `config.json`、`model.safetensors`、generation config、tokenizer 和源文件指纹。
+目录必须不存在；失败不会留下半成品。无需 `trust_remote_code`，可离线加载并使用 Transformers KV cache：
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("artifacts/sft-hf", local_files_only=True)
+tokenizer = AutoTokenizer.from_pretrained("artifacts/sft-hf", local_files_only=True)
+inputs = tokenizer("人工智能的发展将会", return_tensors="pt")
+print(tokenizer.decode(model.generate(**inputs, max_new_tokens=32, do_sample=False)[0]))
+```
+
+聊天模型用 tokenizer 的 `apply_chat_template` 构造输入。当前导出支持本地 HF tokenizer；ByteTokenizer
+和 SentencePiece smoke/实验权重仍通过原生接口使用。HF 导出用于推理，不包含 optimizer 或数据进度；
+精确恢复继续使用原生 `.pt`。导出前后在 FP32 下检查 logits、loss 和 greedy generation 等价。
+
 ## 建议学习顺序
 
 1. `config.py`、`tokenizer.py`、`model.py`：亲手推导张量 shape，确认 causal test 为什么成立。
-2. `data.py`、`training/pretrain.py`：理解流式读取、packing、shift label 和 next-token objective。
-3. `training/sft.py`：检查 `-100` mask，确保 user/system/tool 文本不成为监督目标。
-4. `training/dpo.py`：理解 policy/reference 对 chosen/rejected 的相对 log-probability。
-5. `training/grpo.py`：先看 reward group normalization，再看 ratio clipping 和 reference KL。
-6. `agent_env.py`、`training/agent_rl.py`：跟踪一次两轮 trajectory，确认 observation 进入上下文但
+2. `data/pretrain.py`、`training/pretrain/runner.py`：理解流式读取、packing、shift label 和 next-token objective。
+3. `training/sft/runner.py`：检查 `-100` mask，确保 user/system/tool 文本不成为监督目标。
+4. `training/dpo/runner.py`：理解 policy/reference 对 chosen/rejected 的相对 log-probability。
+5. `training/grpo/runner.py`：先看 reward group normalization，再看 ratio clipping 和 reference KL。
+6. `agent_env.py`、`training/agent_rl/runner.py`：跟踪一次两轮 trajectory，确认 observation 进入上下文但
    action mask 为 0。
 7. 修改一个组件并补测试，例如新增 `search` mock 工具、格式奖励或离线 eval；这才会逐渐变成
    你的工程，而不是 MiniMind 的复刻。

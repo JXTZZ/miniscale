@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 
 import torch
 from torch import Tensor
@@ -35,12 +36,15 @@ def optimize_policy_epochs(
     device: torch.device,
     autocast_dtype: torch.dtype | None,
     step: int,
+    before_optimizer_step: Callable[[], None] | None = None,
 ) -> PolicyUpdate:
     """Apply repeated clipped updates to one immutable on-policy rollout batch."""
 
     metrics: dict[str, float] = {}
     grad_norm_value = 0.0
-    model.train()
+    # Keep dropout disabled as in rollout/old-policy scoring. eval() still
+    # records gradients; enabling dropout here changes the policy ratio.
+    model.eval()
     for epoch in range(1, policy_epochs + 1):
         optimizer.zero_grad(set_to_none=True)
         with autocast_context(device, autocast_dtype):
@@ -69,6 +73,8 @@ def optimize_policy_epochs(
             raise FloatingPointError(
                 f"non-finite GRPO gradient norm at step {step}, epoch {epoch}"
             ) from error
+        if before_optimizer_step is not None:
+            before_optimizer_step()
         optimizer.step()
         scheduler.step()
         grad_norm_value = float(grad_norm)

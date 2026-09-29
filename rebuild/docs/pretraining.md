@@ -24,7 +24,9 @@ BOS，这是当前明确选择，不是 document-isolated attention。
 
 `JsonlPretrainDataset` 是流式 `IterableDataset`，不会把语料整体加载进内存。train/validation 默认用
 文本内容的 BLAKE2b hash 做稳定切分，同一文本及 exact duplicate 会落入同一侧。训练 block 经确定性
-shuffle buffer 打乱。validation 在训练开始时完整扫描相应 stream，通过固定 seed 的 reservoir sampling
+shuffle buffer 打乱，多 worker 跨 epoch 使用 DataLoader 分配的递进 seed。使用独立 validation 文件时，
+训练文件的全部有效文档进入训练，不再额外扣除内部 hash validation 切分。validation 在训练开始时
+完整扫描相应 stream，通过固定 seed 的 reservoir sampling
 选出一组 block，之后每次评估复用同一组，避免只验证文件开头。
 
 正式训练前建议生成完整数据报告：
@@ -75,6 +77,7 @@ output 与 MLP down residual projections 使用 `0.02 / sqrt(2 × num_layers)`�
 
 默认 `--precision fp32`。支持 BF16 的 CUDA 设备可显式传 `--precision bf16`；训练、validation 和固定
 generation probes 都使用 autocast，模型参数和 AdamW state 仍保持 FP32。BF16 不使用 GradScaler。
+RoPE 使用 Q/K 投影的 dtype，采样概率使用 FP32；完整预训练 block 使用 SDPA 原生 causal 路径。
 CPU 或不支持 BF16 的 CUDA 会在训练开始前报错，不会悄悄降级。当前未实现 FP16。
 
 ## Schedule, validation, logging, resume

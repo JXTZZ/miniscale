@@ -15,7 +15,7 @@ from miniscale.tokenizer import Tokenizer
 
 
 DPO_RESUME_SIGNATURE_VERSION = 1
-DPO_IMPLEMENTATION_VERSION = 2
+DPO_IMPLEMENTATION_VERSION = 3
 DPO_OBJECTIVE_VERSION = "sigmoid_sum_completion_logp_v1"
 DPO_OPTIMIZER_GROUPING = "matrix_weights_decay_norm_embedding_no_decay_v1"
 

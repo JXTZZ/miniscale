@@ -27,6 +27,7 @@ from ..core.artifacts import (
 )
 from ..core.logging import format_training_metric
 from ..core.checkpoint import (
+    UpdateBoundary,
     TRAINING_CHECKPOINT_FORMAT_VERSION,
     read_training_checkpoint,
     restore_rng_state,
@@ -36,6 +37,7 @@ from ..core.checkpoint import (
     signature_differences,
 )
 from ..core.runtime import (
+    runtime_metadata,
     autocast_context,
     build_adamw_optimizer,
     build_warmup_cosine_scheduler,
@@ -238,7 +240,9 @@ def run_sft_jsonl(
     saved_signature: dict[str, object] | None = None
     initial_checkpoint_source: str | None = None
     if options.resume_from is not None:
-        payload = read_training_checkpoint(options.resume_from, device)
+        payload = read_training_checkpoint(options.resume_from, "cpu")
+        if payload["step"] >= options.steps:
+            raise ValueError("resume checkpoint is already at or beyond the requested total steps")
         if payload.get("stage") != "sft":
             raise ValueError("--resume requires a full SFT checkpoint")
         state = payload.get("training_state")
@@ -327,6 +331,7 @@ def run_sft_jsonl(
         "implementation_version": SFT_IMPLEMENTATION_VERSION,
         "model": asdict(model.config),
         "num_parameters": model.num_parameters,
+        "runtime": runtime_metadata(device),
         "training": resolved_sft_options(options),
         "resolved": {"precision": resolved_precision, "max_length": max_length, "world_size": 1},
         "data": {
@@ -380,8 +385,10 @@ def run_sft_jsonl(
             "resume_signature": signature,
         }
 
+    boundary = UpdateBoundary()
     try:
         for step in range(completed_step + 1, options.steps + 1):
+            boundary.begin()
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
                 torch.cuda.synchronize(device)
@@ -423,6 +430,7 @@ def run_sft_jsonl(
                 raise FloatingPointError(
                     f"non-finite SFT gradient norm at optimizer step {step}"
                 ) from error
+            boundary.mark_mutating()
             optimizer.step()
             scheduler.step()
             if device.type == "cuda":
@@ -456,6 +464,7 @@ def run_sft_jsonl(
             validation_due = validation_batches is not None and (
                 step % options.validation_every == 0 or step == options.steps
             )
+            best_loss_improved = False
             if validation_due:
                 val_loss, val_accuracy, val_targets = evaluate_sft(
                     model, validation_batches, device, autocast_dtype=autocast_dtype
@@ -471,23 +480,14 @@ def run_sft_jsonl(
                 recent_validation_losses = recent_validation_losses[-maximum_losses:]
                 if math.isfinite(val_loss) and val_loss < best_val_loss:
                     best_val_loss = val_loss
+                    best_loss_improved = True
                     best_metrics = {
                         "loss": last_loss,
                         "validation_loss": val_loss,
                         "validation_token_accuracy": val_accuracy,
                         "best_val_loss": best_val_loss,
                     }
-                    best_checkpoint = save_training_checkpoint(
-                        output / "best_loss.pt",
-                        model,
-                        optimizer,
-                        scheduler,
-                        stage="sft",
-                        step=step,
-                        metrics=best_metrics,
-                        training_state=training_state(),
-                    )
-                    print(f"saved best-loss SFT checkpoint: {best_checkpoint}", flush=True)
+
                 metric["best_val_loss"] = best_val_loss
 
             last_metrics = {
@@ -558,6 +558,21 @@ def run_sft_jsonl(
                 metric["best_quality_score"] = best_quality_score
                 metric["best_quality_step"] = best_quality_step
                 metric["stale_quality_evaluations"] = stale_quality_evaluations
+            # Loss and quality evaluation can run on the same step. Save after
+            # both update their counters so best_loss also resumes early stopping.
+            if best_loss_improved:
+                best_checkpoint = save_training_checkpoint(
+                    output / "best_loss.pt",
+                    model,
+                    optimizer,
+                    scheduler,
+                    stage="sft",
+                    step=step,
+                    metrics=best_metrics,
+                    training_state=training_state(),
+                )
+                print(f"saved best-loss SFT checkpoint: {best_checkpoint}", flush=True)
+            boundary.commit()
             log_due = (
                 step == 1
                 or step % options.log_every == 0
@@ -607,6 +622,10 @@ def run_sft_jsonl(
                     )
                     break
     except (KeyboardInterrupt, FloatingPointError):
+        if not boundary.prepare_emergency():
+            if tracker is not None:
+                tracker.finish(exit_code=1, summary={"interrupted_step": completed_step})
+            raise
         emergency = save_training_checkpoint(
             checkpoint_dir / f"emergency_step_{completed_step:08d}.pt",
             model,

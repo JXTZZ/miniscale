@@ -70,7 +70,8 @@ class CausalSelfAttention(nn.Module):
         query = self.query(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         key = self.key(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         value = self.value(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        cosine, sine = self.rotary(seq_len, hidden_states.device, hidden_states.dtype)
+        # Residual states stay FP32 under autocast; Q/K/V projections are BF16.
+        cosine, sine = self.rotary(seq_len, query.device, query.dtype)
         query, key = _apply_rope(query, key, cosine, sine)
         key = key.repeat_interleave(self.kv_groups, dim=1)
         value = value.repeat_interleave(self.kv_groups, dim=1)
@@ -154,12 +155,26 @@ class MiniScaleForCausalLM(nn.Module):
         *,
         attention_mask: Tensor | None = None,
         labels: Tensor | None = None,
+        logits_to_keep: int = 0,
     ) -> CausalLMOutput:
+        if input_ids.ndim != 2 or input_ids.size(0) < 1 or input_ids.size(1) < 1:
+            raise ValueError("input_ids must be a non-empty [batch, sequence] tensor")
+        if attention_mask is not None and attention_mask.shape != input_ids.shape:
+            raise ValueError("attention_mask must match input_ids shape")
+        if logits_to_keep < 0 or (labels is not None and logits_to_keep):
+            raise ValueError("logits_to_keep must be non-negative and zero when labels are provided")
+        if labels is not None:
+            if labels.shape != input_ids.shape:
+                raise ValueError("labels must match input_ids shape")
+            if not bool(labels[:, 1:].ne(-100).any()):
+                raise ValueError("labels contain no supervised next-token targets")
         if input_ids.size(1) > self.config.max_position_embeddings:
             raise ValueError("sequence exceeds max_position_embeddings")
         hidden_states = self.embedding(input_ids)
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_mask)
+        if logits_to_keep:
+            hidden_states = hidden_states[:, -logits_to_keep:]
         logits = self.lm_head(self.norm(hidden_states))
         loss = None
         if labels is not None:
@@ -203,7 +218,7 @@ class MiniScaleForCausalLM(nn.Module):
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         for _ in range(max_new_tokens):
             window = generated[:, -self.config.max_position_embeddings :]
-            logits = self(window).logits[:, -1]
+            logits = self(window, logits_to_keep=1).logits[:, -1].float()
             completion = generated[:, prompt_length:]
             if repetition_penalty != 1.0 and completion.numel():
                 for row in range(logits.shape[0]):

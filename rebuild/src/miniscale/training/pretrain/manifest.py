@@ -13,6 +13,7 @@ from .config import (
     PRETRAIN_OPTIMIZER_GROUPING,
     PretrainOptions,
 )
+from ..core.runtime import runtime_metadata
 from ..core.checkpoint import TRAINING_CHECKPOINT_FORMAT_VERSION
 
 
@@ -44,6 +45,7 @@ def _write_run_manifest(
         "optimizer_parameter_groups": PRETRAIN_OPTIMIZER_GROUPING,
         "model": asdict(model.config),
         "num_parameters": model.num_parameters,
+        "runtime": runtime_metadata(next(model.parameters()).device),
         "training": _resolved_options(options),
         "resolved_precision": resolved_precision,
         "derived": {

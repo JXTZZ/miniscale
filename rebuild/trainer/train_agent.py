@@ -1,5 +1,7 @@
 """Small standalone multi-turn tool-use Agent GRPO example."""
 
+from miniscale.training.core.runtime import seed_everything
+
 from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
 from miniscale.agent_env import CalculatorTask
 from miniscale.training.core.rl_config import AgentRLOptions
@@ -7,6 +9,7 @@ from miniscale.training.agent_rl import run_agent_grpo
 
 
 def main() -> None:
+    seed_everything(42)
     tasks = [CalculatorTask("Use the calculator for 2+3, then answer.", "2+3", "5")]
     metrics = run_agent_grpo(
         MiniScaleForCausalLM(MiniScaleConfig.smoke()),

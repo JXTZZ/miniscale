@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 PRETRAIN_RESUME_SIGNATURE_VERSION = 2
-PRETRAIN_IMPLEMENTATION_VERSION = 2
+PRETRAIN_IMPLEMENTATION_VERSION = 3
 PRETRAIN_INITIALIZATION_SCHEME = "normal_0.02_residual_scaled_1_over_sqrt_2L_v1"
 PRETRAIN_OPTIMIZER_GROUPING = "matrix_weights_decay_norm_embedding_no_decay_v1"
 

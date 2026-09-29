@@ -42,6 +42,12 @@ def main(argv: list[str] | None = None) -> None:
     arguments = build_parser().parse_args(argv)
     if arguments.command == "doctor":
         result = environment_report()
+    elif arguments.command == "export-hf":
+        from ..huggingface import export_huggingface
+
+        result = {"export": str(export_huggingface(
+            arguments.checkpoint, arguments.output, arguments.tokenizer
+        ))}
     elif arguments.command == "pipeline":
         result = run_training_pipeline(arguments.output, device=arguments.device)
     elif arguments.command == "evaluate":

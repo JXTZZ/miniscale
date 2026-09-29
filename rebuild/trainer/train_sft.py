@@ -1,11 +1,14 @@
 """Small standalone SFT example."""
 
+from miniscale.training.core.runtime import seed_everything
+
 from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.training.sft.config import SFTOptions
+from miniscale.training.sft.config import SmokeSFTOptions
 from miniscale.training.sft import run_sft
 
 
 def main() -> None:
+    seed_everything(42)
     conversations = [
         [
             {"role": "system", "content": "You are a concise assistant."},
@@ -25,7 +28,7 @@ def main() -> None:
         ByteTokenizer(),
         conversations,
         "artifacts",
-        SFTOptions(steps=2, batch_size=2),
+        SmokeSFTOptions(steps=2, batch_size=2),
     )
     print(metrics)
 

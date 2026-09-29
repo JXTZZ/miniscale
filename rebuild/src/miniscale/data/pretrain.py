@@ -87,7 +87,10 @@ class JsonlPretrainDataset(IterableDataset[dict[str, Tensor]]):
 
         worker = get_worker_info()
         worker_id = worker.id if worker is not None else 0
-        rng = random.Random(self.seed + iteration * 1_000_003 + worker_id)
+        # Non-persistent workers receive a fresh dataset copy each epoch, so
+        # their local _iteration resets. DataLoader's seeded worker seed advances.
+        epoch_seed = iteration * 1_000_003 + (worker.seed if worker is not None else 0)
+        rng = random.Random(self.seed + epoch_seed + worker_id)
         buffer: list[dict[str, Tensor]] = []
         for example in examples:
             if len(buffer) < self.shuffle_buffer_size:

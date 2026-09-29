@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import json
+import math
 
 
 @dataclass(slots=True)
@@ -22,12 +23,29 @@ class MiniScaleConfig:
     eos_token_id: int = 2
 
     def __post_init__(self) -> None:
-        if self.num_hidden_layers < 1:
-            raise ValueError("num_hidden_layers must be positive")
+        for name in (
+            "vocab_size", "hidden_size", "intermediate_size", "num_hidden_layers",
+            "num_attention_heads", "num_key_value_heads", "max_position_embeddings",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
         if self.hidden_size % self.num_attention_heads != 0:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
         if self.num_attention_heads % self.num_key_value_heads != 0:
             raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
+        if (self.hidden_size // self.num_attention_heads) % 2:
+            raise ValueError("attention head dimension must be even for RoPE")
+        for name in ("rope_theta", "rms_norm_eps"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not 0 <= self.dropout < 1:
+            raise ValueError("dropout must be in [0, 1)")
+        for name in ("pad_token_id", "bos_token_id", "eos_token_id"):
+            value = getattr(self, name)
+            if type(value) is not int or not 0 <= value < self.vocab_size:
+                raise ValueError(f"{name} must be an integer within the vocabulary")
 
     @classmethod
     def smoke(cls) -> "MiniScaleConfig":

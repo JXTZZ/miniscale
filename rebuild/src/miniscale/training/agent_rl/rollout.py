@@ -42,6 +42,10 @@ def rollout_agent(
     response_fn: ResponseFunction | None = None,
     *,
     autocast_dtype: torch.dtype | None = None,
+    generator: torch.Generator | None = None,
+    top_p: float = 1.0,
+    repetition_penalty: float = 1.0,
+    no_repeat_ngram_size: int = 0,
 ) -> AgentTrajectory:
     env = CalculatorEnv(task)
     system_content = task.system_prompt or env.tool_prompt
@@ -76,6 +80,10 @@ def rollout_agent(
                     max_new_tokens=min(options.max_new_tokens, remaining),
                     temperature=options.temperature,
                     top_k=options.top_k,
+                    generator=generator,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
                 )[0].tolist()
             response_ids = generated[len(input_ids) :]
             response = tokenizer.decode(response_ids)

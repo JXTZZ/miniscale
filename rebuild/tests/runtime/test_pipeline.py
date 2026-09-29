@@ -10,7 +10,7 @@ from miniscale.pipeline import run_training_pipeline
 class PipelineTests(unittest.TestCase):
     def test_environment_report_uses_project_interpreter(self) -> None:
         report = environment_report()
-        self.assertTrue(str(report["python"]).startswith("3.12."))
+        self.assertIn(tuple(map(int, str(report["python"]).split(".")[:2])), {(3, 11), (3, 12)})
 
     def test_end_to_end_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

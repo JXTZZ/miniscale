@@ -127,6 +127,11 @@ class SFTResumeTests(unittest.TestCase):
                 validation_path=validation,
             )
             self.assertTrue((output / "best.pt").is_file())
+            loss_best = torch.load(output / "best_loss.pt", weights_only=False)
+            quality_best = torch.load(output / "best_quality.pt", weights_only=False)
+            for key in ("best_quality_score", "best_quality_step", "early_best_quality_score",
+                        "stale_quality_evaluations", "severe_loop_evaluations"):
+                self.assertEqual(loss_best["training_state"][key], quality_best["training_state"][key])
             self.assertTrue((output / "generations/step_00000001.json").is_file())
             self.assertTrue((output / "sft_run.json").is_file())
             metric = json.loads((output / "sft_metrics.jsonl").read_text().splitlines()[-1])

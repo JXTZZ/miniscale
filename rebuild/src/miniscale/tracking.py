@@ -83,6 +83,10 @@ class WandbTracker:
             retry_every_steps=retry_every_steps,
             initial_step=initial_step,
         )
+        tracker._write_pending([
+            record for record in tracker._read_pending()
+            if int(record.get("metric", {}).get("step", record.get("step", -1))) <= initial_step
+        ])
         tracker._connect(initial_step)
         return tracker
 
@@ -111,6 +115,9 @@ class WandbTracker:
         # non-fatal: the queue survives for the next resumed process.
         if self._run is None and self._read_pending():
             self._connect(self._next_retry_step)
+        if self._run is None:
+            return
+        self._flush_pending(self._next_retry_step)
         if self._run is None:
             return
         try:
