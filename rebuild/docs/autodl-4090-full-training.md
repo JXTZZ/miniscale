@@ -133,9 +133,14 @@ print('pretrain blocks:', blocks, 'steps:', pretrain_steps)
 print('SFT train examples:', examples, 'steps:', sft_steps)
 PY
 source artifacts/autodl-4090/budget.env
+cat artifacts/autodl-4090/budget.env
+printf 'Pretrain: %s optimizer updates; SFT: %s optimizer updates\n' "$PRETRAIN_STEPS" "$SFT_STEPS"
+test "$PRETRAIN_STEPS" -gt 0 && test "$SFT_STEPS" -gt 0
 ```
 
-以实际审计和去重索引计算的 `PRETRAIN_STEPS`、`SFT_STEPS` 为准；不要套用 mini 数据的历史步数。预训练最后一步可能跨过一轮边界少量 block；0.5% 的原始文件数据固定留作验证，因此“约一轮”指训练分区约一轮，不是文件中每条都参与梯度更新，也不是收敛保证。全量 SFT 的步数可能远高于 README 的 3,000 步示例；先根据实测单步耗时计算租机预算，再决定是否启动完整长跑。
+`budget.env` 会写入形如 `PRETRAIN_STEPS=...` 和 `SFT_STEPS=...` 的**实际整数**。在当前 shell 执行 `source` 后，`--steps "$PRETRAIN_STEPS"` 才会被 shell 展开为该整数；另开 shell 时需要重新 `source`，并可用上面的 `cat` / `printf` 查看。`--steps` 指优化器更新次数，不是文件行数：预训练每步处理 `batch-size 4 × gradient-accumulation 4 = 16` 个 768-token packed block，因此 `PRETRAIN_STEPS = ceil(训练分区 packed_blocks / 16)`；SFT 每步处理 16 个去重后的训练目标，因此 `SFT_STEPS = ceil(训练目标数 / 16)`。末步不足一批时可能跨过一轮边界少量数据。
+
+以实际审计和去重索引计算的 `PRETRAIN_STEPS`、`SFT_STEPS` 为准；不要套用 mini 数据的历史步数。0.5% 的原始文件数据固定留作验证，因此“约一轮”指训练分区约一轮，不是文件中每条都参与梯度更新，也不是收敛保证。全量 SFT 的步数可能远高于 README 的 3,000 步示例；先根据实测单步耗时计算租机预算，再决定是否启动完整长跑。
 
 ## 4. 五阶段真实数据冒烟测试
 
@@ -193,6 +198,8 @@ uv run miniscale agent-rl --steps 2 --batch-size 1 --group-size 2 \
 确认五条命令均以退出码 0 结束，目录中依次有 `final.pt`、`sft.pt`、`dpo.pt`、`rl.pt`、`agent_rl.pt`。若 OOM，先确认实例没有其他 GPU 进程；再在**正式训练启动前**降低对应阶段 micro-batch，保持预训练/SFT/DPO 的有效 batch 为 16，例如 `4×4 → 2×8 → 1×16`。RL 先将 `--reference-device same` 改成 `cpu`，或将 group size 从 4 降到 2。变更后重跑对应 smoke，正式命令也使用同一组参数。调整 micro-batch 会改变数据分批与严格 resume 身份；不要在运行中途直接改。
 
 ## 5. 正式训练：Pretrain → SFT → DPO
+
+本配方直接用以下 CLI 参数作为训练配置：`--data` 指向全量文件，`--steps` 从 `budget.env` 读取；batch、梯度累计、学习率、验证频率等也都在命令中明确给出。项目代码里的 mini 默认路径留给原有用法；执行这些命令时，CLI 参数会覆盖默认值。先确认 `cat artifacts/autodl-4090/budget.env` 显示两个正整数。
 
 在同一个 `tmux` shell 中运行。每条命令成功后再运行下一条；`set -o pipefail` 保证使用 `tee` 时训练失败仍返回非零状态。检查验证 loss、有限的梯度、显存和磁盘余量：
 
