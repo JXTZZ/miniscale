@@ -16,6 +16,7 @@ GRPO 目标和工具环境均在本仓库独立实现，不是对上游源码的
 - [训练正确性与系统优化](docs/systems-review.md)：本轮修复、恢复兼容性和验证结果。
 - [重构检查与训练效果判断](docs/rebuild-review.md)：与根目录实现的对照结果、真实数据审计和限制。
 - [阅读与动手顺序](docs/learning-guide.md)：从 token、模型、预训练走到 SFT、DPO、GRPO、Agent RL。
+- [AutoDL 4090 全链路训练](docs/autodl-4090-full-training.md)：从克隆分支、下载数据到五阶段训练、评估和断点恢复。
 - [分支对比、推送与合并](docs/git-workflow.md)：先阅读差异，再推送；合并留到确认之后。
 
 数据可用标准库脚本下载，包含 mini 预训练、mini SFT 以及现有后续阶段所需的数据文件：
