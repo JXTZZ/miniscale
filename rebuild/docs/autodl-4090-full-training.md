@@ -36,14 +36,14 @@ git branch --show-current
 git rev-parse HEAD | tee artifacts/autodl-4090/git-commit.txt
 ```
 
-如果镜像已有 `uv`，跳过安装行。下面的 `uv sync --frozen` 使用仓库的 `uv.lock` 和 CUDA 12.8 PyTorch wheel；不要混用镜像自带的系统 Python/Torch。`uv` 安装命令来自[官方文档](https://docs.astral.sh/uv/getting-started/installation/)。
+如果镜像已有 `uv`，跳过安装行。下面的 `uv sync --frozen --extra tracking` 使用仓库的 `uv.lock` 和 CUDA 12.8 PyTorch wheel；不要混用镜像自带的系统 Python/Torch。`uv` 安装命令来自[官方文档](https://docs.astral.sh/uv/getting-started/installation/)。
 
 ```bash
 command -v uv || (curl -LsSf https://astral.sh/uv/install.sh | sh)
 export PATH="/root/.local/bin:$PATH"
 export UV_CACHE_DIR=/root/autodl-tmp/uv-cache
 uv python install 3.12
-uv sync --frozen
+uv sync --frozen --extra tracking
 uv run python -c 'import miniscale; print(miniscale.__file__)'
 uv run miniscale doctor
 uv run python - <<'PY'
@@ -57,6 +57,18 @@ uv run python -m unittest discover -s tests -q
 ```
 
 导入路径应包含 `/rebuild/src/miniscale/`，GPU 应显示 4090，测试应全部通过。如果 CUDA 自检失败，先核对 AutoDL 主机驱动、GPU 分配和锁定 wheel；此时不要启动训练或擅自改动 `uv.lock`。换新终端后重新 `cd` 到 `rebuild/` 并设置 `UV_CACHE_DIR`。
+
+### W&B 曲线：正式训练前登录一次
+
+`tracking` 是项目的可选依赖；上面的 `uv sync --frozen --extra tracking` 已把它安装到项目环境。正式训练命令启用 `--wandb`，先在 AutoDL 终端登录你自己的 W&B 账号：
+
+```bash
+uv run wandb login
+```
+
+按终端提示完成认证，不要把 API key 写进脚本、仓库或聊天。五个阶段各建一个 run，默认写到登录账号下的 `MiniScale` 项目；如需团队空间，在正式命令加 `--wandb-entity 你的团队名`。打开 W&B 项目页面，选择对应 run，以训练 `step` 为横轴查看 `train/loss`、`train/learning_rate`；预训练、SFT、DPO 还可看 `eval/loss`，GRPO 看 `eval/reward` 与 `eval/exact_match`，Agent RL 看 `eval/success_rate`。验证指标只在 `--validation-every` 指定的步骤出现，学习率和训练 loss 每个训练 step 都会写入。[W&B 指标说明](https://docs.wandb.ai/guides/track/log/)。
+
+如果不使用 W&B，删掉正式训练命令中的 `--wandb` 那一行即可；`*_metrics.jsonl` 仍会完整保存。第 7 节有无需 W&B 账号的本地 PNG 绘图命令。W&B 网络上传失败时训练会继续，未上传的事件会先留在输出目录的 `wandb_pending.jsonl`，默认每 200 step 重试；请同时保留这个文件和 `wandb/` 目录。启用 W&B 会上传指标及固定生成探针表；不想上传时可使用本地绘图。
 
 ## 3. 下载、审计并计算一轮预算
 
@@ -179,6 +191,7 @@ uv run miniscale pretrain \
   --validation-fraction 0.005 --validation-every 500 --validation-batches 50 \
   --generation-every 2000 --save-every 500 --keep-last 2 \
   --shuffle-buffer-size 8192 --num-workers 0 --seed 42 \
+  --wandb --wandb-project MiniScale --wandb-run-name autodl4090-pretrain \
   2>&1 | tee artifacts/autodl-4090/logs/pretrain.log
 
 test -s artifacts/autodl-4090/pretrain/final.pt
@@ -199,6 +212,7 @@ uv run miniscale sft \
   --validation-fraction 0.005 --validation-every 1000 --validation-batches 50 \
   --generation-every 5000 --generation-suite data/eval/sft_generation_v1.jsonl \
   --save-every 1000 --keep-last 2 --num-workers 0 --seed 42 \
+  --wandb --wandb-project MiniScale --wandb-run-name autodl4090-sft-raw \
   2>&1 | tee artifacts/autodl-4090/logs/sft.log
 
 test -s artifacts/autodl-4090/sft/sft.pt
@@ -219,6 +233,7 @@ uv run miniscale dpo \
   --validation-every 100 --validation-batches 50 \
   --generation-every 500 --save-every 200 --keep-last 2 \
   --num-workers 0 --seed 42 \
+  --wandb --wandb-project MiniScale --wandb-run-name autodl4090-dpo \
   2>&1 | tee artifacts/autodl-4090/logs/dpo.log
 
 test -s artifacts/autodl-4090/dpo/dpo.pt
@@ -243,6 +258,7 @@ uv run miniscale grpo \
   --temperature 1.0 --top-k 50 --beta 0.01 --clip-epsilon 0.2 \
   --validation-every 100 --validation-prompts 50 \
   --save-every 100 --keep-last 2 --seed 42 \
+  --wandb --wandb-project MiniScale --wandb-run-name autodl4090-grpo \
   2>&1 | tee artifacts/autodl-4090/logs/grpo.log
 
 test -s artifacts/autodl-4090/grpo/best.pt
@@ -263,6 +279,7 @@ uv run miniscale agent-rl \
   --temperature 1.0 --top-k 50 --beta 0.01 --clip-epsilon 0.2 \
   --validation-every 100 --validation-prompts 20 \
   --save-every 100 --keep-last 2 --seed 42 \
+  --wandb --wandb-project MiniScale --wandb-run-name autodl4090-agent-rl \
   2>&1 | tee artifacts/autodl-4090/logs/agent-rl.log
 
 test -s artifacts/autodl-4090/agent-rl/best.pt
@@ -319,6 +336,50 @@ m = AutoModelForCausalLM.from_pretrained(p)
 print(type(m).__name__, len(t), m.config.num_hidden_layers)
 PY
 ```
+
+### 本地画 loss 和学习率图
+
+每个阶段的 `*_metrics.jsonl` 都包含 `step`、`train_loss`、`learning_rate`；前三阶段的验证行另含 `validation_loss`。下面临时安装绘图依赖并在 `artifacts/autodl-4090/` 生成各阶段 PNG，**不会修改项目锁文件或训练依赖**。[uv 的临时依赖说明](https://docs.astral.sh/uv/guides/scripts/)。
+
+```bash
+uv run --with matplotlib python - <<'PY'
+import json
+from pathlib import Path
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+root = Path('artifacts/autodl-4090')
+for stage in ('pretrain', 'sft', 'dpo', 'grpo', 'agent-rl'):
+    name = stage.replace('-', '_')
+    path = root / stage / f'{name}_metrics.jsonl'
+    if not path.exists():
+        continue
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    if not rows:
+        continue
+    steps = [row['step'] for row in rows]
+    fig, (loss_ax, lr_ax) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    loss_ax.plot(steps, [row['train_loss'] for row in rows], label='train/loss')
+    validation = [row for row in rows if 'validation_loss' in row]
+    if validation:
+        loss_ax.plot([row['step'] for row in validation],
+                     [row['validation_loss'] for row in validation],
+                     label='eval/loss', marker='.', linewidth=1)
+    loss_ax.set_ylabel('loss')
+    loss_ax.legend()
+    lr_ax.plot(steps, [row['learning_rate'] for row in rows])
+    lr_ax.set_ylabel('learning rate')
+    lr_ax.set_xlabel('training step')
+    fig.tight_layout()
+    output = root / f'{stage}-loss-lr.png'
+    fig.savefig(output, dpi=150)
+    plt.close(fig)
+    print(output)
+PY
+```
+
+在 AutoDL 文件浏览器打开 PNG，或下载到本机。GRPO/Agent RL 的 policy loss 不能单独代表任务质量；同时查看各自 JSONL 中的 `validation_reward`、`validation_exact_match` 或 `validation_success_rate`，或在 W&B 看对应 `eval/` 曲线。
 
 ## 8. 断线、OOM、备份与收尾
 
