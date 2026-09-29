@@ -1,6 +1,6 @@
 # AutoDL 单卡 RTX 4090：从克隆分支到全链路训练
 
-本文针对 `learn/rebuild-from-scratch` 分支的 `rebuild/`，依次运行 **Pretrain → SFT → DPO → 数学 GRPO → 计算器 Agent RL**，最后做固定验证集对比、生成和 Hugging Face 导出。默认模型约 63.6M 参数、上下文 768；使用仓库自带的 MiniMind 6400 词 tokenizer。这里的“尽量一轮”指预训练读完约一轮 packed block、SFT 读完约一轮去重后的训练样本；DPO 和在线 RL 使用单独的实验预算。**这是一份训练执行配方，不保证最终质量或 4090 上的特定吞吐。**
+本文针对 `learn/rebuild-from-scratch` 分支的 `rebuild/`，依次运行 **Pretrain → SFT → DPO → 数学 GRPO → 计算器 Agent RL**，最后做固定验证集对比、生成和 Hugging Face 导出。Pretrain 和 SFT 使用 ModelScope 的全量 `pretrain_t2t.jsonl`、`sft_t2t.jsonl`；DPO、GRPO 和 Agent RL 沿用各自数据文件。默认模型约 63.6M 参数、上下文 768；使用仓库自带的 MiniMind 6400 词 tokenizer。这里的“尽量一轮”指预训练读完约一轮 packed block、SFT 读完约一轮去重后的训练样本；DPO 和在线 RL 使用单独的实验预算。**全量数据可能需要很长租机时间，实际耗时须依据冒烟测试后的实测吞吐估算；本文不保证最终质量或特定吞吐。**
 
 只使用 `agent_rl_math.jsonl` 训练后两阶段。下载脚本也会取回 `rlaif.jsonl` 和混合 `agent_rl.jsonl`，但当前没有开放式 RLAIF 的可靠奖励模型，也没有混合 Agent 文件所需的全部真实工具环境，不要把这两份文件直接喂给 GRPO/Agent RL。
 
@@ -8,13 +8,14 @@
 
 以下命令假设使用 AutoDL **普通容器实例**、一张 RTX 4090，且数据盘挂载在 `/root/autodl-tmp`。选择能运行本项目锁定的 PyTorch 2.9.1 + CUDA 12.8 wheel 的主机驱动；NVIDIA 列出的 CUDA 12.8 GA Linux 驱动版本为 570.26 起，最终仍以安装后的 CUDA 自检为准。4090 有 24 GB 显存；下面从保守的 micro-batch 开始，正式长跑前要做同配置的五阶段冒烟测试。[4090 规格](https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf)、[CUDA 12.8 驱动说明](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-toolkit-release-notes/)。
 
-建议给数据盘至少 **80 GB 可用空间**：原始下载约 3.16 GB，此外还要放 `uv` 缓存、虚拟环境、多个约数百 MB 的完整训练 checkpoint 和日志；这只是空间余量建议，实际以 `df -h` 为准。代码、数据和训练产物都放在数据盘。AutoDL 说明普通容器重置系统或更换镜像时会清空系统盘，但保留 `/root/autodl-tmp`；本地数据盘没有冗余保障，重要 checkpoint 仍要备份。[实例数据说明](https://www.autodl.com/docs/instance_data/)、[本地数据盘说明](https://www.autodl.com/docs/local_disk/)。
+建议给数据盘至少 **120 GB 可用空间**：全量 pretrain 约 8.28 GB、全量 SFT 约 14.10 GB，六份训练链数据合计约 22.55 GB；此外还要放 `uv` 缓存、虚拟环境、多阶段 checkpoint 和日志。`df -h` 应显示实际剩余空间，下载前后都检查。全量审计和 SFT 索引会占用较多**系统内存**，建议选 64 GB RAM 或更高的实例，并用 `free -h` 监控；24 GB 显存只决定每步可用的 micro-batch，文件大小主要增加训练时长、磁盘和 CPU/RAM 负担。代码、数据和训练产物都放在数据盘。AutoDL 说明普通容器重置系统或更换镜像时会清空系统盘，但保留 `/root/autodl-tmp`；本地数据盘没有冗余保障，重要 checkpoint 仍要备份。[实例数据说明](https://www.autodl.com/docs/instance_data/)、[本地数据盘说明](https://www.autodl.com/docs/local_disk/)。
 
 打开实例终端或 SSH，先检查：
 
 ```bash
 nvidia-smi
 df -h /root/autodl-tmp
+free -h
 ```
 
 SSH 断开可能终止前台训练，所以长任务在 `tmux` 中运行；AutoDL 也建议使用 `screen`/`tmux`。[守护进程说明](https://www.autodl.com/docs/daemon/)。若镜像没有 `tmux`，在实例中安装：
@@ -72,21 +73,34 @@ uv run wandb login
 
 ## 3. 下载、审计并计算一轮预算
 
-下载脚本从 ModelScope 获取六份文件，支持 `.part` 续传，并按上游 SHA-256 验证。请保留 `download_manifest.json`；运行中不要替换数据或 tokenizer，否则严格 resume 会拒绝。[数据来源和当前文件大小](rebuild-review.md#数据下载与完整性)。
+全量下载和审计可能持续很久，先单独执行 `tmux new -s miniscale`。进入新会话后运行下面的命令；按 `Ctrl+b`、`d` 可暂时离开，重新登录后用 `tmux attach -t miniscale` 返回。
 
 ```bash
-uv run python scripts/download_minimind.py
+cd /root/autodl-tmp/miniscale/rebuild
+export UV_CACHE_DIR=/root/autodl-tmp/uv-cache
+set -o pipefail
+```
+
+下载脚本的 `--profile full` 会获取两份全量文件及 DPO/RL/Agent 的四份文件，共约 **22.55 GB**（ModelScope 2026-09-29 的文件元数据；上游更新后以脚本打印的总量为准）。默认不带参数仍下载 mini，**本配方必须加 `--profile full`**。脚本支持 `.part` 续传，并按上游 SHA-256 验证；请保留 `download_manifest.json`。运行中不要替换数据或 tokenizer，否则严格 resume 会拒绝。[ModelScope 数据文件列表](https://www.modelscope.cn/datasets/gongjy/minimind_dataset/files)。
+
+```bash
+uv run python scripts/download_minimind.py --profile full
 du -sh data/raw/minimind
 test -s data/raw/minimind/download_manifest.json
+test -s data/raw/minimind/pretrain/pretrain_t2t.jsonl
+test -s data/raw/minimind/sft/sft_t2t.jsonl
 uv run python -c "from miniscale.tokenizer import load_tokenizer; t=load_tokenizer('data/tokenizer/minimind'); print(type(t).__name__, t.vocab_size)"
 ```
 
-最后一条应显示 `HuggingFaceTokenizer 6400`。随后扫描真实数据。SFT 选择 `response_only`；DPO 必须保持相同目标语义。审计会花一些 CPU 时间，不会修改原始 JSONL。
+最后一条应显示 `HuggingFaceTokenizer 6400`。随后扫描真实数据。SFT 选择 `response_only`；DPO 必须保持相同目标语义。全量预训练审计会分词并统计所有文本的 hash，全量 SFT 审计会建立索引并再次扫描所有行；它们可能耗时数小时并使用较多 RAM，不会修改原始 JSONL。执行时用 `free -h` 观察内存；审计完成后再计算预算。
 
 ```bash
-uv run miniscale audit-pretrain-data --sequence-length 768 \
+uv run miniscale audit-pretrain-data \
+  --data data/raw/minimind/pretrain/pretrain_t2t.jsonl --sequence-length 768 \
   --output artifacts/autodl-4090/pretrain-audit.json
-uv run miniscale audit-sft-data --max-length 768 --target-mode response_only \
+uv run miniscale audit-sft-data \
+  --data data/raw/minimind/sft/sft_t2t.jsonl \
+  --max-length 768 --target-mode response_only \
   --sample-size 2000 --output artifacts/autodl-4090/sft-audit.json
 uv run miniscale audit-dpo-data --max-length 768 --target-mode response_only \
   --sample-size 2000 --output artifacts/autodl-4090/dpo-audit.json
@@ -106,7 +120,7 @@ from miniscale.data.sft import SFTCorpusIndex
 report = json.loads(Path('artifacts/autodl-4090/pretrain-audit.json').read_text())
 blocks = report['tokens']['train']['packed_blocks']
 index = SFTCorpusIndex.build(
-    'data/raw/minimind/sft/sft_t2t_mini.jsonl',
+    'data/raw/minimind/sft/sft_t2t.jsonl',
     validation_fraction=0.005, target_mode='response_only',
     destination='split', deduplicate_exact=True,
 )
@@ -121,13 +135,11 @@ PY
 source artifacts/autodl-4090/budget.env
 ```
 
-当前已审计的 mini 文件对应 **431,398 block → 26,963 步**预训练，以及 **1,163,936 个去重后 `response_only` 训练样本 → 72,746 步** SFT。预训练最后一步可能跨过一轮边界少量 block；这是一轮数据量级，不是收敛保证。如果你下载到更新的数据，使用上面生成的新预算，不要照抄这两个历史数值。原始 SFT 一轮明显长于 README 的 3,000 步示例；先看冒烟测试与实测吞吐，再决定是否承担完整预算。
+以实际审计和去重索引计算的 `PRETRAIN_STEPS`、`SFT_STEPS` 为准；不要套用 mini 数据的历史步数。预训练最后一步可能跨过一轮边界少量 block；0.5% 的原始文件数据固定留作验证，因此“约一轮”指训练分区约一轮，不是文件中每条都参与梯度更新，也不是收敛保证。全量 SFT 的步数可能远高于 README 的 3,000 步示例；先根据实测单步耗时计算租机预算，再决定是否启动完整长跑。
 
 ## 4. 五阶段真实数据冒烟测试
 
-先启动持久终端，并在里面重新加载变量。`Ctrl+b` 后按 `d` 可暂时离开；重新登录后用 `tmux attach -t miniscale` 返回。**以下 smoke 使用单独输出目录，其 checkpoint 只用于下一条 smoke；正式训练从头建立新目录。**
-
-先单独执行 `tmux new -s miniscale`，进入新会话后再粘贴以下命令；不要把两段一次性粘进旧终端：
+继续使用第 3 节的 `tmux` 会话；如果重新登录，请先 `tmux attach -t miniscale`。**以下 smoke 使用单独输出目录，其 checkpoint 只用于下一条 smoke；正式训练从头建立新目录。** 在会话中重新加载预算：
 
 ```bash
 cd /root/autodl-tmp/miniscale/rebuild
@@ -139,13 +151,17 @@ set -o pipefail
 下面分别触碰真实 JSONL、BF16、验证、DPO reference、RL rollout 和计算器环境。预训练/SFT/DPO 的生成探针在此关掉以节省时间；正式运行会启用。
 
 ```bash
-uv run miniscale pretrain --steps 2 --batch-size 4 --gradient-accumulation 4 \
+uv run miniscale pretrain \
+  --data data/raw/minimind/pretrain/pretrain_t2t.jsonl \
+  --steps 2 --batch-size 4 --gradient-accumulation 4 \
   --sequence-length 768 --num-hidden-layers 20 --precision bf16 --device cuda \
   --warmup-steps 1 --validation-every 1 --validation-batches 2 \
   --generation-every 0 --save-every 0 \
   --output artifacts/autodl-4090/smoke/pretrain
 
-uv run miniscale sft --steps 2 --batch-size 4 --gradient-accumulation 4 \
+uv run miniscale sft \
+  --data data/raw/minimind/sft/sft_t2t.jsonl \
+  --steps 2 --batch-size 4 --gradient-accumulation 4 \
   --max-length 768 --target-mode response_only --precision bf16 --device cuda \
   --warmup-steps 1 --validation-every 1 --validation-batches 2 \
   --generation-every 0 --save-every 0 \
@@ -182,7 +198,7 @@ uv run miniscale agent-rl --steps 2 --batch-size 1 --group-size 2 \
 
 ```bash
 uv run miniscale pretrain \
-  --data data/raw/minimind/pretrain/pretrain_t2t_mini.jsonl \
+  --data data/raw/minimind/pretrain/pretrain_t2t.jsonl \
   --tokenizer data/tokenizer/minimind \
   --output artifacts/autodl-4090/pretrain \
   --steps "$PRETRAIN_STEPS" --batch-size 4 --gradient-accumulation 4 \
@@ -198,11 +214,11 @@ test -s artifacts/autodl-4090/pretrain/final.pt
 df -h /root/autodl-tmp
 ```
 
-`final.pt` 是走完预算的权重；`best.pt` 是验证 loss 最低的权重。本配方用 `final.pt` 交给 SFT，便于追踪“一轮后”的模型，同时保留 `best.pt` 以便比较。预训练的验证数据是训练文件的固定 hash 切分，约 0.5% 不参与训练。长跑开始后可用 `tail -n 2 artifacts/autodl-4090/pretrain/pretrain_metrics.jsonl` 查看 `update_seconds`、`tokens_per_second` 和 `cuda_peak_memory_mb`；先测几十步再估算剩余时间，验证和生成还会产生额外耗时。然后训练原始 mini SFT 的一轮，不启用早停：
+`final.pt` 是走完预算的权重；`best.pt` 是验证 loss 最低的权重。本配方用 `final.pt` 交给 SFT，便于追踪“一轮后”的模型，同时保留 `best.pt` 以便比较。预训练的验证数据是训练文件的固定 hash 切分，约 0.5% 不参与训练。长跑开始后可用 `tail -n 2 artifacts/autodl-4090/pretrain/pretrain_metrics.jsonl` 查看 `update_seconds`、`tokens_per_second` 和 `cuda_peak_memory_mb`；先测几十步再估算剩余时间，验证和生成还会产生额外耗时。然后训练全量 SFT 的一轮，不启用早停：
 
 ```bash
 uv run miniscale sft \
-  --data data/raw/minimind/sft/sft_t2t_mini.jsonl \
+  --data data/raw/minimind/sft/sft_t2t.jsonl \
   --tokenizer data/tokenizer/minimind \
   --checkpoint artifacts/autodl-4090/pretrain/final.pt \
   --output artifacts/autodl-4090/sft \
@@ -389,4 +405,4 @@ PY
 - **磁盘与备份**：每阶段结束运行 `df -h /root/autodl-tmp`。把 `artifacts/autodl-4090/` 中的 run manifest、日志、评估 JSON 和选定 checkpoint 复制到已挂载的 AutoDL 文件存储或下载到本地；DPO/GRPO/Agent RL 的完整恢复还需原输出目录及 `reference.pt`。AutoDL 本地盘没有冗余，实例释放后数据不能依赖本地盘恢复。[文件存储说明](https://www.autodl.com/docs/fs/)、[实例数据说明](https://www.autodl.com/docs/instance_data/)。
 - **结束租用**：确认备份可读、`git-commit.txt` 和 `download_manifest.json` 已保存，再在控制台关机。关机与释放的行为不同，按实例页面和 AutoDL 文档核对。
 
-如果这一轮的实际吞吐或验证曲线使 72,746 步 SFT 成本过高，可另开一个**新实验**，用 [`prepare-sft-data` 的质量策略](sft.md#训练前审计) 生成上限约 25 万目标的派生集并重新计算步数。它能降低预算，但只覆盖筛选后的数据，不等于原始 mini SFT 一轮。
+如果全量一轮的实测时长超出预算，可另开一个**新实验**，用 [`prepare-sft-data` 的质量策略](sft.md#训练前审计) 生成较小的派生集并重新计算步数。它只覆盖筛选后的数据，不等于全量 SFT 一轮；在实验记录中写清使用的文件和步数。

@@ -1,6 +1,6 @@
-"""Download the MiniMind mini training chain and verify upstream checksums.
+"""Download the MiniMind training chain and verify upstream checksums.
 
-Run from rebuild/: python scripts/download_minimind.py
+Run from rebuild/: python scripts/download_minimind.py --profile full
 Only Python's standard library is required. Interrupted files use a .part suffix.
 """
 from __future__ import annotations
@@ -18,11 +18,18 @@ REPOSITORY = "https://www.modelscope.cn/datasets/gongjy/minimind_dataset"
 TREE_URL = "https://www.modelscope.cn/api/v1/datasets/gongjy/minimind_dataset/repo/tree"
 FILES = {
     "pretrain_t2t_mini.jsonl": "pretrain",
+    "pretrain_t2t.jsonl": "pretrain",
     "sft_t2t_mini.jsonl": "sft",
+    "sft_t2t.jsonl": "sft",
     "dpo.jsonl": "preference",
     "rlaif.jsonl": "rl",
     "agent_rl_math.jsonl": "agent",
     "agent_rl.jsonl": "agent",
+}
+COMMON_FILES = ("dpo.jsonl", "rlaif.jsonl", "agent_rl_math.jsonl", "agent_rl.jsonl")
+PROFILES = {
+    "mini": ("pretrain_t2t_mini.jsonl", "sft_t2t_mini.jsonl", *COMMON_FILES),
+    "full": ("pretrain_t2t.jsonl", "sft_t2t.jsonl", *COMMON_FILES),
 }
 
 
@@ -92,14 +99,17 @@ def download(metadata: dict, output: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[1] / "data/raw/minimind")
+    parser.add_argument("--profile", choices=PROFILES, default="mini",
+                        help="choose full or mini pretrain/SFT files; default: mini")
     args = parser.parse_args()
     with urlopen(TREE_URL + "?" + urlencode({"Revision": "master", "Root": ""}), timeout=30) as response:
         listing = json.load(response)
     available = {entry["Name"]: entry for entry in listing["Data"]["Files"]}
-    missing = FILES.keys() - available.keys()
+    names = PROFILES[args.profile]
+    missing = set(names) - available.keys()
     if missing:
         raise RuntimeError(f"Upstream files missing: {sorted(missing)}")
-    selected = [available[name] for name in FILES]
+    selected = [available[name] for name in names]
     print(f"Downloading {len(selected)} files, {sum(item['Size'] for item in selected) / 1e9:.2f} GB", flush=True)
     with ThreadPoolExecutor(max_workers=3) as pool:
         results = list(pool.map(lambda item: download(item, args.output), selected))
