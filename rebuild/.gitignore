@@ -1,24 +1,70 @@
-.venv/
+# Python bytecode and build outputs
 __pycache__/
 *.py[cod]
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environments and local environment settings
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Test, lint, and type-check caches
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-build/
-dist/
-artifacts/
-data/*
-!data/eval/
-data/eval/*
-!data/eval/sft_generation_v1.jsonl
-!data/policies/
-data/policies/*
-!data/policies/sft_quality_v1.json
-!data/tokenizer/
-data/tokenizer/*
-!data/tokenizer/minimind/
-!data/tokenizer/minimind/tokenizer.json
-!data/tokenizer/minimind/tokenizer_config.json
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 
-# Local learning notes: useful for personal review, not part of the public project.
+# Editor, notebook, and operating system files
+.idea/
+.vscode/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Local datasets (dataset Python source remains tracked)
+/dataset/raw/**
+!/dataset/raw/**/
+!/dataset/raw/**/.gitkeep
+/dataset/processed/**
+!/dataset/processed/**/
+!/dataset/processed/**/.gitkeep
+
+# Downloaded or trained tokenizer files
+/model/tokenizer/**
+!/model/tokenizer/**/
+!/model/tokenizer/**/.gitkeep
+
+# Checkpoints, logs, and experiment tracking
+# Re-include artifacts/ in case the parent repository ignores that directory.
+!/artifacts/
+/artifacts/**
+!/artifacts/**/
+!/artifacts/**/.gitkeep
+/wandb/
+/runs/
+*.log
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+
+# Personal learning notes
 /TRAINING_EXPERIENCE.md
+
+# Keep .python-version, pyproject.toml, and uv.lock for reproducibility.

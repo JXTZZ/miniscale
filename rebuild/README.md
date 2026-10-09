@@ -1,5 +1,70 @@
 # MiniScale
 
+## 当前手写框架
+
+当前重新从零编写全链路实现，仅搭建目录和空文件。所有新增 `.py` 文件均为空，
+尚未包含实现。环境和依赖配置沿用现有文件。
+
+目录布局参考 [MiniMind](https://github.com/jingyaogong/minimind) 的
+`model / dataset / trainer / scripts` 划分，并为 Agent RL、测试及训练产物预留位置。
+Agent RL 的环境、奖励及工具文件统一放在 `trainer/`；数据集代码和训练数据统一放在
+`dataset/`。分词器是模型配套资源，放在 `model/tokenizer/`，训练数据仍放在 `dataset/`。
+推理与评估入口统一放在 `scripts/`。
+
+```text
+rebuild/
+├── model/                      # 模型结构与模型配置
+│   ├── __init__.py
+│   ├── config.py
+│   ├── model.py
+│   └── tokenizer/              # 分词器文件
+├── dataset/                    # 数据集代码与训练数据
+│   ├── __init__.py
+│   ├── lm_dataset.py
+│   ├── raw/                    # 原始数据
+│   └── processed/              # 处理后的数据
+├── trainer/                    # 每个训练阶段一个入口
+│   ├── __init__.py
+│   ├── trainer_utils.py
+│   ├── train_pretrain.py
+│   ├── train_sft.py
+│   ├── train_dpo.py
+│   ├── train_grpo.py
+│   ├── train_agent.py
+│   ├── agent_env.py
+│   ├── agent_rewards.py
+│   └── agent_tools.py
+├── scripts/                    # 数据准备、分词器、导出、推理与评估
+│   ├── download_data.py
+│   ├── prepare_data.py
+│   ├── train_tokenizer.py
+│   ├── export_model.py
+│   ├── generate.py
+│   └── eval_llm.py
+├── configs/                    # 预留训练实验配置
+├── tests/                      # 预留测试
+├── artifacts/
+│   ├── checkpoints/            # 模型权重与恢复状态
+│   └── logs/                   # 训练日志与评估结果
+├── README.md
+├── pyproject.toml
+├── uv.lock
+├── .python-version
+├── .gitignore
+└── .venv/
+```
+
+空目录通过空的 `.gitkeep` 文件保留在 Git 中，实际数据、分词器产物、权重及日志被忽略。
+`.gitignore` 参考 [MiniMind](https://github.com/jingyaogong/minimind/blob/master/.gitignore)、
+[nanoGPT](https://github.com/karpathy/nanoGPT/blob/master/.gitignore) 和
+[GitHub Python 模板](https://github.com/github/gitignore/blob/main/Python.gitignore)，
+按 Python 产物、环境、开发缓存、数据和训练产物分组；保留依赖锁文件、源代码及目录占位文件。
+建议编写顺序：模型与数据集 → 预训练 → 推理与评估 → SFT → DPO → GRPO → Agent RL。
+
+## 上一版实现说明（重写参考）
+
+以下保留原 README 作为参考；其中描述的功能和命令需要在本次手写实现后才能使用。
+
 > 这里是 `rebuild/` 中的独立重构项目。请先进入本目录，再运行下面的 `uv`、训练和测试命令；当前重构计划见 [`docs/refactor-roadmap.md`](docs/refactor-roadmap.md)。
 
 MiniScale 是一个从零实现、可测试的“小模型到 Agent RL”学习项目。它借鉴了

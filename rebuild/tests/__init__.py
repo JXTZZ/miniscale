@@ -1,1 +1,0 @@
-"""MiniScale test suite."""
