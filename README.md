@@ -32,13 +32,13 @@ tied embeddings。真实训练默认使用 MiniMind 已训练好的 6400 词表 
 不代表本项目虚拟环境异常。
 
 ```bash
-uv sync
-uv run miniscale doctor
-uv run python -m unittest discover -s tests -v
-uv run miniscale pipeline --device cpu --output artifacts/run
+uv sync --locked
+uv run --frozen python scripts/doctor.py
+uv run --frozen python -m unittest discover -s tests -v
+uv run python scripts/smoke_pipeline.py --device cpu --output artifacts/smoke
 ```
 
-代码目录的职责、兼容入口以及“优先复用现存库”的判断原则见
+目录职责和安装后的模块入口见
 [`docs/architecture.md`](docs/architecture.md)。
 
 有可用 CUDA 时可将 `cpu` 改为 `cuda`。约 64M 参数的默认结构是 20 层、hidden size 512、
@@ -48,57 +48,51 @@ uv run miniscale pipeline --device cpu --output artifacts/run
 
 ## 用真实数据运行完整链路
 
-数据默认放在 `data/raw/minimind/`，并被 Git 忽略：
+从仓库根运行时，训练命令默认读取 `dataset/` 根目录中的 JSONL。下列本地文件由 Git 和打包规则排除。
 
 ```text
-pretrain/pretrain_t2t_mini.jsonl   预训练 text
-sft/sft_t2t_mini.jsonl             多轮 conversations
-preference/dpo.jsonl               chosen / rejected
-rl/rlaif.jsonl                     需要 judge/reward model 的开放式 RLAIF 数据
-agent/agent_rl_math.jsonl          带 gt 的数学工具任务
-agent/agent_rl.jsonl               混合 Agent 任务
+dataset/pretrain_t2t_mini.jsonl   预训练 text
+dataset/sft_t2t_mini.jsonl        多轮 conversations
+dataset/dpo.jsonl                 chosen / rejected
+dataset/agent_rl_math.jsonl       带 gt 的 GRPO 和 Agent 数学任务
 ```
 
-MiniMind tokenizer 已放在 `data/tokenizer/minimind/`，包含 `tokenizer.json` 和
-`tokenizer_config.json`，不需要重新训练。可以先验证它：
+已有全量语料可以用 `--data` 指定原路径，例如
+`--data data/raw/minimind/pretrain/pretrain_t2t_mini.jsonl`。各阶段的字段和切分见
+[`dataset/dataset.md`](dataset/dataset.md)。
 
-```bash
-uv run python -c "from miniscale.tokenizer import load_tokenizer; t=load_tokenizer('data/tokenizer/minimind'); print(type(t).__name__, t.vocab_size)"
-```
-
-预期输出 `HuggingFaceTokenizer 6400`。如果需要做 tokenizer 消融实验，仍可使用
-`miniscale train-tokenizer` 训练独立 SentencePiece 模型，但它产生的 checkpoint 与默认
-MiniMind tokenizer checkpoint 不兼容。
+默认 Hugging Face tokenizer 位于 `model/`，包含 `tokenizer.json` 和 `tokenizer_config.json`。
+可用 `uv run python trainer/train_tokenizer.py` 训练独立的 SentencePiece 模型。后续训练和推理
+需要沿用生成 checkpoint 时使用的 tokenizer。
 
 输入任意文本查看 token ID、子词、压缩率和解码结果：
 
 ```bash
-uv run miniscale tokenize \
+uv run python scripts/inspect_tokenizer.py \
   --text "你好，中国的首都是北京。MiniScale正在学习Agent RL！" \
   --add-bos \
   --add-eos
 ```
 
-`round_trip` 应为 `true`；`characters_per_token` 越高表示这段文本压缩得越好，但应在固定的
+`vocab_size` 应为 `6400`，`round_trip` 应为 `true`。`characters_per_token` 越高表示这段文本压缩得越好，但应在固定的
 中英/代码/数学测试集上比较，而不是只看一个句子。ByteLevel BPE 的 `tokens` 可能显示成
 `ä½łå¥½` 一类内部字节符号，这是正常表示，判断正确性应看 `decoded` 和 `round_trip`。
 
 然后逐阶段运行。下面的步数用于首次端到端实验，不代表最终收敛配置；每个阶段必须使用上个
-阶段的权重和同一个 `data/tokenizer/minimind/` 目录：
+阶段的权重和同一个 `model/` 目录：
 
 正式预训练前建议先完整扫描语料。报告会给出内容指纹、有效/异常行、exact duplicate、真实 token
 总量、稳定 train/validation 切分和 packing 利用率，但不会静默删除数据：
 
 ```bash
-uv run miniscale audit-pretrain-data \
-  --data data/raw/minimind/pretrain/pretrain_t2t_mini.jsonl \
-  --tokenizer data/tokenizer/minimind \
+uv run python scripts/audit_data.py pretrain \
+  --data dataset/pretrain_t2t_mini.jsonl \
   --sequence-length 768 \
   --output artifacts/data-audit.json
 ```
 
 ```bash
-uv run miniscale pretrain --steps 10000 --batch-size 1 \
+uv run python trainer/train_pretrain.py --steps 10000 --batch-size 1 \
   --num-hidden-layers 20 \
   --gradient-accumulation 16 --sequence-length 768 \
   --precision bf16 \
@@ -109,7 +103,7 @@ uv run miniscale pretrain --steps 10000 --batch-size 1 \
   --shuffle-buffer-size 8192 \
   --output artifacts/pretrain
 
-uv run miniscale sft --steps 3000 --batch-size 1 \
+uv run python trainer/train_full_sft.py --steps 3000 --batch-size 1 \
   --gradient-accumulation 16 --max-length 512 \
   --precision bf16 \
   --learning-rate 2e-5 --min-learning-rate 2e-6 \
@@ -119,7 +113,7 @@ uv run miniscale sft --steps 3000 --batch-size 1 \
   --checkpoint artifacts/pretrain/best.pt \
   --output artifacts/sft
 
-uv run miniscale dpo --steps 1000 --batch-size 1 \
+uv run python trainer/train_dpo.py --steps 1000 --batch-size 1 \
   --gradient-accumulation 16 --max-length 512 \
   --precision bf16 \
   --learning-rate 5e-6 --min-learning-rate 5e-7 --beta 0.1 \
@@ -129,11 +123,11 @@ uv run miniscale dpo --steps 1000 --batch-size 1 \
   --checkpoint artifacts/sft/sft.pt \
   --output artifacts/dpo
 
-uv run miniscale audit-grpo-data \
-  --data data/raw/minimind/agent/agent_rl_math.jsonl \
+uv run python scripts/audit_data.py grpo \
+  --data dataset/agent_rl_math.jsonl \
   --output artifacts/grpo-data-audit.json
 
-uv run miniscale grpo --steps 500 --batch-size 1 --group-size 4 \
+uv run python trainer/train_grpo.py --steps 500 --batch-size 1 --group-size 4 \
   --policy-epochs 2 --max-new-tokens 96 \
   --precision bf16 --reference-device cpu \
   --validation-every 100 --validation-prompts 100 \
@@ -141,11 +135,11 @@ uv run miniscale grpo --steps 500 --batch-size 1 --group-size 4 \
   --checkpoint artifacts/dpo/dpo.pt \
   --output artifacts/grpo
 
-uv run miniscale audit-agent-data \
-  --data data/raw/minimind/agent/agent_rl_math.jsonl \
+uv run python scripts/audit_data.py agent \
+  --data dataset/agent_rl_math.jsonl \
   --output artifacts/agent-data-audit.json
 
-uv run miniscale agent-rl --steps 500 --batch-size 1 --group-size 2 \
+uv run python trainer/train_agent.py --steps 500 --batch-size 1 --group-size 2 \
   --policy-epochs 2 --max-turns 3 --max-new-tokens 64 \
   --precision bf16 --reference-device cpu \
   --validation-every 50 --validation-prompts 50 \
@@ -157,7 +151,7 @@ uv run miniscale agent-rl --steps 500 --batch-size 1 --group-size 2 \
 正式 SFT 会把 conversation 展开为 assistant-turn 样本，只监督当前 assistant 回复；训练数据使用
 全局确定性 permutation，而不是只读取 JSONL 前部。默认按 conversation hash 留出 0.5% validation、
 跳过 exact duplicate，并在超过 context 时同时保留最近 prompt 和回复开头。训练前建议先运行
-`audit-sft-data`；reasoning mask、旧 10k 权重启动、3050 Ti/5070 配置和精确恢复命令见
+`uv run python scripts/audit_data.py sft`。reasoning mask、旧 10k 权重启动、3050 Ti/5070 配置和精确恢复命令见
 [`docs/sft.md`](docs/sft.md)。
 
 正式 DPO 会校验 chosen/rejected 的共享 prompt，执行 pair-aware 安全截断和 prompt-hash 验证切分，
@@ -198,7 +192,7 @@ checkpoint，不会删除 `best.pt`、`final.pt` 或 generations。按 `Ctrl+C` 
 参数必须与原命令一致：
 
 ```bash
-uv run miniscale pretrain --steps 10000 --batch-size 1 \
+uv run python trainer/train_pretrain.py --steps 10000 --batch-size 1 \
   --num-hidden-layers 20 \
   --gradient-accumulation 16 --sequence-length 768 \
   --precision bf16 \
@@ -216,8 +210,8 @@ RNG 都从断点恢复，因此 warmup/cosine schedule 会从原位置继续。�
 `pretrain.pt` 没有 optimizer/scheduler 状态，不能用 `--resume`；但仍可用于生成或作为后续
 SFT 的初始权重。
 
-新版 checkpoint 会在加载任何训练状态前严格校验数据、tokenizer、模型和所有影响训练轨迹的
-参数。旧版完整 checkpoint 缺少这些指纹，需要人工确认输入未变后，在第一次迁移时增加
+严格恢复会在加载训练状态前校验数据、tokenizer、模型和影响训练轨迹的参数。布局迁移前的 v2
+完整 checkpoint 可以直接恢复。更早的预训练 checkpoint 缺少这些指纹，需要人工确认输入未变后增加
 `--allow-legacy-resume`；之后保存的新 checkpoint 不再需要该参数。完整格式和迁移约定见
 [`docs/checkpointing.md`](docs/checkpointing.md)。新训练也不能直接复用已有产物的输出目录；应使用
 新目录或显式 `--resume`，避免悄悄拼接 metrics 或覆盖 checkpoint。
@@ -235,7 +229,7 @@ Linear matrix weights 使用 weight decay，RMSNorm 与 tied embedding/lm head �
 `--shuffle-buffer-size 0` 可以恢复旧的顺序读取行为，但不建议用于正式训练。
 
 内置 validation split 是稳定的 hash 切分，适合纵向比较；如果准备了覆盖中文、英文、代码等
-类别的独立 held-out JSONL，建议通过 `--validation-data data/eval/pretrain_validation.jsonl`
+类别的独立 held-out JSONL，建议通过 `--validation-data dataset/pretrain_validation.jsonl`
 传入。无论使用内置 split 还是独立文件，程序都会完整扫描 validation stream，并用固定 seed 的
 reservoir sampling 等概率抽取候选 block，而不是只读取文件前部。`--validation-batches 100` 表示
 缓存并复用最多 100 个 validation batch；实际 block 数为 `100 × batch_size`，候选不足时使用全部。
@@ -253,7 +247,7 @@ uv run wandb login
 tokens seen 和 generation tables：
 
 ```bash
-uv run miniscale pretrain --steps 10000 --batch-size 4 \
+uv run python trainer/train_pretrain.py --steps 10000 --batch-size 4 \
   --num-hidden-layers 20 \
   --gradient-accumulation 4 --sequence-length 768 \
   --learning-rate 3e-4 --min-learning-rate 3e-5 \
@@ -297,13 +291,10 @@ tail -f artifacts/pretrain/pretrain_metrics.jsonl
 KL、clip fraction、success/tool-call rate。固定一组 held-out prompts，定期生成并保存结果，
 比只盯 loss 更可信。
 
-只想学习代码或验证安装时，继续使用秒级入口：
+验证 CPU 流水线时使用 smoke 入口：
 
 ```bash
-uv run python trainer/train_pretrain.py
-uv run python trainer/train_sft.py
-uv run python trainer/train_grpo.py
-uv run python trainer/train_agent.py
+uv run python scripts/smoke_pipeline.py --device cpu --output artifacts/smoke
 ```
 
 输出在 `artifacts/`，该目录已被 Git 忽略。流水线清单会记录各阶段 loss、reward、耗时和
@@ -312,16 +303,16 @@ checkpoint 路径。
 使用真实 SFT 或最后一个 Agent RL checkpoint 生成文本时必须传入训练时的 tokenizer：
 
 ```bash
-uv run miniscale generate \
+uv run python eval_llm.py \
   --checkpoint artifacts/agent-rl/best.pt \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --prompt "请计算 7109*2920，只给最终结果。" \
   --calculator --max-turns 3 \
   --temperature 0 --max-new-tokens 64
 
-# 也可以使用独立脚本；--raw 只打印模型回答
-uv run python generate.py \
-  --checkpoint artifacts/run/agent_rl.pt \
+# --raw 只打印模型回答
+uv run python eval_llm.py \
+  --checkpoint artifacts/smoke/agent_rl.pt \
   --prompt "Use the calculator for 3*4." \
   --calculator \
   --temperature 0 \
@@ -329,19 +320,18 @@ uv run python generate.py \
 ```
 
 `best.pt`、`final.pt`、`sft.pt`、`dpo.pt`、`rl.pt` 和 `agent_rl.pt` 都包含可加载的模型权重；
-评估 base 模型 `best.pt` 或 `final.pt` 的续写时可给 `generate` 增加 `--raw-prompt`。
+评估 base 模型 `best.pt` 或 `final.pt` 的续写时可给 `eval_llm.py` 增加 `--raw-prompt`。
 但通常优先选择 `sft.pt` 或 `agent_rl.pt`。训练步数和数据量决定输出质量，文件能加载不等于
 模型已经具备泛化能力。
 
 ## 建议学习顺序
 
-1. `config.py`、`tokenizer.py`、`model.py`：亲手推导张量 shape，确认 causal test 为什么成立。
-2. `data.py`、`training/pretrain.py`：理解流式读取、packing、shift label 和 next-token objective。
-3. `training/sft.py`：检查 `-100` mask，确保 user/system/tool 文本不成为监督目标。
-4. `training/dpo.py`：理解 policy/reference 对 chosen/rejected 的相对 log-probability。
-5. `training/grpo.py`：先看 reward group normalization，再看 ratio clipping 和 reference KL。
-6. `agent_env.py`、`training/agent_rl.py`：跟踪一次两轮 trajectory，确认 observation 进入上下文但
-   action mask 为 0。
+1. 从 `model/model_miniscale.py` 和 `model/tokenizer.py` 推导张量 shape，确认 causal test 为什么成立。
+2. 在 `dataset/lm_dataset.py` 和 `trainer/train_pretrain.py` 跟踪流式读取、packing、shift label 和 next-token loss。
+3. 在 `trainer/train_full_sft.py` 跟踪 assistant-only 监督和 `-100` mask。
+4. 在 `trainer/train_dpo.py` 检查 policy 与 reference 对 chosen/rejected 的相对 log-probability。
+5. 从 `trainer/train_grpo.py` 跟到 `trainer/rl_utils.py`，依次看组内优势、ratio clipping 和 reference KL。
+6. 从 `trainer/train_agent.py` 跟到 `trainer/rollout_engine.py` 和 `trainer/agent_env.py`，观察工具响应如何进入上下文以及 action mask 如何标记模型动作。
 7. 修改一个组件并补测试，例如新增 `search` mock 工具、格式奖励或离线 eval；这才会逐渐变成
    你的工程，而不是 MiniMind 的复刻。
 
@@ -364,14 +354,45 @@ policy、稳定 held-out validation、可验证 reward、受限工具执行和�
 ## 目录
 
 ```text
-src/miniscale/          核心模型、数据、环境与训练算法
-trainer/                各阶段可直接运行的薄入口
+model/                  模型配置、decoder、tokenizer 和词表资源
+dataset/                JSONL 读取、切分、批处理、评估套件和质量策略
+trainer/                五个训练阶段、tokenizer 训练和共享运行机制
+scripts/                数据工具、评测、推理实现、环境检查和 smoke
+eval_llm.py             根目录推理入口
 tests/                  算法语义与端到端回归测试
 artifacts/              本地 checkpoint/manifest（不提交）
 ```
 
 贡献流程、测试约定和 checkpoint 兼容性要求见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。CI 会在 push 和
 pull request 上使用锁定依赖运行完整 unittest。公开发布前仍需由仓库所有者明确选择并添加许可证。
+
+## 旧命令迁移
+
+从源码目录可直接运行右列脚本，也可以使用对应模块，例如
+`uv run python -m trainer.train_full_sft --help`。安装 wheel 后，推理入口是
+`python -m scripts.inference`。
+
+| 旧入口 | 新命令 |
+| --- | --- |
+| `uv run miniscale pretrain` | `uv run python trainer/train_pretrain.py` |
+| `uv run miniscale sft` | `uv run python trainer/train_full_sft.py` |
+| `uv run miniscale dpo` | `uv run python trainer/train_dpo.py` |
+| `uv run miniscale grpo` | `uv run python trainer/train_grpo.py` |
+| `uv run miniscale agent-rl` | `uv run python trainer/train_agent.py` |
+| `uv run miniscale train-tokenizer` | `uv run python trainer/train_tokenizer.py` |
+| `uv run miniscale tokenize` | `uv run python scripts/inspect_tokenizer.py` |
+| `uv run miniscale generate`、`uv run python generate.py` | `uv run python eval_llm.py` |
+| `uv run miniscale evaluate` | `uv run python scripts/evaluate_checkpoints.py rl` |
+| `uv run miniscale evaluate-sft` | `uv run python scripts/evaluate_checkpoints.py sft` |
+| `uv run miniscale audit-pretrain-data` | `uv run python scripts/audit_data.py pretrain` |
+| `uv run miniscale audit-sft-data` | `uv run python scripts/audit_data.py sft` |
+| `uv run miniscale audit-dpo-data` | `uv run python scripts/audit_data.py dpo` |
+| `uv run miniscale audit-grpo-data` | `uv run python scripts/audit_data.py grpo` |
+| `uv run miniscale audit-agent-data` | `uv run python scripts/audit_data.py agent` |
+| `uv run miniscale prepare-sft-data` | `uv run python scripts/prepare_data.py` |
+| `uv run miniscale doctor` | `uv run python scripts/doctor.py` |
+| `uv run miniscale pipeline` | `uv run python scripts/smoke_pipeline.py` |
+| `uv run python trainer/train_sft.py` 及其他旧阶段 smoke 脚本 | `uv run python scripts/smoke_pipeline.py` |
 
 ## 阶段提交
 

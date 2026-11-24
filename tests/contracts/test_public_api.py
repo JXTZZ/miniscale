@@ -2,110 +2,60 @@ import argparse
 import importlib
 import unittest
 
-import miniscale
-import miniscale.training as training
-from miniscale.cli import build_parser, environment_report, main
+from scripts import audit_data, doctor, evaluate_checkpoints
+from trainer import train_agent, train_dpo, train_full_sft, train_grpo, train_pretrain
 
 
 class PublicAPIContractTests(unittest.TestCase):
-    def test_root_exports_remain_stable(self) -> None:
-        self.assertEqual(
-            set(miniscale.__all__),
-            {
-                "ByteTokenizer",
-                "HuggingFaceTokenizer",
-                "MiniScaleConfig",
-                "MiniScaleForCausalLM",
-                "SentencePieceTokenizer",
-            },
-        )
-
-    def test_training_exports_remain_stable(self) -> None:
-        self.assertEqual(
-            set(training.__all__),
-            {
-                "AgentRLOptions",
-                "DPOOptions",
-                "GRPOOptions",
-                "PretrainOptions",
-                "SmokePretrainOptions",
-                "RLTask",
-                "SFTOptions",
-                "SmokeSFTOptions",
-                "run_agent_grpo",
-                "run_agent_grpo_jsonl",
-                "run_dpo_jsonl",
-                "run_grpo",
-                "run_grpo_jsonl",
-                "run_pretrain",
-                "run_pretrain_jsonl",
-                "run_sft",
-                "run_sft_jsonl",
-            },
-        )
-
-    def test_cli_commands_remain_stable(self) -> None:
-        parser = build_parser()
-        subcommands = next(
-            action
-            for action in parser._actions
-            if isinstance(action, argparse._SubParsersAction)
-        )
-        self.assertEqual(
-            set(subcommands.choices),
-            {
-                "doctor",
-                "pipeline",
-                "generate",
-                "evaluate",
-                "evaluate-sft",
-                "tokenize",
-                "audit-pretrain-data",
-                "audit-sft-data",
-                "audit-dpo-data",
-                "audit-grpo-data",
-                "audit-agent-data",
-                "prepare-sft-data",
-                "train-tokenizer",
-                "pretrain",
-                "sft",
-                "dpo",
-                "grpo",
-                "agent-rl",
-            },
-        )
-        self.assertTrue(callable(main))
-        self.assertIn("python", environment_report())
-
-    def test_legacy_compatibility_modules_still_import(self) -> None:
+    def test_modules_expose_their_source_entry_points(self) -> None:
         for module_name in (
-            "model.model",
-            "dataset.lm_dataset",
-            "trainer.trainer_utils",
-            "miniscale.agent_data",
-            "miniscale.data_audit",
-            "miniscale.dpo_data_audit",
-            "miniscale.preference_data",
-            "miniscale.rl_data",
-            "miniscale.sft_data",
-            "miniscale.sft_data_audit",
-            "miniscale.sft_data_prepare",
-            "miniscale.training.agent_rl",
-            "miniscale.training.checkpoint",
-            "miniscale.training.common",
-            "miniscale.training.dpo",
-            "miniscale.training.dpo_config",
-            "miniscale.training.dpo_objective",
-            "miniscale.training.grpo",
-            "miniscale.training.grpo_objective",
-            "miniscale.training.pretrain",
-            "miniscale.training.rl_config",
-            "miniscale.training.runtime",
-            "miniscale.training.sft",
-            "miniscale.training.sft_config",
+            "eval_llm",
+            "trainer.train_pretrain",
+            "trainer.train_full_sft",
+            "trainer.train_dpo",
+            "trainer.train_grpo",
+            "trainer.train_agent",
+            "trainer.train_tokenizer",
+            "scripts.audit_data",
+            "scripts.prepare_data",
+            "scripts.inspect_tokenizer",
+            "scripts.evaluate_checkpoints",
+            "scripts.inference",
+            "scripts.doctor",
+            "scripts.smoke_pipeline",
         ):
             with self.subTest(module=module_name):
-                importlib.import_module(module_name)
+                module = importlib.import_module(module_name)
+                self.assertTrue(callable(module.main))
+        self.assertIs(importlib.import_module("eval_llm").main, importlib.import_module("scripts.inference").main)
+        self.assertIn("python", doctor.environment_report())
+
+    def test_tool_subcommands(self) -> None:
+        for module, expected in (
+            (audit_data, {"pretrain", "sft", "dpo", "grpo", "agent"}),
+            (evaluate_checkpoints, {"rl", "sft"}),
+        ):
+            with self.subTest(module=module.__name__):
+                subcommands = next(
+                    action for action in module.build_parser()._actions
+                    if isinstance(action, argparse._SubParsersAction)
+                )
+                self.assertEqual(set(subcommands.choices), expected)
+
+    def test_training_steps_are_explicit_and_checkpoint_sources_are_exclusive(self) -> None:
+        for module in (train_pretrain, train_full_sft, train_dpo, train_grpo, train_agent):
+            with self.subTest(module=module.__name__):
+                parser = module.build_parser()
+                required = {action.dest for action in parser._actions if action.required}
+                self.assertIn("steps", required)
+                if module is train_pretrain:
+                    continue
+                source_groups = [
+                    {action.dest for action in group._group_actions}
+                    for group in parser._mutually_exclusive_groups
+                    if group.required
+                ]
+                self.assertIn({"checkpoint", "resume"}, source_groups)
 
 
 if __name__ == "__main__":

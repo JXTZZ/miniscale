@@ -7,7 +7,7 @@ Agent-RL 是可选阶段：只有最终产品需要工具调用时才应在 GRPO
 ## 数据与工具能力审计
 
 ```bash
-uv run miniscale audit-agent-data \
+uv run python scripts/audit_data.py agent \
   --data data/raw/minimind/agent/agent_rl_math.jsonl \
   --validation-fraction 0.05 \
   --output artifacts/agent-data-audit.json
@@ -27,9 +27,9 @@ unsupported tool、invalid arguments 和 execution error。计算仅允许 AST �
 ## 冒烟测试
 
 ```bash
-uv run miniscale agent-rl \
+uv run python trainer/train_agent.py \
   --data data/raw/minimind/agent/agent_rl_math.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --checkpoint artifacts/grpo-v2-3050ti/best.pt \
   --output artifacts/agent-rl-smoke \
   --steps 10 --batch-size 1 --group-size 2 \
@@ -53,9 +53,9 @@ Agent trajectory 比单轮 GRPO 长得多，应先增加 group size，再尝试�
 一个保守的 3050 Ti 配置：
 
 ```bash
-uv run miniscale agent-rl \
+uv run python trainer/train_agent.py \
   --data data/raw/minimind/agent/agent_rl_math.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --checkpoint artifacts/grpo-v2-3050ti/best.pt \
   --output artifacts/agent-rl-v2-3050ti \
   --steps 500 --batch-size 1 --group-size 2 \
@@ -73,12 +73,12 @@ uv run miniscale agent-rl \
 
 ## 真实工具推理
 
-`generate --calculator` 会执行完整的模型→工具→observation→模型循环，不再只是注入工具说明：
+`eval_llm.py --calculator` 会执行完整的模型→工具→observation→模型循环。
 
 ```bash
-uv run miniscale generate \
+uv run python eval_llm.py \
   --checkpoint artifacts/agent-rl-v2-3050ti/best.pt \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --prompt "请计算 7109*2920，只给最终结果。" \
   --calculator --max-turns 3 --temperature 0 --max-new-tokens 64
 ```

@@ -3,23 +3,18 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM, SentencePieceTokenizer
-from miniscale.data import JsonlPretrainDataset
-from miniscale.inference import GenerationOptions, generate_from_checkpoint
-from miniscale.tokenizer import train_sentencepiece
-from miniscale.training import (
-    AgentRLOptions,
-    DPOOptions,
-    GRPOOptions,
-    PretrainOptions,
-    SFTOptions,
-    run_agent_grpo_jsonl,
-    run_dpo_jsonl,
-    run_grpo_jsonl,
-    run_pretrain_jsonl,
-    run_sft_jsonl,
-)
-from miniscale.training.common import load_checkpoint, save_checkpoint
+from dataset.lm_dataset import JsonlPretrainDataset
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import ByteTokenizer, SentencePieceTokenizer
+from scripts.inference import GenerationOptions, generate_from_checkpoint
+from trainer.checkpoint import load_checkpoint, save_checkpoint
+from trainer.rl_utils import AgentRLOptions, GRPOOptions
+from trainer.train_agent import run_agent_grpo_jsonl
+from trainer.train_dpo import DPOOptions, run_dpo_jsonl
+from trainer.train_full_sft import SFTOptions, run_sft_jsonl
+from trainer.train_grpo import run_grpo_jsonl
+from trainer.train_pretrain import PretrainOptions, run_pretrain_jsonl
+from trainer.train_tokenizer import train_sentencepiece
 
 
 def write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
@@ -120,8 +115,8 @@ class JsonlTrainingChainTests(unittest.TestCase):
                 PretrainOptions(steps=1, batch_size=1, sequence_length=32, validation_fraction=0, device="cpu"),
             )
             self.assertTrue(Path(str(pretrain_result["checkpoint"])).exists())
-            run_sft_jsonl(
-                model,
+            sft_result = run_sft_jsonl(
+                load_checkpoint(pretrain_result["checkpoint"]),
                 tokenizer,
                 sft,
                 root / "sft-out",
@@ -135,9 +130,10 @@ class JsonlTrainingChainTests(unittest.TestCase):
                     generation_every=0,
                     device="cpu",
                 ),
+                initial_checkpoint_path=pretrain_result["checkpoint"],
             )
             dpo_result = run_dpo_jsonl(
-                model,
+                load_checkpoint(sft_result["checkpoint"]),
                 tokenizer,
                 dpo,
                 root / "dpo-out",
@@ -151,15 +147,17 @@ class JsonlTrainingChainTests(unittest.TestCase):
                     generation_every=0,
                     device="cpu",
                 ),
+                initial_checkpoint_path=sft_result["checkpoint"],
             )
-            model = load_checkpoint(dpo_result["checkpoint"])
-            run_grpo_jsonl(
-                model, tokenizer, rl, root / "grpo-out",
+            grpo_result = run_grpo_jsonl(
+                load_checkpoint(dpo_result["checkpoint"]), tokenizer, rl, root / "grpo-out",
                 GRPOOptions(steps=1, group_size=2, max_new_tokens=4, data_limit=1, device="cpu"),
+                initial_checkpoint_path=dpo_result["checkpoint"],
             )
             agent_result = run_agent_grpo_jsonl(
-                model, tokenizer, agent, root / "agent-out",
+                load_checkpoint(grpo_result["checkpoint"]), tokenizer, agent, root / "agent-out",
                 AgentRLOptions(steps=1, group_size=2, max_new_tokens=4, data_limit=1, device="cpu"),
+                initial_checkpoint_path=grpo_result["checkpoint"],
             )
             self.assertTrue(Path(str(agent_result["checkpoint"])).exists())
 

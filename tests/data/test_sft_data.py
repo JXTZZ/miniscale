@@ -7,17 +7,18 @@ import unittest
 
 import torch
 
-from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.data import collate_lm_batch
-from miniscale.sft_data import (
+from dataset.lm_dataset import (
     IndexedJsonlSFTDataset,
     SFTCorpusIndex,
+    collate_lm_batch,
     fixed_validation_batches,
     truncate_sft_example,
 )
-from miniscale.sft_data_audit import audit_sft_jsonl
-from miniscale.sft_data_prepare import prepare_sft_jsonl
-from miniscale.data.sft_quality import response_has_severe_repetition
+from dataset.sft_quality import response_has_severe_repetition
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import ByteTokenizer
+from scripts.audit_data import audit_sft_jsonl
+from scripts.prepare_data import prepare_sft_jsonl
 
 
 def write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:

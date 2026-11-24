@@ -7,14 +7,11 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.training.pretrain import (
-    PretrainOptions,
-    _validate_resume_signature,
-    build_warmup_cosine_scheduler,
-    run_pretrain_jsonl,
-)
-from miniscale.training.common import restore_rng_state
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import ByteTokenizer
+from trainer.checkpoint import restore_rng_state
+from trainer.train_pretrain import PretrainOptions, _validate_resume_signature, run_pretrain_jsonl
+from trainer.trainer_utils import build_warmup_cosine_scheduler
 
 
 def write_corpus(path: Path, prefix: str = "resume-safe pretraining data 中文。") -> None:

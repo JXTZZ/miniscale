@@ -24,7 +24,7 @@ jobs:
         run: uv sync --locked
 
       - name: Report environment
-        run: uv run --frozen miniscale doctor
+        run: uv run --frozen python scripts/doctor.py
 
       - name: Run unit and integration tests
         run: uv run --frozen python -m unittest discover -s tests -v

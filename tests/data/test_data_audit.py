@@ -3,8 +3,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from miniscale import ByteTokenizer
-from miniscale.data_audit import audit_pretrain_jsonl, save_data_audit
+from dataset.file_utils import atomic_write_json
+from model.tokenizer import ByteTokenizer
+from scripts.audit_data import audit_pretrain_jsonl
 
 
 class DataAuditTests(unittest.TestCase):
@@ -41,7 +42,7 @@ class DataAuditTests(unittest.TestCase):
             self.assertEqual(report["tokens"]["train"]["packed_blocks"], 2)
             self.assertFalse(report["quality"]["training_compatible"])
 
-            target = save_data_audit(report, root / "reports/data.json")
+            target = atomic_write_json(root / "reports/data.json", report)
             self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["schema_version"], 1)
 
 

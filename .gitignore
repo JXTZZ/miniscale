@@ -7,18 +7,12 @@ __pycache__/
 build/
 dist/
 artifacts/
-data/*
-!data/eval/
-data/eval/*
-!data/eval/sft_generation_v1.jsonl
-!data/policies/
-data/policies/*
-!data/policies/sft_quality_v1.json
-!data/tokenizer/
-data/tokenizer/*
-!data/tokenizer/minimind/
-!data/tokenizer/minimind/tokenizer.json
-!data/tokenizer/minimind/tokenizer_config.json
+/data/
+/dataset/*.jsonl
+/dataset/*.jsonl.*
+/dataset/raw/
+/model/*.model
+/model/*.vocab
 
 # Local learning notes: useful for personal review, not part of the public project.
 /TRAINING_EXPERIENCE.md

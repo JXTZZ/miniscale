@@ -3,8 +3,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from miniscale.cli import environment_report
-from miniscale.pipeline import run_training_pipeline
+from scripts.doctor import environment_report
+from scripts.smoke_pipeline import run_training_pipeline
 
 
 class PipelineTests(unittest.TestCase):

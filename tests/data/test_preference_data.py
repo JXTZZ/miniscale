@@ -7,9 +7,7 @@ import unittest
 
 import torch
 
-from miniscale import ByteTokenizer
-from miniscale.dpo_data_audit import audit_dpo_jsonl
-from miniscale.preference_data import (
+from dataset.preference_dataset import (
     IndexedPreferenceDataset,
     PreferenceCorpusIndex,
     collate_preference_batch,
@@ -17,6 +15,8 @@ from miniscale.preference_data import (
     fixed_preference_validation_batches,
     parse_preference_pair,
 )
+from model.tokenizer import ByteTokenizer
+from scripts.audit_data import audit_dpo_jsonl
 
 
 def row(prompt: str, chosen: str, rejected: str) -> dict[str, object]:

@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import unittest
 
-from miniscale.cli import build_parser
-from miniscale.training.dpo import DPOOptions, dpo_option_default
+from trainer.train_dpo import DPOOptions, build_parser
 
 
 class DPOTests(unittest.TestCase):
     def test_production_steps_are_explicit_and_cli_defaults_have_one_source(self) -> None:
         with self.assertRaises(TypeError):
             DPOOptions()  # type: ignore[call-arg]
-        arguments = build_parser().parse_args(["dpo", "--steps", "10", "--checkpoint", "sft.pt"])
+        arguments = build_parser().parse_args(["--steps", "10", "--checkpoint", "sft.pt"])
         mappings = {
             "batch_size": "batch_size",
             "gradient_accumulation": "gradient_accumulation_steps",
@@ -42,16 +41,16 @@ class DPOTests(unittest.TestCase):
             "wandb_retry_every": "wandb_retry_every_steps",
         }
         for argument_name, option_name in mappings.items():
-            self.assertEqual(getattr(arguments, argument_name), dpo_option_default(option_name))
+            self.assertEqual(getattr(arguments, argument_name), getattr(DPOOptions(steps=10), option_name))
         self.assertIsNone(arguments.target_mode)
 
     def test_checkpoint_and_resume_are_mutually_exclusive(self) -> None:
         parser = build_parser()
         with self.assertRaises(SystemExit):
-            parser.parse_args(["dpo", "--steps", "1"])
+            parser.parse_args(["--steps", "1"])
         with self.assertRaises(SystemExit):
             parser.parse_args([
-                "dpo", "--steps", "1", "--checkpoint", "sft.pt", "--resume", "dpo.pt"
+                "--steps", "1", "--checkpoint", "sft.pt", "--resume", "dpo.pt"
             ])
 
 

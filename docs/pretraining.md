@@ -1,8 +1,8 @@
 # Production pretraining contract
 
-本文记录当前代码实际保证的预训练语义。正式路径是 CLI `miniscale pretrain` 调用
-`src/miniscale/training/pretrain.py::run_pretrain_jsonl`；`trainer/train_pretrain.py` 和
-`run_pretrain` 是独立的内存 smoke 路径，不代表正式 recipe。
+正式入口 `uv run python trainer/train_pretrain.py --steps ...` 调用同一文件中的
+`run_pretrain_jsonl`。内存 smoke 流水线通过 `scripts/smoke_pipeline.py` 调用
+`run_pretrain`。
 
 ## Objective and sequence construction
 
@@ -30,9 +30,9 @@ shuffle buffer 打乱。validation 在训练开始时完整扫描相应 stream�
 正式训练前建议生成完整数据报告：
 
 ```bash
-uv run miniscale audit-pretrain-data \
+uv run python scripts/audit_data.py pretrain \
   --data data/raw/minimind/pretrain/pretrain_t2t_mini.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --sequence-length 768 \
   --output artifacts/data-audit.json
 ```

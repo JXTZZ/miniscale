@@ -1,10 +1,16 @@
-import unittest
 from types import SimpleNamespace
+import unittest
 
 import torch
 
-from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.data import PretrainDataset, SFTDataset, collate_lm_batch, reservoir_sample_lm_batches
+from dataset.lm_dataset import (
+    PretrainDataset,
+    SFTDataset,
+    collate_lm_batch,
+    reservoir_sample_lm_batches,
+)
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import ByteTokenizer
 
 
 class ModelAndDataTests(unittest.TestCase):

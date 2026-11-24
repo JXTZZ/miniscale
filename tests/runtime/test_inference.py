@@ -1,13 +1,36 @@
 from pathlib import Path
+import sys
 import tempfile
+from types import ModuleType
 import unittest
+from unittest.mock import patch
 
-from miniscale import MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.inference import GenerationOptions, generate_from_checkpoint
-from miniscale.training.common import save_checkpoint
+import torch
+
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from scripts.inference import GenerationOptions, generate_from_checkpoint
+from trainer.checkpoint import load_checkpoint, save_checkpoint
 
 
 class InferenceTests(unittest.TestCase):
+    def test_loads_pickled_config_from_retired_module(self) -> None:
+        legacy_package = ModuleType("miniscale")
+        legacy_module = ModuleType("miniscale.config")
+        legacy_package.config = legacy_module
+        legacy_module.MiniScaleConfig = MiniScaleConfig
+        model = MiniScaleForCausalLM(MiniScaleConfig.smoke())
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "legacy.pt"
+            with (
+                patch.dict(sys.modules, {"miniscale": legacy_package, "miniscale.config": legacy_module}),
+                patch.object(MiniScaleConfig, "__module__", "miniscale.config"),
+            ):
+                torch.save({"config": model.config, "model": model.state_dict()}, checkpoint)
+            restored = load_checkpoint(checkpoint)
+        self.assertEqual(restored.config, model.config)
+        for name, parameter in model.state_dict().items():
+            self.assertTrue(torch.equal(restored.state_dict()[name], parameter), name)
+
     def test_checkpoint_generates_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = save_checkpoint(

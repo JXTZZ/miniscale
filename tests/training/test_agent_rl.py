@@ -4,15 +4,13 @@ import unittest
 
 import torch
 
-from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.agent_env import (
-    CalculatorTask,
-    filter_calculator_tools,
-    parse_tool_call,
-    parse_tool_call_payload,
-    safe_calculate,
-)
-from miniscale.training.agent_rl import AgentRLOptions, rollout_agent, run_agent_grpo
+from dataset.rl_dataset import CalculatorTask, filter_calculator_tools
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import ByteTokenizer
+from trainer.agent_env import parse_tool_call, parse_tool_call_payload, safe_calculate
+from trainer.rl_utils import AgentRLOptions
+from trainer.rollout_engine import rollout_agent
+from trainer.train_agent import run_agent_grpo
 
 
 class AgentRLTests(unittest.TestCase):
@@ -68,7 +66,7 @@ class AgentRLTests(unittest.TestCase):
             self.assertTrue(Path(str(metrics["checkpoint"])).exists())
 
     def test_reward_scores_all_expected_answers(self) -> None:
-        from miniscale.agent_env import CalculatorEnv
+        from trainer.agent_env import CalculatorEnv
 
         env = CalculatorEnv(CalculatorTask("two calculations", "", ("4", "9")))
         self.assertGreater(env.reward("4 and 9"), env.reward("4"))

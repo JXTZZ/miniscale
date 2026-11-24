@@ -6,13 +6,14 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.preference_data import (
+from dataset.preference_dataset import (
     PreferencePair,
     collate_preference_batch,
     encode_preference_pair,
 )
-from miniscale.training.dpo_objective import (
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import ByteTokenizer
+from trainer.train_dpo import (
     completion_log_probability,
     concatenated_completion_log_probabilities,
     dpo_loss,

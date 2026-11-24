@@ -2,16 +2,16 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.cli import build_parser
-from miniscale.training.sft import SFTOptions, SmokeSFTOptions, run_sft, sft_option_default
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import ByteTokenizer
+from trainer.train_full_sft import SFTOptions, SmokeSFTOptions, build_parser, run_sft
 
 
 class SFTTests(unittest.TestCase):
     def test_production_steps_are_explicit_and_cli_defaults_have_one_source(self) -> None:
         with self.assertRaises(TypeError):
             SFTOptions()  # type: ignore[call-arg]
-        arguments = build_parser().parse_args(["sft", "--steps", "10", "--checkpoint", "base.pt"])
+        arguments = build_parser().parse_args(["--steps", "10", "--checkpoint", "base.pt"])
         mappings = {
             "batch_size": "batch_size",
             "min_context_tokens": "min_context_tokens",
@@ -49,15 +49,15 @@ class SFTTests(unittest.TestCase):
             "wandb_retry_every": "wandb_retry_every_steps",
         }
         for argument_name, option_name in mappings.items():
-            self.assertEqual(getattr(arguments, argument_name), sft_option_default(option_name))
+            self.assertEqual(getattr(arguments, argument_name), getattr(SFTOptions(steps=10), option_name))
 
     def test_checkpoint_and_resume_are_mutually_exclusive(self) -> None:
         parser = build_parser()
         with self.assertRaises(SystemExit):
-            parser.parse_args(["sft", "--steps", "1"])
+            parser.parse_args(["--steps", "1"])
         with self.assertRaises(SystemExit):
             parser.parse_args([
-                "sft", "--steps", "1", "--checkpoint", "base.pt", "--resume", "sft.pt"
+                "--steps", "1", "--checkpoint", "base.pt", "--resume", "sft.pt"
             ])
 
     def test_sft_stage_writes_checkpoint(self) -> None:

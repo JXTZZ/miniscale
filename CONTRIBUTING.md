@@ -8,19 +8,19 @@ checkpoint 可解释，并用小模型测试验证算法语义。
 项目支持 Python 3.11 和 3.12，推荐使用仓库固定的 Python 3.12：
 
 ```bash
-uv sync
-uv run miniscale doctor
-uv run python -m unittest discover -s tests -v
+uv sync --locked
+uv run --frozen python scripts/doctor.py
+uv run --frozen python -m unittest discover -s tests -v
 ```
 
 真实数据、模型权重、W&B 离线文件和 `artifacts/` 不应提交。测试应使用临时目录、smoke 配置和最小
-合成数据，不能依赖本地 `data/` 内容、GPU、网络或外部账号。
+合成数据，不能依赖本地训练 JSONL、GPU、网络或外部账号。
 
 ## 代码边界
 
-- `src/miniscale/` 是可安装的核心实现；`trainer/` 只保留便于阅读的薄 smoke 入口。
-- 正式预训练入口是 `miniscale pretrain` / `run_pretrain_jsonl`；`run_pretrain` 只用于秒级集成测试。
-- 生产预训练参数的默认值只定义在 `PretrainOptions`，CLI 通过 `pretrain_option_default` 读取。
+- `model/`、`dataset/`、`trainer/` 和 `scripts/` 同时是源码目录与可安装模块。
+- `trainer/train_pretrain.py` 的正式入口调用 `run_pretrain_jsonl`。`run_pretrain` 供内存 smoke 流水线使用。
+- 生产训练参数的默认值由各阶段 Options 定义，CLI 从对应的数据类读取。
 - 模型配置属于 checkpoint 格式的一部分；加载 checkpoint 时不要用隐式默认值替换保存的配置。
 - 数据顺序、优化器、精度、scheduler、初始化或 loss 语义的变化必须进入 resume identity；必要时提升
   implementation/signature/checkpoint 版本并补迁移说明。

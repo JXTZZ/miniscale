@@ -7,9 +7,10 @@ import unittest
 
 import torch
 
-from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.training.common import load_checkpoint
-from miniscale.training.dpo import DPOOptions, run_dpo_jsonl
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import ByteTokenizer
+from trainer.checkpoint import load_checkpoint
+from trainer.train_dpo import DPOOptions, run_dpo_jsonl
 
 
 def preference(index: int) -> dict[str, object]:

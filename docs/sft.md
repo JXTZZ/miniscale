@@ -10,9 +10,9 @@ MiniScale 的正式 SFT 路径把一个 conversation 展开为多个 assistant-t
 随机样本计算 token 长度与截断：
 
 ```bash
-uv run miniscale audit-sft-data \
+uv run python scripts/audit_data.py sft \
   --data data/derived/sft/sft_miniscale_lotusy_v2.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --max-length 768 \
   --target-mode response_only \
   --validation-fraction 0.005 \
@@ -30,12 +30,12 @@ conversation identity 跳过 exact duplicate，并把去重数量写入 `sft_run
 conversation 的所有字符串值大小写不敏感，并在替换后重新执行 exact dedup：
 
 ```bash
-uv run miniscale prepare-sft-data \
+uv run python scripts/prepare_data.py \
   --data data/derived/sft/sft_miniscale_lotusy.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --replace-pattern MiniMind=MiniScale \
   --replace-pattern jingyaogong=LoTusY \
-  --quality-policy data/policies/sft_quality_v1.json \
+  --quality-policy dataset/policies/sft_quality_v1.json \
   --output data/derived/sft/sft_miniscale_lotusy_v2.jsonl
 ```
 
@@ -76,7 +76,7 @@ supervised token 开始。
 先进行 20 step 验证：
 
 ```bash
-uv run miniscale sft \
+uv run python trainer/train_full_sft.py \
   --steps 20 \
   --batch-size 1 \
   --gradient-accumulation 4 \
@@ -93,7 +93,7 @@ uv run miniscale sft \
   --device cuda \
   --target-mode response_only \
   --generation-every 10 \
-  --generation-suite data/eval/sft_generation_v1.jsonl \
+  --generation-suite dataset/eval/sft_generation_v1.jsonl \
   --checkpoint artifacts/pretrain-20l-768-4epoch/best.pt \
   --output artifacts/sft-v2-smoke
 ```
@@ -102,7 +102,7 @@ uv run miniscale sft \
 下面给出 18,000 step（约 1.25 轮）上限，并在 12,000 step 后允许质量早停；上限不是要求必须跑满：
 
 ```bash
-uv run miniscale sft \
+uv run python trainer/train_full_sft.py \
   --data data/derived/sft/sft_miniscale_lotusy_v2.jsonl \
   --checkpoint artifacts/pretrain-20l-768-4epoch/best.pt \
   --output artifacts/sft-64m-response-v2 \
@@ -151,7 +151,7 @@ Python/NumPy/PyTorch/CUDA RNG、输入/监督 token 计数和严格 resume ident
 精确恢复时，`--steps` 表示原计划总步数，所有影响训练轨迹的参数必须和首次命令一致：
 
 ```bash
-uv run miniscale sft \
+uv run python trainer/train_full_sft.py \
   --data data/derived/sft/sft_miniscale_lotusy_v2.jsonl \
   --steps 18000 \
   --batch-size 8 \
@@ -167,7 +167,7 @@ uv run miniscale sft \
   --save-every 1000 \
   --keep-last 3 \
   --generation-every 500 \
-  --generation-suite data/eval/sft_generation_v1.jsonl \
+  --generation-suite dataset/eval/sft_generation_v1.jsonl \
   --early-stopping-patience 4 \
   --early-stopping-min-steps 12000 \
   --num-workers 0 \
@@ -192,11 +192,11 @@ token 和 think 泄漏，并参与 `best_quality.pt` 与可选 early stopping �
 训练结束后用同一套 24 条固定探针同时比较原始 greedy 和部署防循环解码：
 
 ```bash
-uv run miniscale evaluate-sft \
+uv run python scripts/evaluate_checkpoints.py sft \
   --checkpoint artifacts/sft-64m-response-v2/best_loss.pt \
   --checkpoint artifacts/sft-64m-response-v2/best_quality.pt \
-  --suite data/eval/sft_generation_v1.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --suite dataset/eval/sft_generation_v1.jsonl \
+  --tokenizer model \
   --precision bf16 \
   --device cuda \
   --output artifacts/sft-64m-response-v2/checkpoint-comparison.json

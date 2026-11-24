@@ -1,22 +1,17 @@
+import json
 from pathlib import Path
 import tempfile
 import unittest
-import json
 
 import torch
 
-from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.training.common import load_checkpoint
-from miniscale.training.grpo import (
-    GRPOOptions,
-    RLTask,
-    grpo_objective,
-    math_reward,
-    normalize_group_rewards,
-    run_grpo,
-)
-from miniscale.rewards import score_math_answer
-from miniscale.rl_data import build_rl_corpus
+from dataset.rl_dataset import RLTask, build_rl_corpus
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import ByteTokenizer
+from trainer.checkpoint import load_checkpoint
+from trainer.rewards import score_math_answer
+from trainer.rl_utils import GRPOOptions, grpo_objective, normalize_group_rewards
+from trainer.train_grpo import run_grpo
 
 
 class GRPOTests(unittest.TestCase):
@@ -37,8 +32,8 @@ class GRPOTests(unittest.TestCase):
         self.assertIn("kl", stats)
 
     def test_math_reward_prefers_exact_answer(self) -> None:
-        self.assertGreater(math_reward("The answer is 5", "5"), math_reward("The answer is 4", "5"))
-        self.assertGreater(math_reward("answers: 5 and 7", ("5", "7")), math_reward("answer: 5", ("5", "7")))
+        self.assertGreater(score_math_answer("The answer is 5", "5").total, score_math_answer("The answer is 4", "5").total)
+        self.assertGreater(score_math_answer("answers: 5 and 7", ("5", "7")).total, score_math_answer("answer: 5", ("5", "7")).total)
 
     def test_math_reward_penalizes_answer_stuffing_and_tool_arguments(self) -> None:
         exact = score_math_answer("The answer is 5", "5")

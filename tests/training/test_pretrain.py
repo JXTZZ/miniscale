@@ -7,25 +7,26 @@ from unittest.mock import patch
 
 import torch
 
-from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.cli import build_parser, main
-from miniscale.training.common import load_checkpoint
-from miniscale.training.pretrain import (
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import ByteTokenizer
+from trainer.checkpoint import load_checkpoint
+from trainer.train_pretrain import (
     PretrainOptions,
     SmokePretrainOptions,
+    build_parser,
     build_pretrain_optimizer,
-    pretrain_option_default,
-    resolve_autocast_dtype,
+    main,
     run_pretrain,
     run_pretrain_jsonl,
 )
+from trainer.trainer_utils import resolve_autocast_dtype
 
 
 class PretrainTests(unittest.TestCase):
     def test_production_steps_are_explicit_and_cli_defaults_have_one_source(self) -> None:
         with self.assertRaises(TypeError):
             PretrainOptions()  # type: ignore[call-arg]
-        arguments = build_parser().parse_args(["pretrain", "--steps", "10"])
+        arguments = build_parser().parse_args(["--steps", "10"])
         mappings = {
             "batch_size": "batch_size",
             "sequence_length": "sequence_length",
@@ -62,7 +63,7 @@ class PretrainTests(unittest.TestCase):
             "num_workers": "num_workers",
         }
         for argument_name, option_name in mappings.items():
-            self.assertEqual(getattr(arguments, argument_name), pretrain_option_default(option_name))
+            self.assertEqual(getattr(arguments, argument_name), getattr(PretrainOptions(steps=10), option_name))
 
     def test_precision_resolution_is_explicit_and_rejects_unsupported_devices(self) -> None:
         self.assertIsNone(resolve_autocast_dtype("fp32", torch.device("cpu")))
@@ -75,21 +76,21 @@ class PretrainTests(unittest.TestCase):
 
     def test_pretrain_cli_exposes_model_depth(self) -> None:
         arguments = build_parser().parse_args(
-            ["pretrain", "--steps", "1", "--num-hidden-layers", "16"]
+            ["--steps", "1", "--num-hidden-layers", "16"]
         )
         self.assertEqual(arguments.num_hidden_layers, 16)
         self.assertEqual(MiniScaleConfig.small_64m(num_hidden_layers=16).num_hidden_layers, 16)
 
         with (
-            patch("miniscale.cli.load_tokenizer", return_value=ByteTokenizer()),
+            patch("trainer.train_pretrain.load_tokenizer", return_value=ByteTokenizer()),
             patch(
-                "miniscale.cli.MiniScaleConfig.small_64m",
+                "trainer.train_pretrain.MiniScaleConfig.small_64m",
                 return_value=MiniScaleConfig.smoke(),
             ) as config_factory,
-            patch("miniscale.cli.run_pretrain_jsonl", return_value={"checkpoint": "unused.pt"}),
+            patch("trainer.train_pretrain.run_pretrain_jsonl", return_value={"checkpoint": "unused.pt"}),
             redirect_stdout(StringIO()),
         ):
-            main(["pretrain", "--steps", "1", "--num-hidden-layers", "16"])
+            main(["--steps", "1", "--num-hidden-layers", "16"])
 
         self.assertEqual(config_factory.call_args.kwargs["num_hidden_layers"], 16)
 
@@ -118,13 +119,13 @@ class PretrainTests(unittest.TestCase):
             return {"checkpoint": "unused.pt"}
 
         with (
-            patch("miniscale.cli.load_tokenizer", return_value=ByteTokenizer()),
-            patch("miniscale.cli.MiniScaleConfig.small_64m", return_value=MiniScaleConfig.smoke()),
-            patch("miniscale.cli.run_pretrain_jsonl", side_effect=capture_model),
+            patch("trainer.train_pretrain.load_tokenizer", return_value=ByteTokenizer()),
+            patch("trainer.train_pretrain.MiniScaleConfig.small_64m", return_value=MiniScaleConfig.smoke()),
+            patch("trainer.train_pretrain.run_pretrain_jsonl", side_effect=capture_model),
             redirect_stdout(StringIO()),
         ):
-            main(["pretrain", "--steps", "1", "--seed", "123"])
-            main(["pretrain", "--steps", "1", "--seed", "123"])
+            main(["--steps", "1", "--seed", "123"])
+            main(["--steps", "1", "--seed", "123"])
         self.assertTrue(torch.equal(initialized[0], initialized[1]))
 
     def test_pretrain_writes_loadable_checkpoint(self) -> None:

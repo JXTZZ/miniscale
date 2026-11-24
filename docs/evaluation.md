@@ -1,16 +1,16 @@
 # Cross-stage RL evaluation
 
-`miniscale evaluate` lets the same immutable validation prompts compare checkpoints from different stages. It fully
+`scripts/evaluate_checkpoints.py rl` compares checkpoints from different stages on the same fixed validation prompts. It fully
 scans and fingerprints the source data, uses the same prompt-hash split as training, takes a fixed global sample and
 runs greedy generation. The JSON report records checkpoint, tokenizer and data identities so results remain auditable.
 
 Compare DPO with GRPO on direct mathematical answers:
 
 ```bash
-uv run miniscale evaluate \
+uv run python scripts/evaluate_checkpoints.py rl \
   --kind grpo \
   --data data/raw/minimind/agent/agent_rl_math.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --checkpoint artifacts/dpo-v2-3050ti/dpo.pt \
   --checkpoint artifacts/grpo-v2-3050ti/best.pt \
   --prompts 100 --max-new-tokens 96 \
@@ -21,10 +21,10 @@ uv run miniscale evaluate \
 Compare the selected GRPO model with Agent-RL using the real calculator loop:
 
 ```bash
-uv run miniscale evaluate \
+uv run python scripts/evaluate_checkpoints.py rl \
   --kind agent \
   --data data/raw/minimind/agent/agent_rl_math.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --checkpoint artifacts/grpo-v2-3050ti/best.pt \
   --checkpoint artifacts/agent-rl-v2-3050ti/best.pt \
   --prompts 50 --max-turns 3 --max-new-tokens 64 \

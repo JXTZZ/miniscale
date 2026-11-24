@@ -3,8 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from miniscale.training.core.artifacts import append_metric
-from miniscale.training.core.logging import format_training_metric
+from trainer.trainer_utils import append_metric, format_training_metric
 
 
 class TrainingLoggingTests(unittest.TestCase):

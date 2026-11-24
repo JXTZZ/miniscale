@@ -8,9 +8,10 @@ from unittest.mock import patch
 
 import torch
 
-from miniscale import ByteTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.training.common import load_checkpoint
-from miniscale.training.sft import SFTOptions, run_sft_jsonl
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import ByteTokenizer
+from trainer.checkpoint import load_checkpoint
+from trainer.train_full_sft import SFTOptions, run_sft_jsonl
 
 
 def write_corpus(path: Path) -> None:
@@ -229,9 +230,9 @@ class SFTResumeTests(unittest.TestCase):
                 device="cpu",
             )
             with (
-                patch("miniscale.training.stages.sft.evaluate_sft", return_value=(2.0, 0.5, 10)),
+                patch("trainer.train_full_sft.evaluate_sft", return_value=(2.0, 0.5, 10)),
                 patch(
-                    "miniscale.training.stages.sft.run_sft_generation_evaluation",
+                    "trainer.train_full_sft.run_sft_generation_evaluation",
                     return_value=(root / "generation.json", summary),
                 ),
             ):

@@ -2,28 +2,51 @@ from contextlib import redirect_stdout
 from io import StringIO
 import json
 from pathlib import Path
+from shutil import copyfile
 import tempfile
 import unittest
 
 import torch
 
-from miniscale import HuggingFaceTokenizer, MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.agent_env import CalculatorTask
-from miniscale.cli import main
-from miniscale.inference import GenerationOptions, generate_from_checkpoint
-from miniscale.tokenizer import load_tokenizer
-from miniscale.training.agent_rl import AgentRLOptions, rollout_agent
-from miniscale.training.common import save_checkpoint
+from dataset.file_utils import tokenizer_identity
+from dataset.rl_dataset import CalculatorTask
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import (
+    DEFAULT_TOKENIZER_FILES,
+    DEFAULT_TOKENIZER_PATH,
+    HuggingFaceTokenizer,
+    load_tokenizer,
+)
+from scripts.inference import GenerationOptions, generate_from_checkpoint
+from scripts.inspect_tokenizer import main
+from trainer.checkpoint import save_checkpoint
+from trainer.rl_utils import AgentRLOptions
+from trainer.rollout_engine import rollout_agent
 
 
-TOKENIZER_DIR = Path(__file__).parents[2] / "data/tokenizer/minimind"
+TOKENIZER_DIR = DEFAULT_TOKENIZER_PATH
 
 
 class HuggingFaceTokenizerTests(unittest.TestCase):
+    def test_bundled_identity_matches_the_legacy_two_file_directory(self) -> None:
+        bundled = tokenizer_identity(load_tokenizer(TOKENIZER_DIR))
+        self.assertEqual(bundled["class"], "miniscale.tokenizer.HuggingFaceTokenizer")
+        with tempfile.TemporaryDirectory() as directory:
+            external = Path(directory)
+            for filename in DEFAULT_TOKENIZER_FILES:
+                copyfile(TOKENIZER_DIR / filename, external / filename)
+            self.assertEqual(tokenizer_identity(load_tokenizer(external)), bundled)
+            (external / "extra.txt").write_text("extra file", encoding="utf-8")
+            self.assertNotEqual(tokenizer_identity(load_tokenizer(external)), bundled)
+            (external / "extra.txt").unlink()
+            with (external / "tokenizer_config.json").open("a", encoding="utf-8") as config:
+                config.write("\n")
+            self.assertNotEqual(tokenizer_identity(load_tokenizer(external)), bundled)
+
     def test_tokenize_cli_reports_ids_and_round_trip(self) -> None:
         output = StringIO()
         with redirect_stdout(output):
-            main(["tokenize", "--tokenizer", str(TOKENIZER_DIR), "--text", "你好，MiniScale！"])
+            main(["--tokenizer", str(TOKENIZER_DIR), "--text", "你好，MiniScale！"])
         result = json.loads(output.getvalue())
         self.assertTrue(result["round_trip"])
         self.assertEqual(result["token_count"], len(result["token_ids"]))

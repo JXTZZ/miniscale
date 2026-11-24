@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from miniscale.tracking import WandbTracker
+from trainer.tracking import WandbTracker
 
 
 class FakeRun:

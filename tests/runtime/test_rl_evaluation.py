@@ -1,18 +1,18 @@
-from pathlib import Path
 import json
+from pathlib import Path
 import tempfile
 import unittest
 
-from miniscale import MiniScaleConfig, MiniScaleForCausalLM
-from miniscale.evaluation import evaluate_rl_checkpoints
-from miniscale.rl_data import prompt_in_validation
-from miniscale.tokenizer import load_tokenizer
-from miniscale.training.common import save_checkpoint
+from dataset.rl_dataset import prompt_in_validation
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import DEFAULT_TOKENIZER_PATH, load_tokenizer
+from scripts.evaluate_checkpoints import evaluate_rl_checkpoints
+from trainer.checkpoint import save_checkpoint
 
 
 class RLEvaluationTests(unittest.TestCase):
     def test_comparison_report_records_input_identities(self) -> None:
-        tokenizer_path = Path("data/tokenizer/minimind")
+        tokenizer_path = DEFAULT_TOKENIZER_PATH
         tokenizer = load_tokenizer(tokenizer_path)
         config = MiniScaleConfig.smoke()
         config.vocab_size = tokenizer.vocab_size

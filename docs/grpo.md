@@ -6,7 +6,7 @@ GRPO 承接 DPO checkpoint，默认只训练 `agent_rl_math.jsonl` 中具有确�
 ## 数据审计
 
 ```bash
-uv run miniscale audit-grpo-data \
+uv run python scripts/audit_data.py grpo \
   --data data/raw/minimind/agent/agent_rl_math.jsonl \
   --validation-fraction 0.05 \
   --sample-size 2000 \
@@ -34,9 +34,9 @@ scoring 会更慢。
 ## 冒烟测试
 
 ```bash
-uv run miniscale grpo \
+uv run python trainer/train_grpo.py \
   --data data/raw/minimind/agent/agent_rl_math.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --checkpoint artifacts/dpo-v2-3050ti/dpo.pt \
   --output artifacts/grpo-smoke \
   --steps 10 --batch-size 1 --group-size 2 \
@@ -54,9 +54,9 @@ temperature、group size 和奖励覆盖，不应靠提高学习率强行训练�
 ## 3050 Ti 建议
 
 ```bash
-uv run miniscale grpo \
+uv run python trainer/train_grpo.py \
   --data data/raw/minimind/agent/agent_rl_math.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --checkpoint artifacts/dpo-v2-3050ti/dpo.pt \
   --output artifacts/grpo-v2-3050ti \
   --steps 1000 --batch-size 1 --group-size 4 \
@@ -85,9 +85,9 @@ policy、AdamW、scheduler、RNG、任务游标、rollout/token 计数、数据�
 必须保留整个输出目录。支持 hard link 的文件系统上 `last.pt` 是 `rl.pt` 的磁盘零拷贝别名：
 
 ```bash
-uv run miniscale grpo \
+uv run python trainer/train_grpo.py \
   --data data/raw/minimind/agent/agent_rl_math.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --resume artifacts/grpo-v2-3050ti/checkpoints/step_00000200.pt \
   --output artifacts/grpo-v2-3050ti \
   --steps 1000 --batch-size 1 --group-size 4 \

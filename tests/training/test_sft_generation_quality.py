@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from miniscale.training.evaluators.generation_quality import (
+from trainer.eval_utils import (
     generation_quality_score,
     load_generation_suite,
     repeated_ngram_fraction,

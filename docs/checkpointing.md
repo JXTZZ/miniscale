@@ -1,9 +1,8 @@
 # Checkpoint and resume contract
 
 MiniScale treats "resume" as continuation of the same training experiment, not
-as loading weights for a new experiment. Production pretraining, SFT, and DPO
-checkpoints therefore use checkpoint format v2 and stage-specific versioned
-resume identities.
+as loading weights for a new experiment. All five production stages use format v2
+and stage-specific versioned resume identities.
 
 ## What strict resume verifies
 
@@ -28,21 +27,31 @@ resume verifies its SHA-256 before restoring optimizer state.
 
 Paths are recorded for provenance, but compatibility uses content identities, so
 moving an unchanged dataset or tokenizer does not invalidate a checkpoint.
-Logging, W&B, generation, checkpoint-retention, and output cadence may be changed
-when resuming because they do not alter optimizer updates.
+Logging, W&B, and checkpoint-retention settings can be changed on resume.
+Keep any settings that affect the stage's resume signature, including the SFT
+generation suite and cadence used for early stopping.
 
-Every run also writes `pretrain_run.json`, `sft_run.json`, or `dpo_run.json`, a human-readable resolved recipe and
-input identity manifest. Full checkpoints contain the same identity plus model,
+Every run writes a stage manifest such as `pretrain_run.json`, with its resolved
+recipe and input identities. Full checkpoints include the same identity plus model,
 optimizer, scheduler, progress counters, and Python/NumPy/PyTorch/CUDA RNG state.
 
-## Legacy checkpoint migration
+## Checkpoints from the previous layout
+
+The checkpoint reader accepts the old serialized `miniscale.config.MiniScaleConfig`
+class for inference, stage initialization, and exact resume. New files store
+the same configuration as a dictionary. The bundled tokenizer's fingerprint
+uses the original two JSON files. A format-v2 checkpoint can resume using its
+original training inputs and options. Keep the existing `reference.pt` next to
+the training outputs when resuming DPO, GRPO, or Agent RL.
+
+## Pretraining checkpoints before format v2
 
 Checkpoints created before format v2 do not contain enough information to prove
 that data, tokenizer, and model semantics are unchanged. They are rejected by
 default. If you have manually verified those inputs, perform a one-time migration:
 
 ```bash
-uv run miniscale pretrain \
+uv run python trainer/train_pretrain.py \
   --steps 10000 \
   --batch-size 4 \
   --gradient-accumulation 4 \

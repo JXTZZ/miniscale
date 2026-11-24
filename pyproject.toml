@@ -14,12 +14,22 @@ dependencies = [
 [project.optional-dependencies]
 tracking = ["wandb>=0.21,<1"]
 
-[project.scripts]
-miniscale = "miniscale:main"
-
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+module-name = ["model", "dataset", "trainer", "scripts"]
+source-include = ["eval_llm.py"]
+source-exclude = [
+    "/dataset/*.jsonl",
+    "/dataset/*.jsonl.*",
+    "/dataset/raw",
+    "/dataset/raw/**",
+    "/model/*.model",
+    "/model/*.vocab",
+]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }

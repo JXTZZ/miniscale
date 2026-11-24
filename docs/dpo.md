@@ -9,9 +9,9 @@ chosen 和 rejected assistant 回复。两侧使用相同的近期 prompt contex
 审计只读取 MiniMind 数据并生成报告，不修改原始 JSONL：
 
 ```bash
-uv run miniscale audit-dpo-data \
+uv run python scripts/audit_data.py dpo \
   --data data/raw/minimind/preference/dpo.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --max-length 512 \
   --sample-size 2000 \
   --output artifacts/dpo-data-audit.json
@@ -41,9 +41,9 @@ margin 和 validation loss，而不是只比较 chosen/rejected 的原始 log-pr
 先验证数据、BF16、reference、validation 和 checkpoint：
 
 ```bash
-uv run miniscale dpo \
+uv run python trainer/train_dpo.py \
   --data data/raw/minimind/preference/dpo.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --checkpoint artifacts/sft-v2-3050ti/sft.pt \
   --output artifacts/dpo-smoke-3050ti \
   --steps 20 \
@@ -73,9 +73,9 @@ uv run miniscale dpo \
 16,277 个训练 pair 配合有效 batch 16，1,000 optimizer steps 约等于遍历一轮训练数据：
 
 ```bash
-uv run miniscale dpo \
+uv run python trainer/train_dpo.py \
   --data data/raw/minimind/preference/dpo.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --checkpoint artifacts/sft-v2-3050ti/sft.pt \
   --output artifacts/dpo-v2-3050ti \
   --steps 1000 \
@@ -130,9 +130,9 @@ RNG、数据进度、SFT 父权重身份和 reference 内容身份。
 恢复时保留首次正式命令中的所有轨迹参数，只把 `--checkpoint` 替换为 `--resume`，输出目录不变：
 
 ```bash
-uv run miniscale dpo \
+uv run python trainer/train_dpo.py \
   --data data/raw/minimind/preference/dpo.jsonl \
-  --tokenizer data/tokenizer/minimind \
+  --tokenizer model \
   --resume artifacts/dpo-v2-3050ti/checkpoints/step_00000200.pt \
   --output artifacts/dpo-v2-3050ti \
   --steps 1000 \
@@ -159,4 +159,4 @@ uv run miniscale dpo \
 `--steps 1000` 是原计划总步数，不是剩余步数。若要改变总 steps、LR、beta 或数据策略，应从原 SFT
 checkpoint 使用新输出目录重新开始 DPO 实验，不应把轨迹变化伪装成精确 resume。
 
-最终 `dpo.pt` 保留顶层 `config` 与 `model`，可以直接用于 `generate` 和下一阶段 GRPO。
+最终 `dpo.pt` 保留顶层 `config` 与 `model`，可供 `eval_llm.py` 和下一阶段 GRPO 读取。
