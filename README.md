@@ -27,6 +27,9 @@ tied embeddings。真实训练默认使用 MiniMind 已训练好的 6400 词表 
 
 ## 立即运行
 
+第一次阅读项目可以从 [MiniScale 学习指南](docs/learning-guide.md) 开始。指南从 CPU smoke
+出发，用小实验串起模型、数据、五阶段训练和 checkpoint 恢复。
+
 项目固定 Python `>=3.11,<3.13`，`.python-version` 为 3.12。请始终通过 `uv run` 或
 激活 `.venv` 运行；终端裸执行 `python` 若仍显示 3.14，只表示 base 环境在 PATH 前面，
 不代表本项目虚拟环境异常。
