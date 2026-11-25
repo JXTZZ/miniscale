@@ -7,13 +7,8 @@ import unittest
 
 import torch
 
-from dataset.lm_dataset import (
-    IndexedJsonlSFTDataset,
-    SFTCorpusIndex,
-    collate_lm_batch,
-    fixed_validation_batches,
-    truncate_sft_example,
-)
+from dataset.lm_dataset import collate_lm_batch, sample_indexed_batches
+from dataset.sft_dataset import IndexedJsonlSFTDataset, SFTCorpusIndex, truncate_sft_example
 from dataset.sft_quality import response_has_severe_repetition
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer
@@ -262,10 +257,10 @@ class SFTDataTests(unittest.TestCase):
                 min_context_tokens=8,
                 target_mode="reasoning_and_response",
             )
-            batches_a = fixed_validation_batches(
+            batches_a = sample_indexed_batches(
                 dataset, batch_size=2, batches=3, pad_token_id=0, seed=9
             )
-            batches_b = fixed_validation_batches(
+            batches_b = sample_indexed_batches(
                 dataset, batch_size=2, batches=3, pad_token_id=0, seed=9
             )
             for left, right in zip(batches_a, batches_b, strict=True):

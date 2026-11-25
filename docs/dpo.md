@@ -33,6 +33,8 @@ chosen/rejected 必须具有完全相同的 prompt。截断时两侧保留完全
 reward 是 policy 相对冻结 SFT reference 的隐式 reward，因此应主要观察 reward accuracy、reward
 margin 和 validation loss，而不是只比较 chosen/rejected 的原始 log-prob。
 
+周期 policy/reference 生成默认关闭。需要并排观察回复时，可显式传入 `--generation-every N`。
+
 `--target-mode` 默认从 SFT checkpoint 继承。显式传入不同值会拒绝启动。当前
 `artifacts/sft-v2-3050ti/sft.pt` 记录的是 `reasoning_and_response`。
 

@@ -5,6 +5,7 @@ import unittest
 
 from scripts.doctor import environment_report
 from scripts.smoke_pipeline import run_training_pipeline
+from trainer.checkpoint import read_checkpoint, read_training_checkpoint
 
 
 class PipelineTests(unittest.TestCase):
@@ -23,7 +24,9 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(manifest.read_text())["kind"], "integration-smoke-test")
             for checkpoint in ("pretrain.pt", "sft.pt", "rl.pt", "agent_rl.pt"):
-                self.assertTrue((Path(directory) / checkpoint).exists())
+                self.assertIn("model", read_checkpoint(Path(directory) / checkpoint))
+            self.assertEqual(read_training_checkpoint(Path(directory) / "pretrain/final.pt", "cpu")["step"], 2)
+            self.assertEqual(read_training_checkpoint(Path(directory) / "sft/sft.pt", "cpu")["step"], 200)
 
 
 if __name__ == "__main__":

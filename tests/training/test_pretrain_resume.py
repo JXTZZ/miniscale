@@ -1,3 +1,4 @@
+from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
@@ -9,8 +10,8 @@ import torch
 
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer
-from trainer.checkpoint import restore_rng_state
-from trainer.train_pretrain import PretrainOptions, _validate_resume_signature, run_pretrain_jsonl
+from trainer.checkpoint import read_checkpoint, restore_rng_state, validate_pretrain_signature
+from trainer.train_pretrain import PretrainOptions, run_pretrain_jsonl
 from trainer.trainer_utils import build_warmup_cosine_scheduler
 
 
@@ -20,16 +21,42 @@ def write_corpus(path: Path, prefix: str = "resume-safe pretraining data 中文�
 
 
 class PretrainResumeTests(unittest.TestCase):
+    def test_resume_with_a_different_wandb_id_preserves_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, output = root / "corpus.jsonl", root / "run"
+            write_corpus(corpus)
+            options = PretrainOptions(
+                steps=2, sequence_length=16, batch_size=1, gradient_accumulation_steps=1,
+                validation_fraction=0, generation_every=0, save_every=1, device="cpu",
+            )
+            tokenizer = ByteTokenizer()
+            model = MiniScaleForCausalLM(MiniScaleConfig.smoke())
+            run_pretrain_jsonl(model, tokenizer, corpus, output, options)
+
+            checkpoint = output / "checkpoints/step_00000001.pt"
+            payload = read_checkpoint(checkpoint)
+            payload["training_state"]["wandb_run_id"] = "original-run"
+            torch.save(payload, checkpoint)
+            path = output / "pretrain_metrics.jsonl"
+            before = path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "--wandb-run-id does not match"):
+                run_pretrain_jsonl(
+                    model, tokenizer, corpus, output,
+                    replace(options, resume_from=checkpoint, wandb_run_id="different-run"),
+                )
+            self.assertEqual(path.read_bytes(), before)
+
     def test_legacy_resume_requires_explicit_migration_opt_in(self) -> None:
         legacy = {"batch_size": 1, "sequence_length": 16}
         current = {"batch_size": 1, "sequence_length": 16, "shuffle_buffer_size": 8192}
         with self.assertRaisesRegex(ValueError, "allow-legacy-resume"):
-            _validate_resume_signature(legacy, current)
+            validate_pretrain_signature(legacy, current)
         with self.assertWarnsRegex(RuntimeWarning, "legacy checkpoint"):
-            _validate_resume_signature(legacy, current, allow_legacy=True)
+            validate_pretrain_signature(legacy, current, allow_legacy=True)
         with self.assertRaises(ValueError):
             with self.assertWarns(RuntimeWarning):
-                _validate_resume_signature(
+                validate_pretrain_signature(
                     {"batch_size": 8, "sequence_length": 16},
                     current,
                     allow_legacy=True,

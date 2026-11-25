@@ -9,20 +9,22 @@ import time
 
 import torch
 
-# Direct file execution starts with this subdirectory on sys.path.
+# Support running this file directly as well as with python -m.
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from dataset.file_utils import atomic_write_json, atomic_write_text
 from dataset.rl_dataset import CalculatorTask, RLTask
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer
+from scripts.inference import generate_from_checkpoint, GenerationOptions
 from trainer.agent_env import CalculatorEnv
-from trainer.checkpoint import save_checkpoint
+from trainer.checkpoint import load_checkpoint, save_checkpoint
 from trainer.rl_utils import AgentRLOptions, GRPOOptions
 from trainer.train_agent import run_agent_grpo
-from trainer.train_full_sft import SmokeSFTOptions, run_sft
 from trainer.train_grpo import run_grpo
-from trainer.train_pretrain import SmokePretrainOptions, run_pretrain
+from trainer.train_full_sft import run_sft_jsonl, SFTOptions
+from trainer.train_pretrain import PretrainOptions, run_pretrain_jsonl
 
 
 PRETRAIN_TEXTS = [
@@ -71,25 +73,40 @@ def run_training_pipeline(output_dir: str | Path, *, device: str = "auto") -> di
     config = MiniScaleConfig.smoke()
     tokenizer = ByteTokenizer()
     model = MiniScaleForCausalLM(config)
-    stages: dict[str, dict[str, float | str]] = {}
-    stages["pretrain"] = _timed_stage(
-        run_pretrain,
-        model,
-        tokenizer,
-        PRETRAIN_TEXTS,
-        output,
-        SmokePretrainOptions(device=device),
+    text_path = atomic_write_text(
+        output / "pretrain.jsonl",
+        "".join(json.dumps({"text": text}) + "\n" for text in PRETRAIN_TEXTS),
     )
+    sft_path = atomic_write_text(
+        output / "sft.jsonl",
+        "".join(json.dumps({"conversations": messages}) + "\n" for messages in SFT_CONVERSATIONS),
+    )
+    quick_run = dict(
+        device=device, gradient_accumulation_steps=1, validation_fraction=0,
+        save_every=0, generation_every=0, warmup_steps=0,
+    )
+    pretrain = PretrainOptions(steps=2, batch_size=2, sequence_length=64, shuffle_buffer_size=0, **quick_run)
+    sft = SFTOptions(steps=200, batch_size=2, learning_rate=3e-3, **quick_run)
+    stages = {
+        "pretrain": _timed_stage(
+            run_pretrain_jsonl, model, tokenizer, text_path, output / "pretrain", pretrain,
+        ),
+    }
+    pretrain_checkpoint = save_checkpoint(
+        output / "pretrain.pt", model, stage="pretrain", step=pretrain.steps,
+        metrics={"loss": float(stages["pretrain"]["loss"])},
+    )
+    stages["pretrain"]["checkpoint"] = str(pretrain_checkpoint)
+    model = load_checkpoint(pretrain_checkpoint)
     stages["sft"] = _timed_stage(
-        run_sft,
-        model,
-        tokenizer,
-        SFT_CONVERSATIONS,
-        output,
-        # Enough steps to deliberately overfit the two-example integration set;
-        # this proves stage hand-off, not generalization.
-        SmokeSFTOptions(steps=200, batch_size=2, learning_rate=3e-3, device=device),
+        run_sft_jsonl, model, tokenizer, sft_path, output / "sft", sft,
+        initial_checkpoint_path=pretrain_checkpoint,
     )
+    sft_checkpoint = save_checkpoint(
+        output / "sft.pt", model, stage="sft", step=sft.steps,
+        metrics={"loss": float(stages["sft"]["loss"])},
+    )
+    stages["sft"]["checkpoint"] = str(sft_checkpoint)
     stages["rl"] = _timed_stage(
         run_grpo,
         model,
@@ -110,22 +127,21 @@ def run_training_pipeline(output_dir: str | Path, *, device: str = "auto") -> di
         output / "agent_rl",
         AgentRLOptions(steps=1, group_size=2, max_turns=2, max_new_tokens=100, device=device),
     )
-    save_checkpoint(
+    agent_checkpoint = save_checkpoint(
         output / "agent_rl.pt", model, stage="agent_rl", step=1,
         metrics={"reward_mean": float(stages["agent_rl"]["reward_mean"])},
     )
-    prompt_ids = tokenizer.encode("<|user|>\n2+3?<|end|>\n<|assistant|>\n", bos=True)
-    prompt = torch.tensor([prompt_ids], device=next(model.parameters()).device)
-    model.eval()
-    generated = model.generate(prompt, max_new_tokens=8, temperature=0)
+    generated = generate_from_checkpoint(
+        agent_checkpoint, RL_TASKS[0].prompt,
+        GenerationOptions(device=device, max_new_tokens=8, temperature=0),
+    )
     manifest: dict[str, object] = {
         "kind": "integration-smoke-test",
         "config": asdict(config),
         "stages": stages,
-        "sample": tokenizer.decode(generated[0, len(prompt_ids) :].tolist()),
+        "sample": generated["response"],
     }
-    manifest_path = output / "pipeline_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    manifest_path = atomic_write_json(output / "pipeline_manifest.json", manifest)
     manifest["manifest"] = str(manifest_path)
     return manifest
 

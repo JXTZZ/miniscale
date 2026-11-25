@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import random
 
-from dataset.file_utils import path_identity
+from dataset.file_utils import JsonlScan
 
 
 DEFAULT_RL_DATA = Path("dataset/agent_rl_math.jsonl")
@@ -46,7 +46,7 @@ class RLCorpus:
     invalid_reasons: dict[str, int]
 
 
-def parse_rl_task(row: object, *, location: str = "row") -> RLTask:
+def _math_row(row: object, location: str) -> tuple[list[object], str, tuple[str, ...]]:
     if not isinstance(row, dict):
         raise ValueError(f"{location}: expected a JSON object")
     messages = row.get("conversations")
@@ -65,7 +65,12 @@ def parse_rl_task(row: object, *, location: str = "row") -> RLTask:
     answers = tuple(str(item).strip() for item in ground_truth if str(item).strip())
     if not answers:
         raise ValueError(f"{location}: gt contains no answers")
-    return RLTask(users[-1], answers)
+    return messages, users[-1], answers
+
+
+def parse_rl_task(row: object, *, location: str = "row") -> RLTask:
+    _, prompt, answers = _math_row(row, location)
+    return RLTask(prompt, answers)
 
 
 def prompt_in_validation(prompt: str, fraction: float) -> bool:
@@ -109,28 +114,29 @@ def build_rl_corpus(
     invalid: Counter[str] = Counter()
     seen: set[tuple[str, tuple[str, ...]]] = set()
     rows = duplicate_rows = 0
-    with source_path.open(encoding="utf-8") as source:
-        for line_number, line in enumerate(source, 1):
-            if not line.strip():
-                continue
-            rows += 1
-            try:
-                row = json.loads(line)
-                task = parse_rl_task(row, location=f"{source_path}:{line_number}")
-            except json.JSONDecodeError:
-                invalid["invalid_json"] += 1
-                continue
-            except ValueError as error:
-                invalid[_invalid_reason(error)] += 1
-                continue
-            answers = (task.answer,) if isinstance(task.answer, str) else task.answer
-            key = (task.prompt.strip(), tuple(answers))
-            if key in seen:
-                duplicate_rows += 1
-                continue
-            seen.add(key)
-            destination = validation if prompt_in_validation(task.prompt, validation_fraction) else train
-            destination.append(task)
+    scan = JsonlScan(source_path)
+    for line_number, _, raw_line in scan:
+        line = raw_line.decode("utf-8")
+        if not line.strip():
+            continue
+        rows += 1
+        try:
+            row = json.loads(line)
+            task = parse_rl_task(row, location=f"{source_path}:{line_number}")
+        except json.JSONDecodeError:
+            invalid["invalid_json"] += 1
+            continue
+        except ValueError as error:
+            invalid[_invalid_reason(error)] += 1
+            continue
+        answers = (task.answer,) if isinstance(task.answer, str) else task.answer
+        key = (task.prompt.strip(), tuple(answers))
+        if key in seen:
+            duplicate_rows += 1
+            continue
+        seen.add(key)
+        destination = validation if prompt_in_validation(task.prompt, validation_fraction) else train
+        destination.append(task)
     if train_limit is not None and len(train) > train_limit:
         train = random.Random(seed).sample(train, train_limit)
     stats = RLCorpusStats(
@@ -142,7 +148,7 @@ def build_rl_corpus(
         validation_tasks=len(validation),
     )
     identity = {
-        "source": path_identity(source_path),
+        "source": scan.identity,
         "format_version": RL_DATA_FORMAT_VERSION,
         "split_version": RL_SPLIT_VERSION,
         "validation_fraction": validation_fraction,
@@ -237,24 +243,7 @@ def _tool_names(tools: object | None) -> list[str]:
 
 
 def parse_agent_task(row: object, *, location: str = "row") -> tuple[CalculatorTask, list[str]]:
-    if not isinstance(row, dict):
-        raise ValueError(f"{location}: expected a JSON object")
-    messages = row.get("conversations")
-    if not isinstance(messages, list):
-        raise ValueError(f"{location}: conversations must be a list")
-    users = [
-        str(message.get("content") or "").strip()
-        for message in messages
-        if isinstance(message, dict) and message.get("role") == "user"
-    ]
-    if not users or not users[-1]:
-        raise ValueError(f"{location}: missing a non-empty user prompt")
-    ground_truth = row.get("gt")
-    if not isinstance(ground_truth, list):
-        raise ValueError(f"{location}: gt must be a list")
-    answers = tuple(str(item).strip() for item in ground_truth if str(item).strip())
-    if not answers:
-        raise ValueError(f"{location}: gt contains no answers")
+    messages, prompt, answers = _math_row(row, location)
     systems = [
         message for message in messages
         if isinstance(message, dict) and message.get("role") == "system"
@@ -268,7 +257,7 @@ def parse_agent_task(row: object, *, location: str = "row") -> tuple[CalculatorT
     supported_tools = filter_calculator_tools(raw_tools)
     if raw_tools is not None and supported_tools is None:
         raise ValueError(f"{location}: no supported calculator tool schema")
-    return CalculatorTask(users[-1], "", answers, system_prompt, supported_tools), unsupported
+    return CalculatorTask(prompt, "", answers, system_prompt, supported_tools), unsupported
 
 
 def build_agent_corpus(
@@ -287,38 +276,39 @@ def build_agent_corpus(
     unsupported_tools: Counter[str] = Counter()
     seen: set[tuple[str, tuple[str, ...]]] = set()
     rows = duplicates = stripped = 0
-    with source_path.open(encoding="utf-8") as source:
-        for line_number, line in enumerate(source, 1):
-            if not line.strip():
-                continue
-            rows += 1
-            try:
-                task, unsupported = parse_agent_task(
-                    json.loads(line), location=f"{source_path}:{line_number}"
-                )
-            except json.JSONDecodeError:
-                invalid["invalid_json"] += 1
-                continue
-            except ValueError as error:
-                message = str(error)
-                reason = (
-                    "unsupported_tools" if "no supported" in message
-                    else "empty_gt" if "gt contains no answers" in message
-                    else "invalid_tools" if "tools" in message
-                    else "invalid_structure"
-                )
-                invalid[reason] += 1
-                continue
-            unsupported_tools.update(unsupported)
-            stripped += len(unsupported)
-            answers = (task.answer,) if isinstance(task.answer, str) else task.answer
-            key = (task.question.strip(), tuple(answers))
-            if key in seen:
-                duplicates += 1
-                continue
-            seen.add(key)
-            destination = validation if prompt_in_validation(task.question, validation_fraction) else train
-            destination.append(task)
+    scan = JsonlScan(source_path)
+    for line_number, _, raw_line in scan:
+        line = raw_line.decode("utf-8")
+        if not line.strip():
+            continue
+        rows += 1
+        try:
+            task, unsupported = parse_agent_task(
+                json.loads(line), location=f"{source_path}:{line_number}"
+            )
+        except json.JSONDecodeError:
+            invalid["invalid_json"] += 1
+            continue
+        except ValueError as error:
+            message = str(error)
+            reason = (
+                "unsupported_tools" if "no supported" in message
+                else "empty_gt" if "gt contains no answers" in message
+                else "invalid_tools" if "tools" in message
+                else "invalid_structure"
+            )
+            invalid[reason] += 1
+            continue
+        unsupported_tools.update(unsupported)
+        stripped += len(unsupported)
+        answers = (task.answer,) if isinstance(task.answer, str) else task.answer
+        key = (task.question.strip(), tuple(answers))
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
+        destination = validation if prompt_in_validation(task.question, validation_fraction) else train
+        destination.append(task)
     if train_limit is not None and len(train) > train_limit:
         train = random.Random(seed).sample(train, train_limit)
     stats = AgentCorpusStats(
@@ -331,7 +321,7 @@ def build_agent_corpus(
         stripped_unsupported_tool_schemas=stripped,
     )
     identity = {
-        "source": path_identity(source_path),
+        "source": scan.identity,
         "format_version": 1,
         "split_version": "prompt_sha256_v1",
         "tool_registry": "calculator_v1",

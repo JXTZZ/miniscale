@@ -1,13 +1,19 @@
 # MiniScale
 
-MiniScale 是一个从零实现、可测试的“小模型到 Agent RL”学习项目。它借鉴了
-[MiniMind](https://github.com/jingyaogong/minimind) 的完整训练路线和
-[MokioMind](https://github.com/Wood-Q/MokioMind) 的手写学习方式，但模型、数据管线、
-GRPO 目标和工具环境均在本仓库独立实现，不是对上游源码的改名复制。
+MiniScale 是一个从零实现、可测试的“小模型到 Agent RL”学习项目。项目参考了 MiniMind 的训练路线
+和 MokioMind 的手写学习方式。目录重构采用 MiniMind 的平铺布局，将 MiniScale 原有的模型、数据管线、
+训练目标和工具环境迁入 `model/`、`dataset/`、`trainer/` 和 `scripts/`。 [MiniMind](https://github.com/jingyaogong/minimind) · [MokioMind](https://github.com/Wood-Q/MokioMind)
 
 仓库同时保留秒级 smoke pipeline，并提供约 64M 参数模型的真实 JSONL 训练入口。真实入口
 直接读取本地数据，不会把十几 GB 数据一次性装入内存；训练步数必须显式指定，避免误启动
 长任务。
+
+## MiniScale 的训练特性
+
+- **可复现的预训练与续训**。以 `--steps` 指定训练预算，流式打包 JSONL，按内容稳定切分验证集。完整 checkpoint 保存数据与 tokenizer 指纹、训练进度、优化器、scheduler 和随机状态。 [预训练](docs/pretraining.md) · [恢复契约](docs/checkpointing.md)
+- **SFT 样本选择与质量评估**。按 assistant turn 选择监督目标，可用质量策略生成派生数据，使用固定生成套件评估回复并选择 checkpoint。 [SFT](docs/sft.md)
+- **偏好训练与可验证奖励**。DPO 校验共享 prompt 并保留冻结 reference，GRPO 用数学答案计算奖励，Agent RL 用 action mask 从优化目标中排除计算器观测。 [DPO](docs/dpo.md) · [GRPO](docs/grpo.md) · [Agent RL](docs/agent_rl.md)
+- **本地指标与 W&B**。五个阶段保存本地 JSONL 指标，并可选用 W&B。训练中断后可继续使用原 run ID，持久化的待传队列会在重连后补传指标和生成样例。 [W&B 实现](trainer/tracking.py)
 
 ## 已打通的流水线
 
@@ -102,7 +108,6 @@ uv run python trainer/train_pretrain.py --steps 10000 --batch-size 1 \
   --learning-rate 3e-4 --min-learning-rate 3e-5 \
   --warmup-steps 200 --save-every 500 --keep-last 3 \
   --validation-every 200 --validation-batches 100 \
-  --generation-every 1000 \
   --shuffle-buffer-size 8192 \
   --output artifacts/pretrain
 
@@ -122,7 +127,7 @@ uv run python trainer/train_dpo.py --steps 1000 --batch-size 1 \
   --learning-rate 5e-6 --min-learning-rate 5e-7 --beta 0.1 \
   --warmup-steps 50 \
   --validation-every 100 --validation-batches 100 \
-  --save-every 200 --keep-last 3 --generation-every 500 \
+  --save-every 200 --keep-last 3 \
   --checkpoint artifacts/sft/sft.pt \
   --output artifacts/dpo
 
@@ -263,12 +268,14 @@ uv run python trainer/train_pretrain.py --steps 10000 --batch-size 4 \
   --output artifacts/pretrain-shuffled
 ```
 
-W&B run ID 会写进所有完整 checkpoint。使用 `--resume` 时不需要再次填写 ID，训练会自动接回
-同一个 W&B run；也可以第一次恢复旧 checkpoint 时显式传入 `--wandb-run-id`。所有待上传指标会先
-持久化到输出目录的 `wandb_pending.jsonl`，断联后默认每 200 step 自动重连，连接恢复后补传 loss
-等标量和 generation table；训练进程重启后也会继续处理该队列。generation 与标量分开上传，因此
-Table 上传超时不会挡住 loss 曲线。可用 `--wandb-retry-every` 修改重试间隔。无法联网时也可以使用
-`--wandb-mode offline`，之后再运行 `uv run wandb sync <离线 run 目录>`。
+启用 W&B 时，run ID 会写入完整 checkpoint。续训命令使用 `--resume` 并带上 `--wandb`，
+训练会从 checkpoint 读出 ID，接回同一个 W&B run。首次恢复缺少 run ID 的旧 checkpoint 时，
+可以显式传入 `--wandb-run-id`。
+
+待上传指标先写到输出目录的 `wandb_pending.jsonl`。重新启动时沿用同一个 `--output`，即可继续
+处理这个队列。断联后默认每 200 step 尝试重连，可用 `--wandb-retry-every` 调整间隔。标量和
+generation table 分开上传，标量优先补传。也可以使用 `--wandb-mode offline`，联网后运行
+`uv run wandb sync <离线 run 目录>`。
 
 当前 GRPO 默认使用 `agent_rl_math.jsonl`，因为其中的 `gt` 能形成确定的 verifier reward。全量审计
 发现 20,000 行中有 19,430 个去重有效任务，默认稳定切分为 18,484 train / 946 validation。
@@ -291,8 +298,8 @@ tail -f artifacts/pretrain/pretrain_metrics.jsonl
 
 预训练主要看 `train_loss` 长期下降、`validation_loss` 同步下降，以及 `perplexity` 没有持续
 反弹；单个 step 的抖动正常。DPO 看 loss 和 preference accuracy，GRPO/Agent RL 看 reward、
-KL、clip fraction、success/tool-call rate。固定一组 held-out prompts，定期生成并保存结果，
-比只盯 loss 更可信。
+KL、clip fraction、success/tool-call rate。只有写日志的更新步会测量吞吐和 CUDA 峰值显存。
+预训练和 DPO 默认关闭周期生成，可用 `--generation-every N` 启用。SFT 仍按固定生成套件选模。
 
 验证 CPU 流水线时使用 smoke 入口：
 
@@ -300,8 +307,8 @@ KL、clip fraction、success/tool-call rate。固定一组 held-out prompts，�
 uv run python scripts/smoke_pipeline.py --device cpu --output artifacts/smoke
 ```
 
-输出在 `artifacts/`，该目录已被 Git 忽略。流水线清单会记录各阶段 loss、reward、耗时和
-checkpoint 路径。
+输出在 `artifacts/`，该目录已被 Git 忽略。Smoke 用微型 JSONL 调用正式预训练和 SFT 函数，流水线清单
+记录各阶段 loss、reward、耗时和 checkpoint 路径。
 
 使用真实 SFT 或最后一个 Agent RL checkpoint 生成文本时必须传入训练时的 tokenizer：
 

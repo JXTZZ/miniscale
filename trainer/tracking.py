@@ -224,96 +224,48 @@ class WandbTracker:
             "train/grad_norm": metric["grad_norm"],
             "train/tokens_seen": metric["tokens_seen"],
         }
-        optional_metrics = {
-            "examples_seen": "train/examples_seen",
-            "pairs_seen": "train/pairs_seen",
-            "target_tokens_seen": "train/target_tokens_seen",
-            "grad_was_clipped": "train/grad_was_clipped",
-            "grad_clip_fraction": "train/grad_clip_fraction",
-            "update_seconds": "performance/update_seconds",
-            "tokens_per_second": "performance/tokens_per_second",
-            "supervised_tokens_per_second": "performance/supervised_tokens_per_second",
-            "samples_per_second": "performance/samples_per_second",
-            "pairs_per_second": "performance/pairs_per_second",
-            "cuda_peak_memory_mb": "performance/cuda_peak_memory_mb",
-            "preference_accuracy": "train/preference_accuracy",
-            "reward_accuracy": "train/reward_accuracy",
-            "reward_margin": "train/reward_margin",
-            "chosen_reward": "train/chosen_reward",
-            "rejected_reward": "train/rejected_reward",
-            "policy_chosen_logp": "train/policy_chosen_logp",
-            "policy_rejected_logp": "train/policy_rejected_logp",
-            "policy_logp_margin": "train/policy_logp_margin",
-            "reference_logp_margin": "train/reference_logp_margin",
-            "policy_preference_accuracy": "train/policy_preference_accuracy",
-            "reward_mean": "train/reward_mean",
-            "reward_std": "train/reward_std",
-            "reward_max": "train/reward_max",
-            "policy_loss": "train/policy_loss",
-            "kl": "train/kl",
-            "clip_fraction": "train/clip_fraction",
-            "zero_advantage_group_rate": "train/zero_advantage_group_rate",
-            "prompts_seen": "train/prompts_seen",
-            "rollouts_seen": "train/rollouts_seen",
-            "action_tokens_seen": "train/action_tokens_seen",
-            "optimizer_steps": "train/optimizer_steps",
-            "success_rate": "train/success_rate",
-            "tool_call_rate": "train/tool_call_rate",
-            "invalid_call_rate": "train/invalid_call_rate",
-            "mean_turns": "train/mean_turns",
-            "rollouts_per_second": "performance/rollouts_per_second",
-            "generation_eos_rate": "eval/gen_raw/eos_rate",
-            "generation_max_length_rate": "eval/gen_raw/max_length_rate",
-            "generation_loop_rate": "eval/gen_raw/loop_rate",
-            "generation_repeated_4gram_fraction": "eval/gen_raw/repeated_4gram_fraction",
-            "generation_task_pass_rate": "eval/gen_raw/task_pass_rate",
-            "generation_prompt_echo_rate": "eval/gen_raw/prompt_echo_rate",
-            "generation_special_token_leak_rate": "eval/gen_raw/special_token_leak_rate",
-            "generation_think_leak_rate": "eval/gen_raw/think_leak_rate",
-            "generation_average_tokens": "eval/gen_raw/average_tokens",
-            "generation_quality_score": "eval/gen_raw/quality_score",
-            "best_quality_score": "eval/best_quality_score",
-            "best_quality_step": "eval/best_quality_step",
-        }
-        for source, target in optional_metrics.items():
+        for prefix, names in (
+            ("train", (
+                "examples_seen", "pairs_seen", "target_tokens_seen", "grad_was_clipped", "grad_clip_fraction",
+                "preference_accuracy", "reward_accuracy", "reward_margin", "chosen_reward", "rejected_reward",
+                "policy_chosen_logp", "policy_rejected_logp", "policy_logp_margin", "reference_logp_margin",
+                "policy_preference_accuracy", "reward_mean", "reward_std", "reward_max", "policy_loss", "kl",
+                "clip_fraction", "zero_advantage_group_rate", "prompts_seen", "rollouts_seen",
+                "action_tokens_seen", "optimizer_steps", "success_rate", "tool_call_rate", "invalid_call_rate", "mean_turns",
+            )),
+            ("performance", (
+                "update_seconds", "tokens_per_second", "supervised_tokens_per_second", "samples_per_second",
+                "pairs_per_second", "cuda_peak_memory_mb", "rollouts_per_second",
+            )),
+            ("eval", ("best_quality_score", "best_quality_step")),
+        ):
+            values.update({f"{prefix}/{name}": metric[name] for name in names if name in metric})
+        for name in (
+            "eos_rate", "max_length_rate", "loop_rate", "repeated_4gram_fraction", "task_pass_rate",
+            "prompt_echo_rate", "special_token_leak_rate", "think_leak_rate", "average_tokens", "quality_score",
+        ):
+            source = f"generation_{name}"
             if source in metric:
-                values[target] = metric[source]
+                values[f"eval/gen_raw/{name}"] = metric[source]
         if "validation_loss" in metric:
             values["eval/loss"] = metric["validation_loss"]
             values["eval/best_loss"] = metric["best_val_loss"]
             if "perplexity" in metric:
                 values["eval/perplexity"] = metric["perplexity"]
-            if "validation_token_accuracy" in metric:
-                values["eval/token_accuracy"] = metric["validation_token_accuracy"]
-            if "validation_target_tokens" in metric:
-                values["eval/target_tokens"] = metric["validation_target_tokens"]
-            dpo_validation_metrics = {
-                "validation_reward_accuracy": "eval/reward_accuracy",
-                "validation_reward_margin": "eval/reward_margin",
-                "validation_chosen_reward": "eval/chosen_reward",
-                "validation_rejected_reward": "eval/rejected_reward",
-                "validation_policy_logp_margin": "eval/policy_logp_margin",
-                "validation_reference_logp_margin": "eval/reference_logp_margin",
-                "validation_policy_preference_accuracy": "eval/policy_preference_accuracy",
-                "validation_pairs": "eval/pairs",
-                "validation_chosen_tokens": "eval/chosen_tokens",
-                "validation_rejected_tokens": "eval/rejected_tokens",
-            }
-            for source, target in dpo_validation_metrics.items():
+            for name in (
+                "token_accuracy", "target_tokens", "reward_accuracy", "reward_margin", "chosen_reward",
+                "rejected_reward", "policy_logp_margin", "reference_logp_margin", "policy_preference_accuracy",
+                "pairs", "chosen_tokens", "rejected_tokens",
+            ):
+                source = f"validation_{name}"
                 if source in metric:
-                    values[target] = metric[source]
-        rl_validation_metrics = {
-            "validation_reward": "eval/reward",
-            "validation_exact_match": "eval/exact_match",
-            "validation_success_rate": "eval/success_rate",
-            "validation_tool_call_rate": "eval/tool_call_rate",
-            "validation_invalid_call_rate": "eval/invalid_call_rate",
-            "validation_mean_turns": "eval/mean_turns",
-            "best_validation_reward": "eval/best_reward",
-        }
-        for source, target in rl_validation_metrics.items():
+                    values[f"eval/{name}"] = metric[source]
+        for name in ("reward", "exact_match", "success_rate", "tool_call_rate", "invalid_call_rate", "mean_turns"):
+            source = f"validation_{name}"
             if source in metric:
-                values[target] = metric[source]
+                values[f"eval/{name}"] = metric[source]
+        if "best_validation_reward" in metric:
+            values["eval/best_reward"] = metric["best_validation_reward"]
         return values
 
     def _schedule_retry(self, step: int) -> None:

@@ -3,6 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from dataset.file_utils import path_identity
 from dataset.rl_dataset import prompt_in_validation
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import DEFAULT_TOKENIZER_PATH, load_tokenizer
@@ -26,10 +27,10 @@ class RLEvaluationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data = root / "rl.jsonl"
-            data.write_text(json.dumps({
+            data.write_bytes((json.dumps({
                 "conversations": [{"role": "user", "content": prompt}],
                 "gt": ["4"],
-            }) + "\n", encoding="utf-8")
+            }) + "\r\n\r\n").encode("utf-8"))
             checkpoint = save_checkpoint(
                 root / "model.pt",
                 MiniScaleForCausalLM(config),
@@ -50,6 +51,7 @@ class RLEvaluationTests(unittest.TestCase):
             )
             self.assertTrue(report_path.is_file())
             self.assertEqual(len(report["results"]), 1)
+            self.assertEqual(report["data"]["identity"]["source"], path_identity(data))
             self.assertIn("sha256", report["results"][0]["identity"])
 
 

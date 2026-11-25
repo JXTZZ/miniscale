@@ -4,8 +4,6 @@ import unittest
 import torch
 
 from dataset.lm_dataset import (
-    PretrainDataset,
-    SFTDataset,
     collate_lm_batch,
     reservoir_sample_lm_batches,
 )
@@ -103,22 +101,25 @@ class ModelAndDataTests(unittest.TestCase):
         with torch.no_grad():
             first_logits = self.model(first).logits[:, :3]
             second_logits = self.model(second).logits[:, :3]
+            masked_logits = self.model(first, attention_mask=torch.ones_like(first)).logits[:, :3]
         torch.testing.assert_close(first_logits, second_logits)
+        torch.testing.assert_close(first_logits, masked_logits)
 
     def test_sft_masks_non_assistant_tokens(self) -> None:
-        dataset = SFTDataset(
-            [[{"role": "user", "content": "2+2?"}, {"role": "assistant", "content": "4"}]],
-            self.tokenizer,
+        _, labels = self.tokenizer.encode_sft(
+            [{"role": "user", "content": "2+2?"}, {"role": "assistant", "content": "4"}],
         )
-        example = dataset[0]
-        self.assertGreater(int((example["labels"] == -100).sum()), 0)
-        self.assertGreater(int((example["labels"] != -100).sum()), 0)
+        self.assertIn(-100, labels)
+        self.assertGreater(sum(label != -100 for label in labels), 0)
 
     def test_collate_pads_labels_with_ignore_index(self) -> None:
-        dataset = PretrainDataset(["abc", "a much longer example"], self.tokenizer, sequence_length=8)
-        batch = collate_lm_batch([dataset[0], dataset[-1]])
-        self.assertEqual(batch["input_ids"].shape, batch["labels"].shape)
-        self.assertEqual(batch["attention_mask"].shape, batch["labels"].shape)
+        batch = collate_lm_batch([
+            {"input_ids": torch.tensor(ids), "labels": torch.tensor(ids)}
+            for ids in ([1, 4, 2], [1, 2])
+        ])
+        self.assertEqual(batch["input_ids"].tolist(), [[1, 4, 2], [1, 2, 0]])
+        self.assertEqual(batch["labels"].tolist(), [[1, 4, 2], [1, 2, -100]])
+        self.assertEqual(batch["attention_mask"].tolist(), [[1, 1, 1], [1, 1, 0]])
 
     def test_validation_reservoir_is_deterministic_and_spans_stream(self) -> None:
         examples = [

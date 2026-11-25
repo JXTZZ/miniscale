@@ -23,8 +23,7 @@ from trainer.eval_utils import (
     load_generation_suite,
 )
 from trainer.rl_utils import AgentRLOptions, GRPOOptions
-from trainer.train_agent import evaluate_agent
-from trainer.train_grpo import evaluate_grpo
+from trainer.rollout_engine import evaluate_agent, evaluate_grpo
 from trainer.trainer_utils import resolve_autocast_dtype, resolve_device
 
 

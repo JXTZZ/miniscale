@@ -7,13 +7,13 @@ import unittest
 
 import torch
 
+from dataset.lm_dataset import sample_indexed_batches
 from dataset.preference_dataset import (
-    IndexedPreferenceDataset,
-    PreferenceCorpusIndex,
     collate_preference_batch,
     encode_preference_pair,
-    fixed_preference_validation_batches,
+    IndexedPreferenceDataset,
     parse_preference_pair,
+    PreferenceCorpusIndex,
 )
 from model.tokenizer import ByteTokenizer
 from scripts.audit_data import audit_dpo_jsonl
@@ -123,15 +123,15 @@ class PreferenceDataTests(unittest.TestCase):
                 target_mode="reasoning_and_response",
             )
             collated = collate_preference_batch([dataset[0], dataset[1]], 0)
-            self.assertEqual(collated["chosen"]["input_ids"].shape, collated["rejected"]["input_ids"].shape)
-            first = fixed_preference_validation_batches(
-                dataset, batch_size=2, batches=2, pad_token_id=0, seed=9
+            self.assertEqual(collated["input_ids"].shape[0], 4)
+            first = sample_indexed_batches(
+                dataset, collate=collate_preference_batch, batch_size=2, batches=2, pad_token_id=0, seed=9
             )
-            second = fixed_preference_validation_batches(
-                dataset, batch_size=2, batches=2, pad_token_id=0, seed=9
+            second = sample_indexed_batches(
+                dataset, collate=collate_preference_batch, batch_size=2, batches=2, pad_token_id=0, seed=9
             )
             for left, right in zip(first, second, strict=True):
-                self.assertTrue(torch.equal(left["chosen"]["input_ids"], right["chosen"]["input_ids"]))
+                self.assertTrue(torch.equal(left["input_ids"], right["input_ids"]))
             dataset.close()
 
     def test_audit_reports_invalid_pairs_and_token_sample(self) -> None:

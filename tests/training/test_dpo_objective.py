@@ -6,16 +6,12 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from dataset.preference_dataset import (
-    PreferencePair,
-    collate_preference_batch,
-    encode_preference_pair,
-)
+from dataset.lm_dataset import collate_lm_batch
+from dataset.preference_dataset import collate_preference_batch, encode_preference_pair, PreferencePair
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer
-from trainer.train_dpo import (
+from trainer.preference_objective import (
     completion_log_probability,
-    concatenated_completion_log_probabilities,
     dpo_loss,
 )
 
@@ -74,10 +70,11 @@ class DPOObjectiveTests(unittest.TestCase):
     def test_concatenated_scoring_matches_independent_scoring(self) -> None:
         torch.manual_seed(7)
         model = MiniScaleForCausalLM(MiniScaleConfig.smoke()).eval()
-        batch = collate_preference_batch([example("q", "good", "bad")], 0)
-        chosen, rejected, _, _ = concatenated_completion_log_probabilities(model, batch)
-        self.assertTrue(torch.allclose(chosen, completion_log_probability(model, batch["chosen"])))
-        self.assertTrue(torch.allclose(rejected, completion_log_probability(model, batch["rejected"])))
+        pair = example("q", "good", "bad")
+        batch = collate_preference_batch([pair], 0)
+        chosen, rejected = completion_log_probability(model, batch).chunk(2)
+        torch.testing.assert_close(chosen, completion_log_probability(model, collate_lm_batch([pair["chosen"]])))
+        torch.testing.assert_close(rejected, completion_log_probability(model, collate_lm_batch([pair["rejected"]])))
 
     def test_pair_weighted_accumulation_matches_combined_batch(self) -> None:
         torch.manual_seed(11)
@@ -90,10 +87,8 @@ class DPOObjectiveTests(unittest.TestCase):
         for row in rows:
             batch = collate_preference_batch([row], 0)
             with torch.no_grad():
-                ref_chosen, ref_rejected, _, _ = concatenated_completion_log_probabilities(reference, batch)
-            policy_chosen, policy_rejected, _, _ = concatenated_completion_log_probabilities(
-                accumulated, batch
-            )
+                ref_chosen, ref_rejected = completion_log_probability(reference, batch).chunk(2)
+            policy_chosen, policy_rejected = completion_log_probability(accumulated, batch).chunk(2)
             loss, _ = dpo_loss(
                 policy_chosen, policy_rejected, ref_chosen, ref_rejected, beta=0.1
             )
@@ -101,8 +96,8 @@ class DPOObjectiveTests(unittest.TestCase):
 
         batch = collate_preference_batch(rows, 0)
         with torch.no_grad():
-            ref_chosen, ref_rejected, _, _ = concatenated_completion_log_probabilities(reference, batch)
-        policy_chosen, policy_rejected, _, _ = concatenated_completion_log_probabilities(combined, batch)
+            ref_chosen, ref_rejected = completion_log_probability(reference, batch).chunk(2)
+        policy_chosen, policy_rejected = completion_log_probability(combined, batch).chunk(2)
         loss, _ = dpo_loss(
             policy_chosen, policy_rejected, ref_chosen, ref_rejected, beta=0.1
         )

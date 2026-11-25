@@ -7,14 +7,15 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
-import random
 from typing import BinaryIO, Literal, Sequence
 
 from torch import Tensor
 import torch
 from torch.utils.data import Dataset
 
-from dataset.lm_dataset import assistant_has_target, collate_lm_batch
+from dataset.lm_dataset import collate_lm_batch
+from dataset.sft_dataset import assistant_has_target
+from dataset.file_utils import JsonlScan
 from model.tokenizer import Tokenizer
 
 
@@ -141,68 +142,58 @@ class PreferenceCorpusIndex:
         validation_offsets = array("Q")
         seen_pairs: set[bytes] = set()
         seen_prompts: set[bytes] = set()
-        raw_digest = hashlib.sha256()
-        size_bytes = 0
+        scan = JsonlScan(source_path)
         rows = valid = invalid = duplicates = contradictions = repeated_prompts = 0
 
-        with source_path.open("rb") as source:
-            line_number = 0
-            while True:
-                offset = source.tell()
-                line = source.readline()
-                if not line:
-                    break
-                line_number += 1
-                raw_digest.update(line)
-                size_bytes += len(line)
-                if not line.strip():
+        for line_number, offset, line in scan:
+            if not line.strip():
+                continue
+            rows += 1
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                raise ValueError(f"invalid JSON at {source_path}:{line_number}") from error
+            try:
+                pair = parse_preference_pair(
+                    row,
+                    target_mode=target_mode,
+                    location=f"{source_path}:{line_number}",
+                )
+            except ValueError:
+                invalid += 1
+                continue
+            valid += 1
+            digest = preference_pair_digest(pair.chosen, pair.rejected)
+            reverse_digest = preference_pair_digest(pair.rejected, pair.chosen)
+            if digest in seen_pairs:
+                duplicates += 1
+                if deduplicate_exact:
                     continue
-                rows += 1
-                try:
-                    row = json.loads(line)
-                except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                    raise ValueError(f"invalid JSON at {source_path}:{line_number}") from error
-                try:
-                    pair = parse_preference_pair(
-                        row,
-                        target_mode=target_mode,
-                        location=f"{source_path}:{line_number}",
-                    )
-                except ValueError:
-                    invalid += 1
+            elif reverse_digest in seen_pairs:
+                contradictions += 1
+                if deduplicate_exact:
                     continue
-                valid += 1
-                digest = preference_pair_digest(pair.chosen, pair.rejected)
-                reverse_digest = preference_pair_digest(pair.rejected, pair.chosen)
-                if digest in seen_pairs:
-                    duplicates += 1
-                    if deduplicate_exact:
-                        continue
-                elif reverse_digest in seen_pairs:
-                    contradictions += 1
-                    if deduplicate_exact:
-                        continue
-                else:
-                    seen_pairs.add(digest)
+            else:
+                seen_pairs.add(digest)
 
-                prompt_digest = preference_prompt_digest(pair.prompt)
-                if prompt_digest in seen_prompts:
-                    repeated_prompts += 1
-                else:
-                    seen_prompts.add(prompt_digest)
-                if destination == "train":
-                    validation = False
-                elif destination == "validation":
-                    validation = True
-                else:
-                    validation = _is_validation_prompt(prompt_digest, validation_fraction)
-                (validation_offsets if validation else train_offsets).append(offset)
+            prompt_digest = preference_prompt_digest(pair.prompt)
+            if prompt_digest in seen_prompts:
+                repeated_prompts += 1
+            else:
+                seen_prompts.add(prompt_digest)
+            if destination == "train":
+                validation = False
+            elif destination == "validation":
+                validation = True
+            else:
+                validation = _is_validation_prompt(prompt_digest, validation_fraction)
+            (validation_offsets if validation else train_offsets).append(offset)
 
         return cls(
             path=source_path,
             train_offsets=train_offsets,
             validation_offsets=validation_offsets,
-            identity={"kind": "file", "sha256": raw_digest.hexdigest(), "size_bytes": size_bytes},
+            identity=scan.identity,
             stats=PreferenceIndexStats(
                 rows=rows,
                 valid_pairs=valid,
@@ -371,38 +362,11 @@ class IndexedPreferenceDataset(Dataset[dict[str, dict[str, Tensor]]]):
 
 def collate_preference_batch(
     examples: Sequence[dict[str, dict[str, Tensor]]], pad_token_id: int
-) -> dict[str, dict[str, Tensor]]:
+) -> dict[str, Tensor]:
+    """Pad the chosen half followed by the rejected half for a single forward."""
     if not examples:
         raise ValueError("cannot collate an empty preference batch")
-    count = len(examples)
-    combined = collate_lm_batch(
+    return collate_lm_batch(
         [example[side] for side in ("chosen", "rejected") for example in examples],
         pad_token_id,
     )
-    return {
-        "chosen": {name: value[:count] for name, value in combined.items()},
-        "rejected": {name: value[count:] for name, value in combined.items()},
-    }
-
-
-def fixed_preference_validation_batches(
-    dataset: Dataset[dict[str, dict[str, Tensor]]],
-    *,
-    batch_size: int,
-    batches: int,
-    pad_token_id: int,
-    seed: int,
-) -> list[dict[str, dict[str, Tensor]]]:
-    if batch_size < 1 or batches < 1:
-        raise ValueError("batch_size and batches must be positive")
-    if not len(dataset):
-        raise ValueError("DPO validation split contains no pairs")
-    capacity = min(len(dataset), batch_size * batches)
-    selected = random.Random(seed).sample(range(len(dataset)), capacity)
-    return [
-        collate_preference_batch(
-            [dataset[index] for index in selected[start : start + batch_size]],
-            pad_token_id,
-        )
-        for start in range(0, capacity, batch_size)
-    ]

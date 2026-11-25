@@ -1,5 +1,6 @@
 from contextlib import redirect_stdout
 from io import StringIO
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,15 +11,9 @@ import torch
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer
 from trainer.checkpoint import load_checkpoint
-from trainer.train_pretrain import (
-    PretrainOptions,
-    SmokePretrainOptions,
-    build_parser,
-    build_pretrain_optimizer,
-    main,
-    run_pretrain,
-    run_pretrain_jsonl,
-)
+from trainer.lm_utils import build_lm_optimizer
+from trainer.run_utils import start_update
+from trainer.train_pretrain import build_parser, main, PretrainOptions, run_pretrain_jsonl
 from trainer.trainer_utils import resolve_autocast_dtype
 
 
@@ -100,7 +95,7 @@ class PretrainTests(unittest.TestCase):
 
     def test_optimizer_excludes_norms_and_tied_embedding_from_weight_decay(self) -> None:
         model = MiniScaleForCausalLM(MiniScaleConfig.smoke())
-        optimizer = build_pretrain_optimizer(model, PretrainOptions(steps=1))
+        optimizer = build_lm_optimizer(model, PretrainOptions(steps=1))
         groups = {group["group_name"]: group for group in optimizer.param_groups}
         decay_ids = {id(parameter) for parameter in groups["decay"]["params"]}
         no_decay_ids = {id(parameter) for parameter in groups["no_decay"]["params"]}
@@ -133,13 +128,27 @@ class PretrainTests(unittest.TestCase):
         model = MiniScaleForCausalLM(MiniScaleConfig.smoke())
         tokenizer = ByteTokenizer()
         with tempfile.TemporaryDirectory() as directory:
-            metrics = run_pretrain(
-                model,
-                tokenizer,
-                ["small models make training loops testable " * 4],
-                directory,
-                SmokePretrainOptions(steps=2, batch_size=1, sequence_length=48, device="cpu"),
-            )
+            data = Path(directory) / "pretrain.jsonl"
+            data.write_text(json.dumps({"text": "small models make training loops testable " * 4}) + "\n")
+            with (
+                patch.object(model, "forward", wraps=model.forward) as forward,
+                patch("trainer.train_pretrain.start_update", wraps=start_update) as timer,
+            ):
+                metrics = run_pretrain_jsonl(
+                    model, tokenizer, data, directory,
+                    PretrainOptions(
+                        steps=4, sequence_length=48, device="cpu", gradient_accumulation_steps=1,
+                        validation_fraction=0, log_every=3,
+                    ),
+                )
+            self.assertEqual(metrics["tokens_seen"], 192)
+            self.assertEqual(metrics["target_tokens_seen"], 188)
+            self.assertEqual(forward.call_count, 4)
+            self.assertTrue(all("attention_mask" not in call.kwargs for call in forward.call_args_list))
+            self.assertEqual(timer.call_count, 3)
+            rows = [json.loads(line) for line in Path(metrics["metrics"]).read_text().splitlines()]
+            self.assertEqual([row["step"] for row in rows], [1, 3, 4])
+            self.assertTrue(all(row["tokens_per_second"] > 0 for row in rows))
             checkpoint = Path(str(metrics["checkpoint"]))
             self.assertTrue(checkpoint.exists())
             restored = load_checkpoint(checkpoint)

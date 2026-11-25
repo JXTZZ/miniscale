@@ -1,10 +1,11 @@
+import json
 from pathlib import Path
 import tempfile
 import unittest
 
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer
-from trainer.train_full_sft import SFTOptions, SmokeSFTOptions, build_parser, run_sft
+from trainer.train_full_sft import build_parser, run_sft_jsonl, SFTOptions
 
 
 class SFTTests(unittest.TestCase):
@@ -72,12 +73,14 @@ class SFTTests(unittest.TestCase):
             ],
         ]
         with tempfile.TemporaryDirectory() as directory:
-            metrics = run_sft(
-                MiniScaleForCausalLM(MiniScaleConfig.smoke()),
-                ByteTokenizer(),
-                conversations,
-                directory,
-                SmokeSFTOptions(steps=2, batch_size=2, device="cpu"),
+            data = Path(directory) / "sft.jsonl"
+            data.write_text("".join(json.dumps({"conversations": row}) + "\n" for row in conversations))
+            metrics = run_sft_jsonl(
+                MiniScaleForCausalLM(MiniScaleConfig.smoke()), ByteTokenizer(), data, directory,
+                SFTOptions(
+                    steps=2, batch_size=2, device="cpu", gradient_accumulation_steps=1,
+                    validation_fraction=0, generation_every=0,
+                ),
             )
             self.assertTrue(Path(str(metrics["checkpoint"])).exists())
             self.assertGreater(float(metrics["loss"]), 0.0)
@@ -88,12 +91,14 @@ class SFTTests(unittest.TestCase):
             {"role": "assistant", "content": "kept"},
         ]]
         with tempfile.TemporaryDirectory() as directory:
-            run_sft(
-                MiniScaleForCausalLM(MiniScaleConfig.smoke()),
-                ByteTokenizer(),
-                conversations,
-                directory,
-                SmokeSFTOptions(steps=1, device="cpu"),
+            data = Path(directory) / "sft.jsonl"
+            data.write_text(json.dumps({"conversations": conversations[0]}) + "\n")
+            run_sft_jsonl(
+                MiniScaleForCausalLM(MiniScaleConfig.smoke()), ByteTokenizer(), data, directory,
+                SFTOptions(
+                    steps=1, max_length=128, device="cpu", gradient_accumulation_steps=1,
+                    validation_fraction=0, generation_every=0,
+                ),
             )
 
 

@@ -15,11 +15,11 @@ smoke_dir=$(mktemp -d artifacts/learn-smoke.XXXXXX)
 OMP_NUM_THREADS=1 uv run --frozen python scripts/smoke_pipeline.py \
   --device cpu --output "$smoke_dir"
 uv run --frozen python eval_llm.py \
-  --checkpoint "$smoke_dir/sft.pt" --prompt "2+3?" \
+  --checkpoint "$smoke_dir/sft.pt" --prompt "Return only the result: 2+3" \
   --device cpu --temperature 0 --max-new-tokens 8
 ```
 
-打开 `"$smoke_dir/pipeline_manifest.json"`，对照代码找出四个阶段各自的输入和产物。Smoke 使用内存样例和 `ByteTokenizer`，用来验证训练、保存和加载。观察推理报告中的 `response`、`generated_tokens` 和 `finish_reason`。正式 JSONL 链路包含 DPO，测试会在阶段交接时逐次加载上游权重。 [五阶段测试](../tests/training/test_jsonl_training_chain.py)
+打开 `"$smoke_dir/pipeline_manifest.json"`，对照代码找出四个阶段各自的输入和产物。Smoke 使用微型 JSONL 和 `ByteTokenizer` 验证正式训练、保存和加载。观察推理报告中的 `response`、`generated_tokens` 和 `finish_reason`。正式 JSONL 链路包含 DPO，测试会在阶段交接时逐次加载上游权重。 [五阶段测试](../tests/training/test_jsonl_training_chain.py)
 
 ```bash
 uv run --frozen python -m unittest \
@@ -77,8 +77,8 @@ cat "$run_dir/train/pretrain_metrics.jsonl"
 
 | 阶段 | 从哪里读 | 动手检查 |
 | --- | --- | --- |
-| SFT | [`HuggingFaceTokenizer.encode_sft`](../model/tokenizer.py) → [`IndexedJsonlSFTDataset`](../dataset/lm_dataset.py) → [`run_sft_jsonl`](../trainer/train_full_sft.py) | 把 `labels` 中非 `-100` 的位置解码，检查哪些 assistant token 被监督。 |
-| DPO | [`encode_preference_pair`](../dataset/preference_dataset.py) → [`completion_log_probability` 和 `dpo_loss`](../trainer/train_dpo.py) | 用四个固定 log-prob 手算 loss。把 policy 设为与 reference 相同，预期 margin 为 0、loss 为 `log(2)`。 |
+| SFT | [`HuggingFaceTokenizer.encode_sft`](../model/tokenizer.py) → [`IndexedJsonlSFTDataset`](../dataset/sft_dataset.py) → [`run_sft_jsonl`](../trainer/train_full_sft.py) | 把 `labels` 中非 `-100` 的位置解码，检查哪些 assistant token 被监督。 |
+| DPO | [`encode_preference_pair`](../dataset/preference_dataset.py) → [`completion_log_probability` 和 `dpo_loss`](../trainer/preference_objective.py) | 用四个固定 log-prob 手算 loss。把 policy 设为与 reference 相同，预期 margin 为 0、loss 为 `log(2)`。 |
 | GRPO | [`run_grpo`](../trainer/train_grpo.py) → [`collect_rollouts`](../trainer/rollout_engine.py) → [`normalize_group_rewards` 和 `grpo_objective`](../trainer/rl_utils.py) | 给同一题的三个回答设定奖励 `[0, 1, 2]`，推导组内优势的符号。找出用于比率裁剪的 `old_log_probs` 何时记录，以及冻结 reference 如何提供 KL 基线。 |
 | Agent RL | [`rollout_agent`](../trainer/rollout_engine.py) → [`CalculatorEnv`](../trainer/agent_env.py) → [`run_agent_grpo`](../trainer/train_agent.py) | 跟踪一次 `2+3` 的工具调用与返回值 `5`。检查工具观测如何进入后续上下文，以及 `observation_ranges` 对应的 action mask 为什么全为 0。 |
 
@@ -121,6 +121,13 @@ uv run --frozen python -m unittest \
 ```bash
 uv run --frozen python -m unittest \
   tests.training.test_pretrain_resume.PretrainResumeTests.test_periodic_checkpoint_retention_and_resume -v
+```
+
+接着读 `WandbTracker.log` 和 `_flush_pending`，跟踪指标从本地队列写入 W&B 的过程。下面的测试模拟上传中断，检查预训练从 checkpoint 复用原 run ID，并补传断联期间的指标。 [W&B 实现](../trainer/tracking.py)
+
+```bash
+uv run --frozen python -m unittest \
+  tests.runtime.test_tracking.TrackingTests.test_training_resume_reattaches_run_and_uploads_pending_metrics -v
 ```
 
 最后做一次只改一个变量的小实验。例如，在两步预训练命令里把 `--gradient-accumulation` 改为 `2`，用新的 `--output` 运行。先预测第二步的累计监督 token 数，再用 JSONL 核对，并解释为什么 optimizer 仍更新两次。阅读到这里，可以用 [阶段数据格式](../dataset/dataset.md) 和 [README 的正式训练命令](../README.md#用真实数据运行完整链路) 换成自己的数据。

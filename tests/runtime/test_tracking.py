@@ -1,10 +1,16 @@
+from dataclasses import replace
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
+from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
+from model.tokenizer import ByteTokenizer
+from trainer.checkpoint import read_checkpoint
 from trainer.tracking import WandbTracker
+from trainer.train_pretrain import PretrainOptions, run_pretrain_jsonl
 
 
 class FakeRun:
@@ -236,6 +242,74 @@ class TrackingTests(unittest.TestCase):
                 )
             self.assertIsNotNone(second)
             self.assertEqual([step for _, step in recovered_run.logged], [5])
+            self.assertFalse(pending.exists())
+
+    def test_training_resume_reattaches_run_and_uploads_pending_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus.jsonl"
+            corpus.write_text(
+                json.dumps({"text": "Training metrics survive outages. " * 4}) + "\n",
+                encoding="utf-8",
+            )
+            output = root / "run"
+            pending = output / "wandb_pending.jsonl"
+            options = PretrainOptions(
+                steps=2,
+                sequence_length=16,
+                gradient_accumulation_steps=1,
+                warmup_steps=0,
+                validation_fraction=0,
+                generation_every=0,
+                save_every=0,
+                device="cpu",
+                wandb_enabled=True,
+                wandb_retry_every_steps=10,
+            )
+            tokenizer = ByteTokenizer()
+            model = MiniScaleForCausalLM(MiniScaleConfig.smoke())
+            original_forward = model.forward
+            batches = 0
+
+            def interrupt_second_batch(*args: object, **kwargs: object):
+                nonlocal batches
+                batches += 1
+                if batches == 2:
+                    raise KeyboardInterrupt
+                return original_forward(*args, **kwargs)
+
+            recovered = FakeRun()
+            wandb = FakeWandb([FailingRun(), ConnectionError("still offline"), recovered])
+            # Keep PyTorch's lazy imports when restoring this one module.
+            if "wandb" in sys.modules:
+                self.addCleanup(sys.modules.__setitem__, "wandb", sys.modules["wandb"])
+            else:
+                self.addCleanup(sys.modules.pop, "wandb", None)
+            sys.modules["wandb"] = wandb
+            with (
+                patch.object(model, "forward", side_effect=interrupt_second_batch),
+                self.assertWarnsRegex(RuntimeWarning, "W&B upload failed"),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                run_pretrain_jsonl(
+                    model, tokenizer, corpus, output, replace(options, wandb_run_id="run-123")
+                )
+
+            checkpoint = output / "checkpoints/emergency_step_00000001.pt"
+            self.assertEqual(read_checkpoint(checkpoint)["training_state"]["wandb_run_id"], "run-123")
+            self.assertTrue(pending.is_file())
+
+            result = run_pretrain_jsonl(
+                MiniScaleForCausalLM(MiniScaleConfig.smoke()),
+                tokenizer,
+                corpus,
+                output,
+                replace(options, resume_from=checkpoint),
+            )
+
+            self.assertEqual(wandb.init_calls[-1]["id"], "run-123")
+            self.assertEqual(result["wandb_run_id"], "run-123")
+            self.assertEqual([step for _, step in recovered.logged], [1, 2])
             self.assertFalse(pending.exists())
 
 

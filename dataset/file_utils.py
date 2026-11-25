@@ -53,6 +53,27 @@ def atomic_write_json(path: str | Path, value: dict[str, object]) -> Path:
     return atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
+class JsonlScan:
+    """Scan raw lines with byte offsets and fingerprint the bytes consumed."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.identity: dict[str, object] = {}
+
+    def __iter__(self) -> Iterator[tuple[int, int, bytes]]:
+        digest = hashlib.sha256()
+        offset = 0
+        with self.path.open("rb") as source:
+            expected_size = os.fstat(source.fileno()).st_size
+            for line_number, line in enumerate(source, 1):
+                digest.update(line)
+                yield line_number, offset, line
+                offset += len(line)
+        if offset != expected_size:
+            raise RuntimeError(f"input changed while scanning: {self.path}")
+        self.identity = {"kind": "file", "sha256": digest.hexdigest(), "size_bytes": offset}
+
+
 def _update_hash_from_file(digest: Any, path: Path) -> int:
     size = 0
     with path.open("rb") as source:

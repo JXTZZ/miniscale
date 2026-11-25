@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 import pickle
 import random
+import warnings
 
 import numpy as np
 import torch
 
-from dataset.file_utils import atomic_output_path
+from dataset.file_utils import atomic_output_path, path_identity
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 
 
 TRAINING_CHECKPOINT_FORMAT_VERSION = 2
+PRETRAIN_RESUME_SIGNATURE_VERSION = 2
 
 
 class _CheckpointUnpickler(pickle.Unpickler):
@@ -178,3 +181,152 @@ def signature_differences(
                 differences.update(signature_differences(saved[name], current[name], path))
         return differences
     return {} if saved == current else {prefix: (saved, current)}
+
+
+def migrate_legacy_single_group_optimizer(
+    payload: dict[str, object],
+    model: MiniScaleForCausalLM,
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, object]:
+    """Map an old model-order AdamW state onto the current named groups."""
+
+    saved_optimizer = payload.get("optimizer")
+    if not isinstance(saved_optimizer, dict):
+        raise ValueError("checkpoint optimizer state must be a mapping")
+    saved_groups = saved_optimizer.get("param_groups")
+    saved_state = saved_optimizer.get("state")
+    if not isinstance(saved_groups, list) or not isinstance(saved_state, dict):
+        raise ValueError("checkpoint optimizer state has invalid groups or state")
+    if len(saved_groups) == len(optimizer.param_groups):
+        return payload
+    if len(saved_groups) != 1 or not isinstance(saved_groups[0], dict):
+        raise ValueError(
+            "legacy optimizer parameter groups cannot be migrated automatically; "
+            f"checkpoint has {len(saved_groups)} groups, expected 1"
+        )
+
+    saved_ids = saved_groups[0].get("params")
+    model_parameters = list(model.parameters())
+    if not isinstance(saved_ids, list) or len(saved_ids) != len(model_parameters):
+        raise ValueError("legacy optimizer parameter order does not match the current model")
+    saved_id_by_parameter = {
+        id(parameter): saved_id for parameter, saved_id in zip(model_parameters, saved_ids, strict=True)
+    }
+
+    current_optimizer = optimizer.state_dict()
+    current_groups = current_optimizer["param_groups"]
+    migrated_state: dict[object, object] = {}
+    migrated_groups: list[dict[str, object]] = []
+    source_group = saved_groups[0]
+    for live_group, serialized_group in zip(optimizer.param_groups, current_groups, strict=True):
+        current_ids = serialized_group["params"]
+        for parameter, current_id in zip(live_group["params"], current_ids, strict=True):
+            saved_id = saved_id_by_parameter[id(parameter)]
+            if saved_id in saved_state:
+                migrated_state[current_id] = saved_state[saved_id]
+        migrated_group = dict(serialized_group)
+        for name, value in source_group.items():
+            if name not in {"params", "weight_decay", "group_name"}:
+                migrated_group[name] = value
+        migrated_groups.append(migrated_group)
+
+    scheduler_state = payload.get("scheduler")
+    migrated_scheduler = dict(scheduler_state) if isinstance(scheduler_state, dict) else scheduler_state
+    if isinstance(migrated_scheduler, dict):
+        group_count = len(migrated_groups)
+        for name in ("base_lrs", "_last_lr", "lr_lambdas"):
+            value = migrated_scheduler.get(name)
+            if isinstance(value, list) and len(value) == 1:
+                migrated_scheduler[name] = value * group_count
+
+    migrated = dict(payload)
+    migrated["optimizer"] = {"state": migrated_state, "param_groups": migrated_groups}
+    migrated["scheduler"] = migrated_scheduler
+    warnings.warn(
+        "migrated legacy single-group AdamW state to decay/no-decay parameter groups",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return migrated
+
+
+def validate_pretrain_signature(
+    saved: object,
+    current: dict[str, object],
+    *,
+    allow_legacy: bool = False,
+) -> None:
+    if not isinstance(saved, dict):
+        raise ValueError("checkpoint resume_signature must be a mapping")
+    if saved.get("signature_version") != PRETRAIN_RESUME_SIGNATURE_VERSION:
+        if not allow_legacy:
+            raise ValueError(
+                "checkpoint predates strict resume identity checks; pass "
+                "--allow-legacy-resume once to accept the documented migration risk"
+            )
+        warnings.warn(
+            "resuming a legacy checkpoint without verified data/tokenizer/model identity; "
+            "the next checkpoint will be upgraded to the current format",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        comparable = {
+            name: value
+            for name, value in saved.items()
+            if name in current and name not in {"signature_version", "implementation_version"}
+        }
+        mismatches = signature_differences(comparable, {name: current[name] for name in comparable})
+    else:
+        mismatches = signature_differences(saved, current)
+    if mismatches:
+        raise ValueError(f"resume options do not match checkpoint: {mismatches}")
+
+
+
+def read_strict_checkpoint(path, device, stage: str, label: str):
+    if path is None:
+        return None, {}
+    payload = read_training_checkpoint(path, device)
+    if payload.get("stage") != stage:
+        raise ValueError(f"--resume requires a full {label} checkpoint")
+    state = payload["training_state"]
+    if not isinstance(state, dict) or not isinstance(state.get("resume_signature"), dict):
+        raise ValueError(f"{label} checkpoint does not contain a strict resume signature")
+    return payload, state
+
+
+def check_resume_signature(saved, current, label: str) -> None:
+    if saved is not None:
+        differences = signature_differences(saved, current)
+        if differences:
+            raise ValueError(f"{label} resume options do not match checkpoint: {differences}")
+
+
+def load_reference(path, stage, identity, device, model, label):
+    if identity is None or path_identity(path) != identity:
+        raise ValueError(f"{label} frozen reference snapshot does not match the resume checkpoint")
+    payload = read_checkpoint(path, device)
+    if payload.get("stage") != f"{stage}_reference":
+        raise ValueError(f"{label} reference snapshot has an invalid stage")
+    model.load_state_dict(payload["model"])
+
+
+def resume_pretrain(model, optimizer, scheduler, signature, options, device):
+    if options.resume_from is None:
+        return None
+    payload = read_training_checkpoint(options.resume_from, device)
+    if payload.get("stage") != "pretrain":
+        raise ValueError("--resume must point to a full pretrain checkpoint")
+    state = payload["training_state"]
+    if not isinstance(state, dict):
+        raise ValueError("checkpoint training_state must be a mapping")
+    saved_signature = state.get("resume_signature")
+    validate_pretrain_signature(saved_signature, signature, allow_legacy=options.allow_legacy_resume)
+    if saved_signature.get("signature_version") != PRETRAIN_RESUME_SIGNATURE_VERSION:
+        payload = migrate_legacy_single_group_optimizer(payload, model, optimizer)
+    restore_training_checkpoint(payload, model, optimizer, scheduler, restore_rng=False)
+    return payload
+
+
+def freeze_reference(model: MiniScaleForCausalLM, device: torch.device) -> MiniScaleForCausalLM:
+    return deepcopy(model).to(device).eval().requires_grad_(False)

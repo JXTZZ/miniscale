@@ -1,8 +1,7 @@
 # Production pretraining contract
 
-正式入口 `uv run python trainer/train_pretrain.py --steps ...` 调用同一文件中的
-`run_pretrain_jsonl`。内存 smoke 流水线通过 `scripts/smoke_pipeline.py` 调用
-`run_pretrain`。
+正式入口 `uv run python trainer/train_pretrain.py --steps ...` 与
+`scripts/smoke_pipeline.py` 共用 `run_pretrain_jsonl`。
 
 ## Objective and sequence construction
 
@@ -15,10 +14,11 @@ doc B: [BOS, B1, EOS]
 stream: [BOS, A1, A2, EOS, BOS, B1, EOS, ...]
 ```
 
-`input_ids` 与 `labels` 起初相同。模型内部用 `logits[:, :-1]` 对齐 `labels[:, 1:]`，padding label
-在 collate 时写成 `-100` 并由 cross entropy 忽略。正式训练的完整 block 通常无需 padding；固定长度
-validation reservoir 最后一批可能较小，但不会凭空添加监督 target。packing 允许跨文档预测 EOS 后的
-BOS，这是当前明确选择，不是 document-isolated attention。
+`input_ids` 与 `labels` 起初相同。模型内部用 `logits[:, :-1]` 对齐 `labels[:, 1:]`。训练和验证均直接
+堆叠等长 block，SDPA 使用内建的 causal mask。验证的最后一批可以包含更少的 block，每个 block 仍保持
+同一长度。packing 保留 EOS 后预测下一篇文章 BOS 的目标。
+
+预训练默认关闭周期文本生成。需要训练中探针时，通过 `--generation-every N` 启用。
 
 ## Data and audit
 

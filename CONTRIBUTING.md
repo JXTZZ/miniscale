@@ -19,7 +19,7 @@ uv run --frozen python -m unittest discover -s tests -v
 ## 代码边界
 
 - `model/`、`dataset/`、`trainer/` 和 `scripts/` 同时是源码目录与可安装模块。
-- `trainer/train_pretrain.py` 的正式入口调用 `run_pretrain_jsonl`。`run_pretrain` 供内存 smoke 流水线使用。
+- 正式入口和 smoke 流水线共用 `run_pretrain_jsonl` 与 `run_sft_jsonl`。Smoke 写入微型 JSONL。
 - 生产训练参数的默认值由各阶段 Options 定义，CLI 从对应的数据类读取。
 - 模型配置属于 checkpoint 格式的一部分；加载 checkpoint 时不要用隐式默认值替换保存的配置。
 - 数据顺序、优化器、精度、scheduler、初始化或 loss 语义的变化必须进入 resume identity；必要时提升

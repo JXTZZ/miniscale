@@ -12,12 +12,8 @@ import torch
 import torch.nn.functional as F
 
 from model.model_miniscale import MiniScaleForCausalLM
-from trainer.trainer_utils import (
-    add_optimizer_arguments,
-    add_wandb_arguments,
-    autocast_context,
-    option_default,
-)
+from trainer.cli import add_optimizer_arguments, add_wandb_arguments, option_default
+from trainer.trainer_utils import autocast_context
 
 
 @dataclass(slots=True)
