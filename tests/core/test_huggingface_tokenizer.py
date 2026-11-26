@@ -20,8 +20,8 @@ from model.tokenizer import (
 from scripts.inference import GenerationOptions, generate_from_checkpoint
 from scripts.inspect_tokenizer import main
 from trainer.checkpoint import save_checkpoint
-from trainer.rl_utils import AgentRLOptions
-from trainer.rollout_engine import rollout_agent
+from trainer.rl.options import AgentRLOptions
+from trainer.rl.rollout import rollout_agent
 
 
 TOKENIZER_DIR = DEFAULT_TOKENIZER_PATH

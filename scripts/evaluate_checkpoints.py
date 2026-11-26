@@ -22,9 +22,9 @@ from trainer.eval_utils import (
     evaluate_sft_generation_quality,
     load_generation_suite,
 )
-from trainer.rl_utils import AgentRLOptions, GRPOOptions
-from trainer.rollout_engine import evaluate_agent, evaluate_grpo
-from trainer.trainer_utils import resolve_autocast_dtype, resolve_device
+from trainer.rl.options import AgentRLOptions, GRPOOptions
+from trainer.rl.rollout import evaluate_agent, evaluate_grpo
+from trainer.runtime.torch_utils import resolve_autocast_dtype, resolve_device
 
 
 def evaluate_rl_checkpoints(

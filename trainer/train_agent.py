@@ -6,9 +6,6 @@ import argparse
 from pathlib import Path
 import sys
 
-from torch import Tensor
-import torch
-
 # Support running this file directly as well as with python -m.
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -17,25 +14,10 @@ from dataset.rl_dataset import build_agent_corpus, CalculatorTask, DEFAULT_RL_DA
 from model.model_miniscale import MiniScaleForCausalLM
 from model.tokenizer import Tokenizer
 from trainer.cli import option_default, run_checkpoint_stage, training_parser
-from trainer.policy_training import load_policy_data, run_policy
-from trainer.rl_utils import add_rl_arguments, AgentRLOptions
-from trainer.rollout_engine import AgentTrajectory, evaluate_agent, rollout_agent
-
-
-def _collate_trajectories(
-    trajectories: list[AgentTrajectory], pad_token_id: int, device: torch.device
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    max_length = max(len(item.input_ids) for item in trajectories)
-    input_ids = torch.full((len(trajectories), max_length), pad_token_id, dtype=torch.long, device=device)
-    attention_mask = torch.zeros_like(input_ids)
-    action_mask = torch.zeros((len(trajectories), max_length - 1), dtype=torch.float32, device=device)
-    for row, trajectory in enumerate(trajectories):
-        length = len(trajectory.input_ids)
-        input_ids[row, :length] = torch.tensor(trajectory.input_ids, device=device)
-        attention_mask[row, :length] = 1
-        action_mask[row, : length - 1] = torch.tensor(trajectory.action_mask[1:], device=device)
-    rewards = torch.tensor([item.reward for item in trajectories], dtype=torch.float32, device=device)
-    return input_ids, attention_mask, action_mask, rewards
+from trainer.rl.training import load_policy_data, run_policy
+from trainer.cli import add_rl_arguments
+from trainer.rl.options import AgentRLOptions
+from trainer.rl.rollout import collate_rollouts, evaluate_agent, rollout_agent
 
 
 def _collect_batch(model, tokenizer, tasks, options, device, autocast_dtype):
@@ -50,7 +32,11 @@ def _collect_batch(model, tokenizer, tasks, options, device, autocast_dtype):
         "invalid_call_rate": sum(item.invalid_calls > 0 for item in trajectories) / count,
         "mean_turns": sum(item.turns for item in trajectories) / count,
     }
-    return _collate_trajectories(trajectories, tokenizer.pad_token_id, device), metrics
+    batch = collate_rollouts(
+        [item.input_ids for item in trajectories], [item.action_mask for item in trajectories],
+        [item.reward for item in trajectories], tokenizer.pad_token_id, device,
+    )
+    return batch, metrics
 
 
 def run_agent_grpo(

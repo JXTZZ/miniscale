@@ -19,7 +19,7 @@ from trainer.eval_utils import (
     SFT_GENERATION_METRICS_VERSION,
     SFT_GENERATION_PROMPTS,
 )
-from trainer.trainer_utils import autocast_context
+from trainer.runtime.torch_utils import autocast_context
 
 
 @torch.no_grad()

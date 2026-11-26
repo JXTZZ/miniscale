@@ -30,6 +30,21 @@ class ModelAndDataTests(unittest.TestCase):
         output.loss.backward()
         self.assertIsNotNone(self.model.embedding.weight.grad)
 
+    def test_kv_cache_matches_full_context_and_sliding_generation(self) -> None:
+        self.config.max_position_embeddings = 8
+        self.model.eval()
+        ids = torch.randint(4, self.config.vocab_size, (2, 7))
+        with torch.no_grad():
+            prefill = self.model(ids[:, :4], use_cache=True)
+            continued = self.model(ids[:, 4:], past_key_values=prefill.past_key_values)
+            torch.testing.assert_close(continued.logits, self.model(ids).logits[:, 4:])
+        self.assertEqual(prefill.past_key_values[0][0].shape, (2, 2, 4, 8))
+        options = dict(max_new_tokens=5, temperature=0, eos_token_id=-1)
+        torch.testing.assert_close(
+            self.model.generate(ids, **options, use_cache=True),
+            self.model.generate(ids, **options),
+        )
+
     def test_no_repeat_ngram_blocks_completion_loops(self) -> None:
         def repeated_forward(input_ids: torch.Tensor, **_kwargs: object) -> object:
             logits = torch.zeros(

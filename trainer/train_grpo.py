@@ -14,9 +14,10 @@ from dataset.rl_dataset import build_rl_corpus, DEFAULT_RL_DATA, RLTask
 from model.model_miniscale import MiniScaleForCausalLM
 from model.tokenizer import Tokenizer
 from trainer.cli import run_checkpoint_stage, training_parser
-from trainer.policy_training import load_policy_data, run_policy
-from trainer.rl_utils import add_rl_arguments, GRPOOptions
-from trainer.rollout_engine import collect_rollouts, evaluate_grpo
+from trainer.rl.training import load_policy_data, run_policy
+from trainer.cli import add_rl_arguments
+from trainer.rl.options import GRPOOptions
+from trainer.rl.rollout import collect_rollouts, evaluate_grpo
 
 
 def _collect_batch(model, tokenizer, tasks, options, device, autocast_dtype):
@@ -65,6 +66,7 @@ def run_grpo_jsonl(
 def build_parser() -> argparse.ArgumentParser:
     parser = training_parser('Run GRPO with verifiable math rewards.', 'grpo', DEFAULT_RL_DATA, GRPOOptions)
     add_rl_arguments(parser, GRPOOptions)
+    parser.add_argument("--batch-rollouts", action="store_true", help="sample one prompt's candidates together")
     return parser
 
 

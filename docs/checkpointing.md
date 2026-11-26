@@ -35,6 +35,28 @@ Every run writes a stage manifest such as `pretrain_run.json`, with its resolved
 recipe and input identities. Full checkpoints include the same identity plus model,
 optimizer, scheduler, progress counters, and Python/NumPy/PyTorch/CUDA RNG state.
 
+Emergency checkpoints are written before an optimizer update or after the
+whole step completes. An interrupt during an update or its validation falls
+back to the latest checkpoint successfully written by the run, when one exists.
+
+SFT best-loss checkpoints include any generation and early-stopping state from
+the same step. When an older best-loss checkpoint is missing that state, resume
+replays that step's deterministic generation evaluation. A checkpoint that
+already reached early stopping can initialize a new run via `--checkpoint`.
+
+On resume, the local W&B upload queue drops events newer than the checkpoint.
+Metrics already uploaded to W&B remain in the remote run history.
+
+Agent RL's Python API fingerprints the complete in-memory task definition.
+Older in-memory Agent checkpoints can initialize a new run via `--checkpoint`.
+JSONL checkpoints continue to use the source-file identity.
+
+LoRA checkpoints save the frozen base, the adapter tensors, and the adapter
+settings. Repeat the same LoRA arguments for SFT resume. Inference and stage
+initialization load the merged weights. The RL resume signature also records
+enabled CISPO, batched sampling, and KV cache options because they can affect
+the training trajectory.
+
 ## Checkpoints from the previous layout
 
 The checkpoint reader accepts the old serialized `miniscale.config.MiniScaleConfig`

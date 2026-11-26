@@ -8,7 +8,7 @@ import operator
 import re
 
 from dataset.rl_dataset import CALCULATOR_NAMES, CalculatorTask
-from trainer.rewards import MathReward, score_math_answer
+from trainer.rl.rewards import MathReward, score_math_answer
 
 
 @dataclass(frozen=True, slots=True)

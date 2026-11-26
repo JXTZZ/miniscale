@@ -8,7 +8,7 @@ from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer, SentencePieceTokenizer
 from scripts.inference import GenerationOptions, generate_from_checkpoint
 from trainer.checkpoint import load_checkpoint, save_checkpoint
-from trainer.rl_utils import AgentRLOptions, GRPOOptions
+from trainer.rl.options import AgentRLOptions, GRPOOptions
 from trainer.train_agent import run_agent_grpo_jsonl
 from trainer.train_dpo import DPOOptions, run_dpo_jsonl
 from trainer.train_full_sft import SFTOptions, run_sft_jsonl

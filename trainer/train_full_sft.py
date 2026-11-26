@@ -27,6 +27,7 @@ from dataset.sft_dataset import (
     SFTCorpusIndex,
 )
 from model.model_miniscale import MiniScaleForCausalLM
+from model.lora import enable_lora
 from model.tokenizer import Tokenizer
 from trainer.checkpoint import check_resume_signature, read_strict_checkpoint, restore_training_checkpoint
 from trainer.cli import add_finetune_arguments, option_default, run_checkpoint_stage, training_parser
@@ -46,9 +47,9 @@ from trainer.lm_utils import (
     validate_model_tokenizer,
     validation_identity,
 )
-from trainer.run_utils import (
+from trainer.runtime.run import (
     check_resume_progress,
-    emergency_checkpoint,
+    TrainingStep,
     mirror_checkpoint,
     restore_batches,
     RunArtifacts,
@@ -60,7 +61,7 @@ from trainer.run_utils import (
     update_duration,
 )
 from trainer.sft_eval import evaluate_sft, run_sft_generation_evaluation, SFTQuality
-from trainer.trainer_utils import autocast_context, resolve_autocast_dtype, resolve_device, seed_everything
+from trainer.runtime.torch_utils import autocast_context, resolve_autocast_dtype, resolve_device, seed_everything
 
 
 SFT_RESUME_SIGNATURE_VERSION = 1
@@ -117,11 +118,21 @@ class SFTOptions:
     wandb_mode: str = "online"
     wandb_retry_every_steps: int = 200
     resume_from: str | Path | None = None
+    lora_rank: int = 0
+    lora_alpha: float | None = None
 
 
 def validate_sft_options(options: SFTOptions, model, tokenizer) -> int:
     validate_lm_options(options)
     validate_model_tokenizer(model, tokenizer)
+    if options.lora_rank < 0:
+        raise ValueError("lora_rank must be non-negative")
+    if options.lora_alpha is not None and (
+        not options.lora_rank or not math.isfinite(options.lora_alpha) or options.lora_alpha <= 0
+    ):
+        raise ValueError("lora_alpha requires a positive rank and must be finite and positive")
+    if model.lora_config is not None and not options.lora_rank:
+        raise ValueError("an adapter model requires matching LoRA options")
     if options.generation_every and options.generation_suite is not None and not Path(
         options.generation_suite
     ).is_file():
@@ -150,6 +161,7 @@ def sft_resume_signature(
 ) -> dict[str, object]:
     return {
         **lm_resume_signature(options, model, tokenizer, resolved_precision),
+        **({"lora": model.lora_config} if model.lora_config is not None else {}),
         "signature_version": SFT_RESUME_SIGNATURE_VERSION,
         "implementation_version": SFT_IMPLEMENTATION_VERSION,
         "max_length": max_length,
@@ -215,6 +227,8 @@ def run_sft_jsonl(
         raise ValueError("early stopping requires a non-empty validation dataset")
 
     model.to(device).train()
+    if options.lora_rank:
+        enable_lora(model, options.lora_rank, options.lora_alpha or float(options.lora_rank))
     optimizer = build_lm_optimizer(model, options)
     scheduler = lm_scheduler(optimizer, options)
 
@@ -249,17 +263,39 @@ def run_sft_jsonl(
     examples_seen = int(state.get("examples_seen", progress.micro_batches * options.batch_size))
     clipped_steps = int(state.get("clipped_steps", 0))
     quality = SFTQuality.from_checkpoint(state)
+    stop_reason = None
     if payload is not None:
         check_resume_progress(progress.step, options.steps, options.wandb_run_id, progress.wandb_run_id)
+        if state.get("early_stop_reason") or progress.last_metrics.get("stopped_early"):
+            raise ValueError("SFT checkpoint already reached early stopping. Use --checkpoint to start a new run.")
         restore_training_checkpoint(payload, model, optimizer, scheduler, restore_rng=False)
+    batches = restore_batches(loader, progress.micro_batches, payload)
+    if payload is not None:
+        if (
+            "early_stop_reason" not in state
+            and options.generation_every
+            and progress.step % options.generation_every == 0
+            and progress.step % options.validation_every == 0
+            and validation_batches is not None
+        ):
+            # Older best_loss snapshots had these metrics and omitted that step's generation state.
+            if "validation_token_accuracy" in progress.last_metrics and "learning_rate" not in progress.last_metrics:
+                _, summary = run_sft_generation_evaluation(
+                    model, tokenizer, output, step=progress.step, device=device,
+                    max_new_tokens=options.generation_max_new_tokens, autocast_dtype=autocast_dtype,
+                    suite_path=options.generation_suite,
+                )
+                quality.record_generation(summary, options, progress.step)
+            if quality.stop_reason(options, progress.step):
+                raise ValueError("SFT checkpoint already reached early stopping. Use --checkpoint to start a new run.")
         truncate_metrics_after(artifacts.metrics, progress.step)
         print(f"resuming SFT from step={progress.step}; replaying {progress.micro_batches} micro-batches", flush=True)
-    batches = restore_batches(loader, progress.micro_batches, payload)
 
     manifest = finetune_manifest(
         "sft", model, options, resolved_precision, max_length, data_path, validation_path,
         train_index, validation_index, initial_checkpoint_source, initial_checkpoint, progress.step, signature,
     )
+    manifest["trainable_parameters"] = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     atomic_write_json(artifacts.manifest, manifest)
     tracker, progress.wandb_run_id = start_tracking(
         options, output, progress.step, progress.wandb_run_id,
@@ -271,11 +307,14 @@ def run_sft_jsonl(
             resolved_lm_options(options), signature, examples_seen=examples_seen,
             **asdict(quality),
             clipped_steps=clipped_steps, initial_checkpoint_source=initial_checkpoint_source,
+            early_stop_reason=stop_reason,
         )
 
     save = artifacts.checkpoint_writer(model, optimizer, scheduler, training_state)
+    boundary = TrainingStep()
     try:
         for step in range(progress.step + 1, options.steps + 1):
+            boundary.begin()
             validation_due = validation_batches is not None and (
                 step % options.validation_every == 0 or step == options.steps
             )
@@ -311,6 +350,7 @@ def run_sft_jsonl(
                 step_input_tokens += int(cpu_batch["attention_mask"].sum())
                 step_examples += cpu_batch["input_ids"].shape[0]
             grad_norm = clip_finetune_gradients(model, options.grad_clip, "SFT", step)
+            boundary.updating()
             optimizer.step()
             scheduler.step()
             update_seconds = update_duration(update_started, device) if update_started is not None else None
@@ -324,6 +364,7 @@ def run_sft_jsonl(
             metric["examples_seen"] = examples_seen
             clipped_steps += int(bool(metric["grad_was_clipped"]))
             metric["grad_clip_fraction"] = clipped_steps / progress.step
+            best_metrics = None
             if validation_due:
                 val_loss, val_accuracy, val_targets = evaluate_sft(
                     model, validation_batches, device, autocast_dtype=autocast_dtype
@@ -343,8 +384,6 @@ def run_sft_jsonl(
                         "validation_token_accuracy": val_accuracy,
                         "best_val_loss": progress.best_val_loss,
                     }
-                    best_checkpoint = save(output / "best_loss.pt", step, best_metrics)
-                    print(f"saved best-loss SFT checkpoint: {best_checkpoint}", flush=True)
                 metric["best_val_loss"] = progress.best_val_loss
 
             progress.last_metrics = progress.loss_metrics(last_loss, current_lr, examples_seen=float(examples_seen))
@@ -356,6 +395,7 @@ def run_sft_jsonl(
                 })
 
             generation_path: Path | None = None
+            quality_metrics = None
             if generation_due:
                 generation_path, generation_summary = run_sft_generation_evaluation(
                     model,
@@ -378,26 +418,31 @@ def run_sft_jsonl(
                         "best_quality_step": float(quality.best_quality_step),
                         **generation_summary,
                     }
-                    quality_checkpoint = save(output / "best_quality.pt", step, quality_metrics)
-                    mirror_checkpoint(quality_checkpoint, output / "best.pt")
-                    print(
-                        f"saved best-quality SFT checkpoint: {quality_checkpoint} "
-                        f"(score={quality.best_quality_score:.4f})",
-                        flush=True,
-                    )
                 metric["best_quality_score"] = quality.best_quality_score
                 metric["best_quality_step"] = quality.best_quality_step
                 metric["stale_quality_evaluations"] = quality.stale_quality_evaluations
+            if validation_due and generation_due:
+                stop_reason = quality.stop_reason(options, step)
+            boundary.complete()
+            if best_metrics is not None:
+                best_checkpoint = save(output / "best_loss.pt", step, best_metrics)
+                print(f"saved best-loss SFT checkpoint: {best_checkpoint}", flush=True)
+            if quality_metrics is not None:
+                quality_checkpoint = save(output / "best_quality.pt", step, quality_metrics)
+                mirror_checkpoint(quality_checkpoint, output / "best.pt")
+                print(
+                    f"saved best-quality SFT checkpoint: {quality_checkpoint} "
+                    f"(score={quality.best_quality_score:.4f})",
+                    flush=True,
+                )
             if log_due:
                 artifacts.log(metric, tracker, generation_path)
             artifacts.save_periodic(save, step, progress.last_metrics, options, label='SFT')
-            if validation_due and generation_path is not None:
-                reason = quality.stop_reason(options, step)
-                if reason is not None:
-                    print(f"early stopping SFT at step={step}: {reason}", flush=True)
-                    break
+            if stop_reason is not None:
+                print(f"early stopping SFT at step={step}: {stop_reason}", flush=True)
+                break
     except (KeyboardInterrupt, FloatingPointError):
-        emergency_checkpoint(artifacts, save, progress.step, progress.last_metrics, tracker, 'SFT')
+        boundary.save_emergency(artifacts, save, progress.step, progress.last_metrics, tracker, 'SFT')
         raise
 
     metrics = progress.loss_metrics(
@@ -413,6 +458,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = training_parser('Fine-tune a pretraining checkpoint.', 'sft', DEFAULT_SFT_DATA, SFTOptions)
     add_finetune_arguments(parser, SFTOptions)
     default = partial(option_default, SFTOptions)
+    parser.add_argument(
+        "--lora-rank", type=int, default=default("lora_rank"),
+        help="enable query/value LoRA with a positive rank",
+    )
+    parser.add_argument("--lora-alpha", type=float, help="LoRA scaling numerator, defaults to the rank")
     parser.add_argument(
         "--target-mode",
         choices=("reasoning_and_response", "response_only"),

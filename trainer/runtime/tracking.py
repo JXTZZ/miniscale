@@ -9,6 +9,32 @@ import warnings
 from dataset.file_utils import atomic_write_text
 
 
+def _read_queue(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    records: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        value = json.loads(line)
+        if not isinstance(value, dict):
+            raise ValueError("pending W&B record must be a JSON object")
+        records.append(value)
+    return records
+
+
+def _write_queue(path: Path, records: list[dict[str, object]]) -> None:
+    if records:
+        atomic_write_text(path, "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records))
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _queue_step(record: dict[str, object]) -> int:
+    event = record["metric"] if record["kind"] == "metric" else record
+    return int(event["step"])
+
+
 class WandbTracker:
     """Fault-tolerant W&B adapter backed by a persistent local upload queue."""
 
@@ -49,8 +75,15 @@ class WandbTracker:
         config: dict[str, object],
         directory: str | Path,
         retry_every_steps: int = 200,
-        initial_step: int = 0,
+        initial_step: int | None = None,
     ) -> WandbTracker | None:
+        output = Path(directory).resolve()
+        pending_path = output / "wandb_pending.jsonl"
+        if initial_step is not None:
+            records = _read_queue(pending_path)
+            retained = [record for record in records if _queue_step(record) <= initial_step]
+            if len(retained) != len(records):
+                _write_queue(pending_path, retained)
         if not enabled:
             return None
         if retry_every_steps < 1:
@@ -62,7 +95,6 @@ class WandbTracker:
                 "W&B tracking requires the optional dependency; run `uv sync --extra tracking`"
             ) from error
 
-        output = Path(directory).resolve()
         stable_run_id = run_id or secrets.token_hex(4)
         tracker = cls(
             wandb,
@@ -79,11 +111,11 @@ class WandbTracker:
                 "dir": str(output),
                 "save_code": True,
             },
-            pending_path=output / "wandb_pending.jsonl",
+            pending_path=pending_path,
             retry_every_steps=retry_every_steps,
-            initial_step=initial_step,
+            initial_step=initial_step or 0,
         )
-        tracker._connect(initial_step)
+        tracker._connect(initial_step or 0)
         return tracker
 
     def log(
@@ -287,26 +319,10 @@ class WandbTracker:
     def _read_pending(self) -> list[dict[str, object]]:
         if self._pending_path is None:
             return list(getattr(self, "_memory_pending", []))
-        if not self._pending_path.exists():
-            return []
-        records: list[dict[str, object]] = []
-        for line in self._pending_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise ValueError("pending W&B record must be a JSON object")
-            records.append(value)
-        return records
+        return _read_queue(self._pending_path)
 
     def _write_pending(self, records: list[dict[str, object]]) -> None:
         if self._pending_path is None:
             self._memory_pending = records
             return
-        if not records:
-            self._pending_path.unlink(missing_ok=True)
-            return
-        atomic_write_text(
-            self._pending_path,
-            "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
-        )
+        _write_queue(self._pending_path, records)

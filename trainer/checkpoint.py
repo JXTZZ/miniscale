@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from dataset.file_utils import atomic_output_path, path_identity
+from model.lora import merge_lora_weights
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 
 
@@ -55,6 +56,7 @@ def save_checkpoint(
                 "metrics": metrics,
                 "config": asdict(model.config),
                 "model": model.state_dict(),
+                **({"lora": model.lora_config} if model.lora_config is not None else {}),
             },
             temporary,
         )
@@ -85,13 +87,10 @@ def save_training_checkpoint(
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "training_state": training_state,
-        "rng_state": {
-            "python": random.getstate(),
-            "numpy": np.random.get_state(),
-            "torch": torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-        },
+        "rng_state": capture_rng_state(),
     }
+    if model.lora_config is not None:
+        payload["lora"] = model.lora_config
     for name in ("tokens_seen", "best_val_loss"):
         if name in training_state:
             payload[name] = training_state[name]
@@ -119,6 +118,15 @@ def read_training_checkpoint(
             f"checkpoint format {version} is newer than supported format "
             f"{TRAINING_CHECKPOINT_FORMAT_VERSION}"
         )
+    # Older emergency snapshots could record progress from before the update.
+    stage, state, scheduler = payload.get("stage"), payload["training_state"], payload["scheduler"]
+    if version == 2 and isinstance(state, dict) and isinstance(scheduler, dict):
+        updates = payload["step"]
+        if stage in ("grpo", "agent_rl"):
+            updates = state.get("optimizer_steps")
+        last_epoch = scheduler.get("last_epoch")
+        if isinstance(updates, int) and isinstance(last_epoch, int) and last_epoch > updates:
+            raise ValueError("checkpoint scheduler is ahead of training progress; use an earlier complete checkpoint")
     return payload
 
 
@@ -137,6 +145,15 @@ def restore_training_checkpoint(
     scheduler.load_state_dict(payload["scheduler"])
     if restore_rng:
         restore_rng_state(payload.get("rng_state"))
+
+
+def capture_rng_state() -> dict[str, object]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
 
 
 def restore_rng_state(rng_state: object) -> None:
@@ -160,7 +177,10 @@ def load_checkpoint(path: str | Path, device: str | torch.device = "cpu") -> Min
     if isinstance(config, dict):
         config = MiniScaleConfig(**config)
     model = MiniScaleForCausalLM(config)
-    model.load_state_dict(payload["model"])
+    weights = payload["model"]
+    if "lora" in payload:
+        weights = merge_lora_weights(weights, payload["lora"])
+    model.load_state_dict(weights)
     return model.to(device)
 
 

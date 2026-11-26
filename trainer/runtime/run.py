@@ -13,9 +13,9 @@ import time
 import torch
 
 from dataset.file_utils import atomic_output_path, atomic_write_text
-from trainer.checkpoint import restore_rng_state, save_training_checkpoint
-from trainer.tracking import WandbTracker
-from trainer.trainer_utils import infinite_batches
+from trainer.checkpoint import capture_rng_state, restore_rng_state, save_training_checkpoint
+from trainer.runtime.tracking import WandbTracker
+from trainer.runtime.torch_utils import infinite_batches
 
 
 class RunArtifacts:
@@ -25,9 +25,11 @@ class RunArtifacts:
         self.metrics = self.output / f"{stage}_metrics.jsonl"
         self.manifest = self.output / f"{stage}_run.json"
         self.checkpoints = self.output / "checkpoints"
+        self.last_checkpoint: Path | None = None
 
     def check_empty(self, resume_from: str | Path | None, label: str, *names: str) -> None:
         if resume_from is not None:
+            self.last_checkpoint = Path(resume_from)
             return
         files = (self.output / name for name in names)
         existing = next((path for path in files if path.exists()), None)
@@ -41,10 +43,12 @@ class RunArtifacts:
 
     def checkpoint_writer(self, model, optimizer, scheduler, training_state):
         def save(path: Path, step: int, metrics: dict[str, float]) -> Path:
-            return save_training_checkpoint(
+            checkpoint = save_training_checkpoint(
                 path, model, optimizer, scheduler, stage=self.stage, step=step,
                 metrics=metrics, training_state=training_state(),
             )
+            self.last_checkpoint = checkpoint
+            return checkpoint
         return save
 
     def save_periodic(self, save, step: int, metrics, options, *, label: str | None = None) -> None:
@@ -68,7 +72,7 @@ def start_tracking(options, output: Path, step: int, saved_run_id: str | None, c
         entity=options.wandb_entity, name=options.wandb_run_name,
         run_id=options.wandb_run_id or saved_run_id, mode=options.wandb_mode,
         config=config, directory=output, retry_every_steps=options.wandb_retry_every_steps,
-        initial_step=step,
+        initial_step=step if options.resume_from is not None else None,
     )
     return tracker, tracker.run_id if tracker is not None else saved_run_id
 
@@ -103,12 +107,34 @@ def update_duration(started: float, device: torch.device) -> float:
     return time.perf_counter() - started
 
 
-def emergency_checkpoint(artifacts, save, step, metrics, tracker, label: str = "") -> None:
-    checkpoint = save(artifacts.checkpoints / f"emergency_step_{step:08d}.pt", step, metrics)
-    message = f"{label} interrupted; emergency checkpoint saved" if label else "training interrupted; emergency checkpoint saved"
-    print(f"{message}: {checkpoint}", flush=True)
-    if tracker is not None:
-        tracker.finish(exit_code=1, summary={"interrupted_step": step})
+class TrainingStep:
+    """Allow emergency saves before mutation or after a complete training step."""
+
+    def __init__(self) -> None:
+        self._rng: dict[str, object] | None = None
+        self._updating = False
+
+    def begin(self) -> None:
+        self._rng = capture_rng_state()
+
+    def updating(self) -> None:
+        self._updating = True
+        self._rng = None
+
+    def complete(self) -> None:
+        self._updating = False
+
+    def save_emergency(self, artifacts, save, step, metrics, tracker, label: str = "training") -> None:
+        if self._updating:
+            fallback = artifacts.last_checkpoint
+            recovery = f"resume from {fallback}" if fallback else "no previous checkpoint is available"
+            print(f"{label} interrupted during an incomplete step. {recovery}", flush=True)
+        else:
+            restore_rng_state(self._rng)
+            checkpoint = save(artifacts.checkpoints / f"emergency_step_{step:08d}.pt", step, metrics)
+            print(f"{label} interrupted. Emergency checkpoint saved to {checkpoint}", flush=True)
+        if tracker is not None:
+            tracker.finish(exit_code=1, summary={"interrupted_step": step})
 
 
 def training_result(artifacts, checkpoint, metrics, device, tracker, run_id, completed_step):

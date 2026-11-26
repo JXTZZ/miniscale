@@ -13,7 +13,8 @@ MiniScale 是一个从零实现、可测试的“小模型到 Agent RL”学习�
 - **可复现的预训练与续训**。以 `--steps` 指定训练预算，流式打包 JSONL，按内容稳定切分验证集。完整 checkpoint 保存数据与 tokenizer 指纹、训练进度、优化器、scheduler 和随机状态。 [预训练](docs/pretraining.md) · [恢复契约](docs/checkpointing.md)
 - **SFT 样本选择与质量评估**。按 assistant turn 选择监督目标，可用质量策略生成派生数据，使用固定生成套件评估回复并选择 checkpoint。 [SFT](docs/sft.md)
 - **偏好训练与可验证奖励**。DPO 校验共享 prompt 并保留冻结 reference，GRPO 用数学答案计算奖励，Agent RL 用 action mask 从优化目标中排除计算器观测。 [DPO](docs/dpo.md) · [GRPO](docs/grpo.md) · [Agent RL](docs/agent_rl.md)
-- **本地指标与 W&B**。五个阶段保存本地 JSONL 指标，并可选用 W&B。训练中断后可继续使用原 run ID，持久化的待传队列会在重连后补传指标和生成样例。 [W&B 实现](trainer/tracking.py)
+- **可选训练扩展**。SFT 支持 LoRA，GRPO 与 Agent RL 可选择 CISPO，单轮 GRPO 可批量采样，推理与 RL 可启用 KV cache。 [动手实验](docs/learning-guide.md#试用可选训练功能)
+- **本地指标与 W&B**。五个阶段保存本地 JSONL 指标，并可选用 W&B。训练中断后可继续使用原 run ID，持久化的待传队列会在重连后补传指标和生成样例。 [W&B 实现](trainer/runtime/tracking.py)
 
 ## 已打通的流水线
 
@@ -193,8 +194,9 @@ artifacts/pretrain/
 `best.pt`、`final.pt` 和周期 checkpoint 都包含模型、AdamW、scheduler、step、token 计数、
 `best_val_loss` 及 Python/NumPy/PyTorch/CUDA RNG 状态，可以用于断点续训。`pretrain_run.json`
 保存解析后的完整 recipe、模型配置和数据/tokenizer 内容指纹。`keep_last` 只清理周期
-checkpoint，不会删除 `best.pt`、`final.pt` 或 generations。按 `Ctrl+C` 时还会写入
-`emergency_step_XXXXXXXX.pt` 后再退出。完整 checkpoint 通常约 700–800MB，请预留磁盘空间。
+checkpoint，不会删除 `best.pt`、`final.pt` 或 generations。安全边界收到 `Ctrl+C` 时会写入
+`emergency_step_XXXXXXXX.pt`。如果中断时本步正在更新或验证，程序会指向最近成功写入的 checkpoint。
+完整 checkpoint 通常约 700–800MB，请预留磁盘空间。
 
 从周期或 emergency checkpoint 继续时，`--steps` 仍表示原计划的总步数，其他影响训练轨迹的
 参数必须与原命令一致：
@@ -340,8 +342,8 @@ uv run python eval_llm.py \
 2. 在 `dataset/lm_dataset.py` 和 `trainer/train_pretrain.py` 跟踪流式读取、packing、shift label 和 next-token loss。
 3. 在 `trainer/train_full_sft.py` 跟踪 assistant-only 监督和 `-100` mask。
 4. 在 `trainer/train_dpo.py` 检查 policy 与 reference 对 chosen/rejected 的相对 log-probability。
-5. 从 `trainer/train_grpo.py` 跟到 `trainer/rl_utils.py`，依次看组内优势、ratio clipping 和 reference KL。
-6. 从 `trainer/train_agent.py` 跟到 `trainer/rollout_engine.py` 和 `trainer/agent_env.py`，观察工具响应如何进入上下文以及 action mask 如何标记模型动作。
+5. 从 `trainer/train_grpo.py` 跟到 `trainer/rl/objective.py`，依次看组内优势、ratio clipping 和 reference KL。
+6. 从 `trainer/train_agent.py` 跟到 `trainer/rl/rollout.py` 和 `trainer/rl/environment.py`，观察工具响应如何进入上下文以及 action mask 如何标记模型动作。
 7. 修改一个组件并补测试，例如新增 `search` mock 工具、格式奖励或离线 eval；这才会逐渐变成
    你的工程，而不是 MiniMind 的复刻。
 

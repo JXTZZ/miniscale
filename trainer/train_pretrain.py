@@ -40,9 +40,9 @@ from trainer.lm_utils import (
     validation_identity,
     write_pretrain_manifest,
 )
-from trainer.run_utils import (
+from trainer.runtime.run import (
     check_resume_progress,
-    emergency_checkpoint,
+    TrainingStep,
     restore_batches,
     RunArtifacts,
     should_log,
@@ -52,7 +52,7 @@ from trainer.run_utils import (
     truncate_metrics_after,
     update_duration,
 )
-from trainer.trainer_utils import (
+from trainer.runtime.torch_utils import (
     autocast_context as _autocast_context,
     evaluate_lm,
     resolve_autocast_dtype,
@@ -240,8 +240,10 @@ def run_pretrain_jsonl(
         return progress.state_dict(resolved_lm_options(options), resume_signature)
 
     save = artifacts.checkpoint_writer(model, optimizer, scheduler, training_state)
+    boundary = TrainingStep()
     try:
         for step in range(progress.step + 1, options.steps + 1):
+            boundary.begin()
             validation_due = validation_loader is not None and (
                 step % options.validation_every == 0 or step == options.steps
             )
@@ -274,6 +276,7 @@ def run_pretrain_jsonl(
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), options.grad_clip, error_if_nonfinite=True
             )
+            boundary.updating()
             optimizer.step()
             scheduler.step()
             update_seconds = update_duration(update_started, device) if update_started is not None else None
@@ -319,11 +322,12 @@ def run_pretrain_jsonl(
                     autocast_dtype=autocast_dtype,
                 )
                 print(f"saved generation evaluation: {generation_path}", flush=True)
+            boundary.complete()
             if log_due:
                 artifacts.log(metric, tracker, generation_path)
             artifacts.save_periodic(save, step, progress.last_metrics, options, label='')
     except KeyboardInterrupt:
-        emergency_checkpoint(artifacts, save, progress.step, progress.last_metrics, tracker)
+        boundary.save_emergency(artifacts, save, progress.step, progress.last_metrics, tracker)
         raise
 
     metrics = progress.loss_metrics(last_loss, progress.last_metrics["learning_rate"])

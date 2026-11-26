@@ -15,9 +15,8 @@ if not __package__:
 from dataset.rl_dataset import CalculatorTask
 from model.tokenizer import ByteTokenizer, load_tokenizer
 from trainer.checkpoint import load_checkpoint
-from trainer.rl_utils import AgentRLOptions
-from trainer.rollout_engine import rollout_agent
-from trainer.trainer_utils import resolve_device
+from trainer.rl.rollout import rollout_agent
+from trainer.runtime.torch_utils import resolve_device
 
 
 @dataclass(slots=True)
@@ -35,6 +34,7 @@ class GenerationOptions:
     raw_prompt: bool = False
     calculator: bool = False
     max_turns: int = 6
+    use_cache: bool = False
 
 
 def generate_from_checkpoint(
@@ -65,13 +65,7 @@ def generate_from_checkpoint(
             model,
             tokenizer,
             CalculatorTask(prompt, "", "", options.system_prompt),
-            AgentRLOptions(
-                max_turns=options.max_turns,
-                max_new_tokens=options.max_new_tokens,
-                temperature=options.temperature,
-                top_k=options.top_k,
-                device=str(device),
-            ),
+            options,
             device,
         )
         return {
@@ -115,6 +109,7 @@ def generate_from_checkpoint(
             repetition_penalty=options.repetition_penalty,
             no_repeat_ngram_size=options.no_repeat_ngram_size,
             generator=generator,
+            use_cache=options.use_cache,
         )
     raw_response_ids = generated[0, len(prompt_ids) :].tolist()
     finish_reason = "max_tokens"
@@ -162,6 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-p", type=float, default=defaults.top_p)
     parser.add_argument("--repetition-penalty", type=float, default=defaults.repetition_penalty)
     parser.add_argument("--no-repeat-ngram-size", type=int, default=defaults.no_repeat_ngram_size)
+    parser.add_argument("--kv-cache", action="store_true", dest="use_cache")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default=defaults.device)
     parser.add_argument("--raw-prompt", action="store_true", help="skip the chat template (useful for base models)")
@@ -188,6 +184,7 @@ def main(argv: list[str] | None = None) -> None:
             raw_prompt=arguments.raw_prompt,
             calculator=arguments.calculator,
             max_turns=arguments.max_turns,
+            use_cache=arguments.use_cache,
         ),
     )
     if arguments.raw:

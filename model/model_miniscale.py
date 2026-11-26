@@ -12,6 +12,9 @@ import torch
 import torch.nn.functional as F
 
 
+KeyValue = tuple[Tensor, Tensor]
+
+
 @dataclass(slots=True)
 class MiniScaleConfig:
     vocab_size: int = 260
@@ -84,6 +87,7 @@ class MiniScaleConfig:
 class CausalLMOutput:
     logits: Tensor
     loss: Tensor | None = None
+    past_key_values: list[KeyValue] | None = None
 
 
 class RMSNorm(nn.Module):
@@ -110,8 +114,10 @@ class RotaryEmbedding(nn.Module):
         inverse_frequency = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inverse_frequency", inverse_frequency, persistent=False)
 
-    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        positions = torch.arange(seq_len, device=device, dtype=self.inverse_frequency.dtype)
+    def forward(
+        self, seq_len: int, device: torch.device, dtype: torch.dtype, offset: int = 0
+    ) -> tuple[Tensor, Tensor]:
+        positions = torch.arange(offset, offset + seq_len, device=device, dtype=self.inverse_frequency.dtype)
         frequencies = torch.outer(positions, self.inverse_frequency)
         embeddings = torch.cat((frequencies, frequencies), dim=-1)
         return embeddings.cos().to(dtype)[None, None, :, :], embeddings.sin().to(dtype)[None, None, :, :]
@@ -135,21 +141,31 @@ class CausalSelfAttention(nn.Module):
         self.rotary = RotaryEmbedding(self.head_dim, config.rope_theta)
         self.dropout = config.dropout
 
-    def forward(self, hidden_states: Tensor, attention_mask: Tensor | None = None) -> Tensor:
+    def forward(
+        self, hidden_states: Tensor, attention_mask: Tensor | None = None,
+        *, past: KeyValue | None = None,
+    ) -> tuple[Tensor, KeyValue]:
         batch_size, seq_len, _ = hidden_states.shape
         query = self.query(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         key = self.key(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         value = self.value(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        cosine, sine = self.rotary(seq_len, hidden_states.device, hidden_states.dtype)
+        offset = 0 if past is None else past[0].size(-2)
+        cosine, sine = self.rotary(seq_len, hidden_states.device, hidden_states.dtype, offset)
         query, key = _apply_rope(query, key, cosine, sine)
+        if past is not None:
+            key = torch.cat((past[0], key), dim=-2)
+            value = torch.cat((past[1], value), dim=-2)
+        cache = (key, value)
         key = key.repeat_interleave(self.kv_groups, dim=1)
         value = value.repeat_interleave(self.kv_groups, dim=1)
 
         combined_mask = None
-        is_causal = attention_mask is None
-        if attention_mask is not None:
-            causal = torch.ones(seq_len, seq_len, device=hidden_states.device, dtype=torch.bool).tril()
-            combined_mask = causal[None, None, :, :] & attention_mask[:, None, None, :].bool()
+        is_causal = offset == 0 and attention_mask is None
+        if attention_mask is not None or (offset and seq_len > 1):
+            keys = torch.arange(offset + seq_len, device=hidden_states.device)
+            combined_mask = keys[None, :] <= keys[offset:, None]
+            if attention_mask is not None:
+                combined_mask = combined_mask[None, None] & attention_mask[:, None, None, :].bool()
         attended = F.scaled_dot_product_attention(
             query,
             key,
@@ -159,7 +175,7 @@ class CausalSelfAttention(nn.Module):
             is_causal=is_causal,
         )
         attended = attended.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-        return self.output(attended)
+        return self.output(attended), cache
 
 
 class SwiGLU(nn.Module):
@@ -181,15 +197,20 @@ class DecoderLayer(nn.Module):
         self.mlp_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = SwiGLU(config)
 
-    def forward(self, hidden_states: Tensor, attention_mask: Tensor | None = None) -> Tensor:
-        hidden_states = hidden_states + self.attention(self.attention_norm(hidden_states), attention_mask)
-        return hidden_states + self.mlp(self.mlp_norm(hidden_states))
+    def forward(
+        self, hidden_states: Tensor, attention_mask: Tensor | None = None,
+        *, past: KeyValue | None = None,
+    ) -> tuple[Tensor, KeyValue]:
+        attended, cache = self.attention(self.attention_norm(hidden_states), attention_mask, past=past)
+        hidden_states = hidden_states + attended
+        return hidden_states + self.mlp(self.mlp_norm(hidden_states)), cache
 
 
 class MiniScaleForCausalLM(nn.Module):
     def __init__(self, config: MiniScaleConfig) -> None:
         super().__init__()
         self.config = config
+        self.lora_config: dict[str, float | int] | None = None
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
         self.layers = nn.ModuleList(DecoderLayer(config) for _ in range(config.num_hidden_layers))
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -224,12 +245,26 @@ class MiniScaleForCausalLM(nn.Module):
         *,
         attention_mask: Tensor | None = None,
         labels: Tensor | None = None,
+        use_cache: bool = False,
+        past_key_values: list[KeyValue] | None = None,
+        last_token_only: bool = False,
     ) -> CausalLMOutput:
-        if input_ids.size(1) > self.config.max_position_embeddings:
+        if last_token_only and labels is not None:
+            raise ValueError("last_token_only is only supported without labels")
+        if past_key_values is not None and len(past_key_values) != len(self.layers):
+            raise ValueError("past_key_values must contain one cache per decoder layer")
+        past_length = past_key_values[0][0].size(-2) if past_key_values is not None else 0
+        if past_length + input_ids.size(1) > self.config.max_position_embeddings:
             raise ValueError("sequence exceeds max_position_embeddings")
         hidden_states = self.embedding(input_ids)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask)
+        caches = [] if use_cache else None
+        for index, layer in enumerate(self.layers):
+            past = past_key_values[index] if past_key_values is not None else None
+            hidden_states, cache = layer(hidden_states, attention_mask, past=past)
+            if caches is not None:
+                caches.append(cache)
+        if last_token_only:
+            hidden_states = hidden_states[:, -1:]
         logits = self.lm_head(self.norm(hidden_states))
         loss = None
         if labels is not None:
@@ -238,7 +273,7 @@ class MiniScaleForCausalLM(nn.Module):
                 labels[:, 1:].contiguous().view(-1),
                 ignore_index=-100,
             )
-        return CausalLMOutput(logits=logits, loss=loss)
+        return CausalLMOutput(logits=logits, loss=loss, past_key_values=caches)
 
     @torch.no_grad()
     def generate(
@@ -254,6 +289,7 @@ class MiniScaleForCausalLM(nn.Module):
         eos_token_id: int | None = None,
         do_sample: bool | None = None,
         generator: torch.Generator | None = None,
+        use_cache: bool = False,
     ) -> Tensor:
         if max_new_tokens < 1:
             raise ValueError("max_new_tokens must be positive")
@@ -271,9 +307,19 @@ class MiniScaleForCausalLM(nn.Module):
         prompt_length = input_ids.shape[1]
         eos_token_id = self.config.eos_token_id if eos_token_id is None else eos_token_id
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        cache = None
         for _ in range(max_new_tokens):
             window = generated[:, -self.config.max_position_embeddings :]
-            logits = self(window).logits[:, -1]
+            if use_cache:
+                # Sliding the window resets the positions used by uncached generation.
+                if cache is not None and cache[0][0].size(-2) == window.size(1):
+                    cache = None
+                output = self(window if cache is None else window[:, -1:], use_cache=True,
+                              past_key_values=cache, last_token_only=True)
+                cache = output.past_key_values
+                logits = output.logits[:, -1]
+            else:
+                logits = self(window).logits[:, -1]
             completion = generated[:, prompt_length:]
             if repetition_penalty != 1.0 and completion.numel():
                 for row in range(logits.shape[0]):

@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from dataset.file_utils import atomic_write_json, tokenizer_identity
 from model.model_miniscale import MiniScaleForCausalLM
 from trainer.checkpoint import TRAINING_CHECKPOINT_FORMAT_VERSION
-from trainer.trainer_utils import build_adamw_optimizer, build_warmup_cosine_scheduler, seed_worker
+from trainer.runtime.torch_utils import build_adamw_optimizer, build_warmup_cosine_scheduler, seed_worker
 
 
 OPTIMIZER_GROUPING = "matrix_weights_decay_norm_embedding_no_decay_v1"

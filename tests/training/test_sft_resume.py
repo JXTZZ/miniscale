@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
@@ -10,7 +11,7 @@ import torch
 
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer
-from trainer.checkpoint import load_checkpoint
+from trainer.checkpoint import load_checkpoint, read_checkpoint
 from trainer.train_full_sft import SFTOptions, run_sft_jsonl
 
 
@@ -168,6 +169,38 @@ class SFTResumeTests(unittest.TestCase):
             self.assertIn("optimizer", payload)
             self.assertIn("resume_signature", payload["training_state"])
 
+    def test_lora_checkpoint_resumes_and_loads_as_dense_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "sft.jsonl"
+            write_corpus(corpus)
+            tokenizer = ByteTokenizer()
+            model = new_model()
+            original = {name: value.clone() for name, value in model.state_dict().items()}
+            settings = replace(options(), lora_rank=2)
+            output = root / "lora"
+            result = run_sft_jsonl(model, tokenizer, corpus, output, settings)
+            checkpoint = read_checkpoint(result["checkpoint"])
+            self.assertEqual(checkpoint["lora"], {"rank": 2, "alpha": 2.0})
+            self.assertTrue(all("lora_" in name for name, p in model.named_parameters() if p.requires_grad))
+            for name, weight in original.items():
+                torch.testing.assert_close(checkpoint["model"][name], weight, rtol=0, atol=0)
+            merged = load_checkpoint(result["checkpoint"]).eval()
+            ids = torch.tensor([[1, 10, 15]])
+            torch.testing.assert_close(merged(ids).logits, model.eval()(ids).logits)
+            with self.assertRaisesRegex(ValueError, "resume options do not match"):
+                run_sft_jsonl(
+                    new_model(), tokenizer, corpus, output,
+                    replace(options(), resume_from=output / "checkpoints/step_00000002.pt"),
+                )
+            run_sft_jsonl(
+                new_model(), tokenizer, corpus, output,
+                replace(settings, resume_from=output / "checkpoints/step_00000002.pt"),
+            )
+            resumed = read_checkpoint(result["checkpoint"])
+            for name, weight in checkpoint["model"].items():
+                torch.testing.assert_close(resumed["model"][name], weight, rtol=0, atol=0)
+
     def test_resume_rejects_trajectory_change(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -222,7 +255,7 @@ class SFTResumeTests(unittest.TestCase):
                 validation_batches=1,
                 generation_every=1,
                 generation_suite=None,
-                save_every=0,
+                save_every=1,
                 early_stopping_patience=2,
                 early_stopping_min_steps=1,
                 early_stopping_validation_min_delta=0.01,
@@ -244,10 +277,40 @@ class SFTResumeTests(unittest.TestCase):
                     run_options,
                     validation_path=validation,
                 )
+                best_loss = root / "run/best_loss.pt"
+                best_state = read_checkpoint(best_loss)["training_state"]
+                self.assertEqual(best_state["best_quality_step"], 1)
+                resumed = run_sft_jsonl(
+                    new_model(), ByteTokenizer(), corpus, root / "resumed",
+                    replace(run_options, resume_from=best_loss), validation_path=validation,
+                )
 
-            payload = torch.load(result["checkpoint"], map_location="cpu", weights_only=False)
+                old_best = read_checkpoint(best_loss)
+                old_state = old_best["training_state"]
+                del old_state["early_stop_reason"]
+                old_state.update(best_quality_step=0, best_quality_score=float("-inf"),
+                                 early_best_quality_score=float("-inf"))
+                old_path = root / "old_best_loss.pt"
+                torch.save(old_best, old_path)
+                migrated = run_sft_jsonl(
+                    new_model(), ByteTokenizer(), corpus, root / "migrated",
+                    replace(run_options, resume_from=old_path), validation_path=validation,
+                )
+                stopped = root / "run/checkpoints/step_00000003.pt"
+                with self.assertRaisesRegex(ValueError, "already reached early stopping"):
+                    run_sft_jsonl(
+                        new_model(), ByteTokenizer(), corpus, root / "already_stopped",
+                        replace(run_options, resume_from=stopped), validation_path=validation,
+                    )
+
+            payload = read_checkpoint(result["checkpoint"])
             self.assertEqual(payload["step"], 3)
             self.assertEqual(result["stopped_early"], 1.0)
+            for continuation in (resumed, migrated):
+                continued = read_checkpoint(continuation["checkpoint"])
+                self.assertEqual(continued["step"], 3)
+                for name, expected in payload["model"].items():
+                    self.assertTrue(torch.equal(expected, continued["model"][name]), name)
 
 
 if __name__ == "__main__":

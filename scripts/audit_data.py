@@ -23,7 +23,7 @@ from dataset.sft_dataset import DEFAULT_SFT_DATA
 from model.tokenizer import DEFAULT_TOKENIZER_PATH, load_tokenizer, Tokenizer
 from scripts.chat_audit import audit_dpo_jsonl, audit_sft_jsonl, integer_percentiles
 from trainer.cli import option_default
-from trainer.rl_utils import AgentRLOptions, GRPOOptions
+from trainer.rl.options import AgentRLOptions, GRPOOptions
 from trainer.train_dpo import DPOOptions
 from trainer.train_full_sft import SFTOptions
 from trainer.train_pretrain import PretrainOptions

@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from trainer.run_utils import append_metric, format_training_metric
+from trainer.runtime.run import append_metric, format_training_metric
 
 
 class TrainingLoggingTests(unittest.TestCase):

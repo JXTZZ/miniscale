@@ -14,7 +14,7 @@ from dataset.file_utils import atomic_write_json
 from model.model_miniscale import MiniScaleForCausalLM
 from model.tokenizer import Tokenizer
 from trainer.eval_utils import SFT_GENERATION_PROMPTS
-from trainer.trainer_utils import autocast_context
+from trainer.runtime.torch_utils import autocast_context
 
 
 def checked_dpo_metrics(metrics: dict[str, Tensor], context: str) -> dict[str, float]:

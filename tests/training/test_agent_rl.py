@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -7,9 +8,9 @@ import torch
 from dataset.rl_dataset import CalculatorTask, filter_calculator_tools
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer
-from trainer.agent_env import parse_tool_call, parse_tool_call_payload, safe_calculate
-from trainer.rl_utils import AgentRLOptions
-from trainer.rollout_engine import rollout_agent
+from trainer.rl.environment import parse_tool_call, parse_tool_call_payload, safe_calculate
+from trainer.rl.options import AgentRLOptions
+from trainer.rl.rollout import rollout_agent
 from trainer.train_agent import run_agent_grpo
 
 
@@ -61,15 +62,37 @@ class AgentRLTests(unittest.TestCase):
                 ByteTokenizer(),
                 [CalculatorTask("2+2?", "2+2", "4")],
                 directory,
-                AgentRLOptions(steps=1, group_size=2, max_new_tokens=4, device="cpu"),
+                AgentRLOptions(
+                    steps=1, group_size=2, max_new_tokens=4, device="cpu",
+                    loss_type="cispo", use_cache=True,
+                ),
             )
             self.assertTrue(Path(str(metrics["checkpoint"])).exists())
 
     def test_reward_scores_all_expected_answers(self) -> None:
-        from trainer.agent_env import CalculatorEnv
+        from trainer.rl.environment import CalculatorEnv
 
         env = CalculatorEnv(CalculatorTask("two calculations", "", ("4", "9")))
         self.assertGreater(env.reward("4 and 9"), env.reward("4"))
+
+    def test_in_memory_resume_rejects_changed_system_prompt_or_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = MiniScaleForCausalLM(MiniScaleConfig.smoke())
+            tokenizer = ByteTokenizer()
+            task = CalculatorTask("2+2?", "2+2", "4", system_prompt="Answer briefly")
+            options = AgentRLOptions(steps=2, group_size=2, max_new_tokens=4, save_every=1, device="cpu")
+            run_agent_grpo(model, tokenizer, [task], directory, options)
+            checkpoint = Path(directory) / "checkpoints/step_00000001.pt"
+            for changes in (
+                {"system_prompt": "Explain your arithmetic"},
+                {"tools": [{"function": {"name": "calculator"}}]},
+            ):
+                with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "data.train.sha256"):
+                    run_agent_grpo(
+                        model, tokenizer, [replace(task, **changes)], directory,
+                        replace(options, resume_from=checkpoint),
+                    )
+            run_agent_grpo(model, tokenizer, [task], directory, replace(options, resume_from=checkpoint))
 
 
 if __name__ == "__main__":

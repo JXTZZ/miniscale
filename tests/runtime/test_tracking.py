@@ -9,7 +9,7 @@ from unittest.mock import patch
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer
 from trainer.checkpoint import read_checkpoint
-from trainer.tracking import WandbTracker
+from trainer.runtime.tracking import WandbTracker
 from trainer.train_pretrain import PretrainOptions, run_pretrain_jsonl
 
 
@@ -298,6 +298,9 @@ class TrackingTests(unittest.TestCase):
             checkpoint = output / "checkpoints/emergency_step_00000001.pt"
             self.assertEqual(read_checkpoint(checkpoint)["training_state"]["wandb_run_id"], "run-123")
             self.assertTrue(pending.is_file())
+            with pending.open("a", encoding="utf-8") as queue:
+                queue.write(json.dumps({"kind": "metric", "metric": metric(5)}) + "\n")
+                queue.write(json.dumps({"kind": "generation", "step": 5, "path": "stale.json"}) + "\n")
 
             result = run_pretrain_jsonl(
                 MiniScaleForCausalLM(MiniScaleConfig.smoke()),
@@ -311,6 +314,19 @@ class TrackingTests(unittest.TestCase):
             self.assertEqual(result["wandb_run_id"], "run-123")
             self.assertEqual([step for _, step in recovered.logged], [1, 2])
             self.assertFalse(pending.exists())
+
+    def test_resume_without_tracking_trims_pending_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            queue = Path(directory) / "wandb_pending.jsonl"
+            retained = {"kind": "metric", "metric": metric(2)}
+            stale = {"kind": "generation", "step": 3, "path": "stale.json"}
+            queue.write_text("".join(json.dumps(record) + "\n" for record in (retained, stale)))
+            tracker = WandbTracker.start(
+                enabled=False, project="MiniScale", entity=None, name=None, run_id=None,
+                mode="disabled", config={}, directory=directory, initial_step=2,
+            )
+            self.assertIsNone(tracker)
+            self.assertEqual([json.loads(line) for line in queue.read_text().splitlines()], [retained])
 
 
 if __name__ == "__main__":

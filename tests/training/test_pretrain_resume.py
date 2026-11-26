@@ -10,9 +10,15 @@ import torch
 
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer
-from trainer.checkpoint import read_checkpoint, restore_rng_state, validate_pretrain_signature
+from trainer.checkpoint import (
+    capture_rng_state,
+    read_checkpoint,
+    read_training_checkpoint,
+    restore_rng_state,
+    validate_pretrain_signature,
+)
 from trainer.train_pretrain import PretrainOptions, run_pretrain_jsonl
-from trainer.trainer_utils import build_warmup_cosine_scheduler
+from trainer.runtime.torch_utils import build_warmup_cosine_scheduler
 
 
 def write_corpus(path: Path, prefix: str = "resume-safe pretraining data 中文。") -> None:
@@ -252,11 +258,14 @@ class PretrainResumeTests(unittest.TestCase):
             model = MiniScaleForCausalLM(MiniScaleConfig.smoke())
             original_forward = model.forward
             calls = 0
+            rng_before_interrupt = None
 
             def interrupt_after_one_step(*args: object, **kwargs: object):
-                nonlocal calls
+                nonlocal calls, rng_before_interrupt
                 calls += 1
                 if calls > 1:
+                    rng_before_interrupt = capture_rng_state()["torch"]
+                    torch.rand(8)
                     raise KeyboardInterrupt
                 return original_forward(*args, **kwargs)
 
@@ -284,6 +293,41 @@ class PretrainResumeTests(unittest.TestCase):
             payload = torch.load(emergency, map_location="cpu", weights_only=False)
             self.assertEqual(payload["step"], 1)
             self.assertEqual(payload["training_state"]["micro_batches_seen"], 1)
+            self.assertTrue(torch.equal(payload["rng_state"]["torch"], rng_before_interrupt))
+
+    def test_interrupt_after_optimizer_uses_last_complete_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "pretrain.jsonl"
+            write_corpus(corpus)
+            tokenizer = ByteTokenizer()
+            options = PretrainOptions(
+                steps=3, sequence_length=16, gradient_accumulation_steps=1, validation_fraction=0,
+                save_every=1, log_every=1, warmup_steps=0, device="cpu",
+            )
+            torch.manual_seed(11)
+            uninterrupted = MiniScaleForCausalLM(MiniScaleConfig.smoke())
+            torch.manual_seed(11)
+            interrupted = MiniScaleForCausalLM(MiniScaleConfig.smoke())
+            run_pretrain_jsonl(uninterrupted, tokenizer, corpus, root / "baseline", options)
+            output = root / "interrupted"
+            with (
+                patch("trainer.train_pretrain.update_duration", side_effect=[1.0, KeyboardInterrupt]),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                run_pretrain_jsonl(interrupted, tokenizer, corpus, output, options)
+            self.assertEqual(list((output / "checkpoints").glob("emergency_*.pt")), [])
+            fallback = output / "checkpoints/step_00000001.pt"
+            self.assertTrue(fallback.is_file())
+            old_incomplete = read_training_checkpoint(fallback, "cpu")
+            old_incomplete["step"] = 0
+            old_path = root / "old_emergency.pt"
+            torch.save(old_incomplete, old_path)
+            with self.assertRaisesRegex(ValueError, "scheduler is ahead of training progress"):
+                read_training_checkpoint(old_path, "cpu")
+            run_pretrain_jsonl(interrupted, tokenizer, corpus, output, replace(options, resume_from=fallback))
+            for name, value in uninterrupted.state_dict().items():
+                self.assertTrue(torch.equal(value, interrupted.state_dict()[name]), name)
 
     def test_resume_rejects_changed_training_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -59,9 +59,9 @@ from trainer.preference_objective import (
     evaluate_dpo,
     run_dpo_generation_evaluation,
 )
-from trainer.run_utils import (
+from trainer.runtime.run import (
     check_resume_progress,
-    emergency_checkpoint,
+    TrainingStep,
     restore_batches,
     RunArtifacts,
     should_log,
@@ -71,7 +71,7 @@ from trainer.run_utils import (
     truncate_metrics_after,
     update_duration,
 )
-from trainer.trainer_utils import autocast_context, resolve_autocast_dtype, resolve_device, seed_everything
+from trainer.runtime.torch_utils import autocast_context, resolve_autocast_dtype, resolve_device, seed_everything
 
 
 DPO_RESUME_SIGNATURE_VERSION = 1
@@ -300,8 +300,10 @@ def run_dpo_jsonl(
         )
 
     save = artifacts.checkpoint_writer(model, optimizer, scheduler, training_state)
+    boundary = TrainingStep()
     try:
         for step in range(progress.step + 1, options.steps + 1):
+            boundary.begin()
             validation_due = validation_batches is not None and (
                 step % options.validation_every == 0 or step == options.steps
             )
@@ -339,6 +341,7 @@ def run_dpo_jsonl(
                 step_input_tokens += int(cpu_batch["attention_mask"].sum())
                 step_target_tokens += int(cpu_batch["labels"][:, 1:].ne(-100).sum())
             grad_norm = clip_finetune_gradients(model, options.grad_clip, "DPO", step)
+            boundary.updating()
             optimizer.step()
             scheduler.step()
             update_seconds = update_duration(update_started, device) if update_started is not None else None
@@ -398,11 +401,12 @@ def run_dpo_jsonl(
                     max_new_tokens=options.generation_max_new_tokens,
                     autocast_dtype=autocast_dtype,
                 )
+            boundary.complete()
             if log_due:
                 artifacts.log(metric, tracker, generation_path)
             artifacts.save_periodic(save, step, progress.last_metrics, options, label='DPO')
     except (KeyboardInterrupt, FloatingPointError):
-        emergency_checkpoint(artifacts, save, progress.step, progress.last_metrics, tracker, 'DPO')
+        boundary.save_emergency(artifacts, save, progress.step, progress.last_metrics, tracker, 'DPO')
         raise
 
     metrics = progress.loss_metrics(

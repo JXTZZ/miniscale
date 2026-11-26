@@ -122,13 +122,13 @@ def build_adamw_optimizer(
             decay.append(parameter)
         else:
             no_decay.append(parameter)
-    if not decay or not no_decay:
-        raise ValueError("optimizer requires non-empty decay and no-decay parameter groups")
+    if not (decay or no_decay):
+        raise ValueError("optimizer requires trainable parameters")
     return torch.optim.AdamW(
-        [
+        [group for group in (
             {"params": decay, "weight_decay": weight_decay, "group_name": "decay"},
             {"params": no_decay, "weight_decay": 0.0, "group_name": "no_decay"},
-        ],
+        ) if group["params"]],
         lr=learning_rate,
         betas=(beta1, beta2),
         eps=eps,

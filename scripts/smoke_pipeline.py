@@ -18,9 +18,9 @@ from dataset.rl_dataset import CalculatorTask, RLTask
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer
 from scripts.inference import generate_from_checkpoint, GenerationOptions
-from trainer.agent_env import CalculatorEnv
+from trainer.rl.environment import CalculatorEnv
 from trainer.checkpoint import load_checkpoint, save_checkpoint
-from trainer.rl_utils import AgentRLOptions, GRPOOptions
+from trainer.rl.options import AgentRLOptions, GRPOOptions
 from trainer.train_agent import run_agent_grpo
 from trainer.train_grpo import run_grpo
 from trainer.train_full_sft import run_sft_jsonl, SFTOptions

@@ -26,19 +26,16 @@ from trainer.checkpoint import (
     save_checkpoint,
     TRAINING_CHECKPOINT_FORMAT_VERSION,
 )
-from trainer.rl_utils import (
+from trainer.rl.options import GRPOOptions, resolved_rl_options, rl_resume_options, validate_rl_options
+from trainer.rl.objective import (
     compute_reference_log_probs,
-    GRPOOptions,
     normalize_group_rewards,
     optimize_policy_epochs,
-    resolved_rl_options,
-    rl_resume_options,
     sequence_token_log_probs,
-    validate_rl_options,
 )
-from trainer.run_utils import (
+from trainer.runtime.run import (
     check_resume_progress,
-    emergency_checkpoint,
+    TrainingStep,
     mirror_checkpoint,
     RunArtifacts,
     should_log,
@@ -48,7 +45,7 @@ from trainer.run_utils import (
     truncate_metrics_after,
     update_duration,
 )
-from trainer.trainer_utils import (
+from trainer.runtime.torch_utils import (
     autocast_context,
     build_adamw_optimizer,
     build_warmup_cosine_scheduler,
@@ -65,10 +62,10 @@ def task_identity(tasks: list[RLTask] | list[CalculatorTask], *, agent: bool) ->
     digest = hashlib.sha256()
     for task in tasks:
         answers = (task.answer,) if isinstance(task.answer, str) else task.answer
-        prompt = task.question if isinstance(task, CalculatorTask) else task.prompt
-        digest.update(json.dumps([prompt, answers], ensure_ascii=False).encode("utf-8"))
+        fields = {**asdict(task), "answer": answers} if isinstance(task, CalculatorTask) else [task.prompt, answers]
+        digest.update(json.dumps(fields, ensure_ascii=False).encode("utf-8"))
         digest.update(b"\n")
-    kind = "in_memory_agent_tasks" if agent else "in_memory_tasks"
+    kind = "in_memory_agent_tasks_v2" if agent else "in_memory_tasks"
     return {"kind": kind, "sha256": digest.hexdigest(), "tasks": len(tasks)}
 
 
@@ -140,7 +137,10 @@ def run_policy(
     signature = {
         "signature_version": 1,
         "implementation_version": 2,
-        "objective": "sequence_balanced_clipped_agent_grpo_v2" if agent else "sequence_balanced_clipped_grpo_v2",
+        "objective": (
+            "sequence_balanced_cispo_v1" if options.loss_type == "cispo"
+            else "sequence_balanced_clipped_agent_grpo_v2" if agent else "sequence_balanced_clipped_grpo_v2"
+        ),
         "model": asdict(model.config),
         "tokenizer": tokenizer_identity(tokenizer),
         "options": rl_resume_options(options),
@@ -155,9 +155,10 @@ def run_policy(
     best_validation_reward = float("-inf")
     last_metrics: dict[str, float] = {"loss": float("nan")}
     if payload is not None:
+        completed_step = int(payload["step"])
+        check_resume_progress(completed_step, options.steps, options.wandb_run_id, saved_wandb_run_id)
         load_reference(reference_path, stage, saved_reference_identity, reference_device, reference, label)
         restore_training_checkpoint(payload, model, optimizer, scheduler, restore_rng=False)
-        completed_step = int(payload["step"])
         task_cursor = int(state.get("task_cursor", completed_step * options.batch_size)) % len(tasks)
         prompts_seen = int(state.get("prompts_seen", completed_step * options.batch_size))
         rollouts_seen = int(state.get("rollouts_seen", prompts_seen * options.group_size))
@@ -165,7 +166,6 @@ def run_policy(
         optimizer_steps = int(state.get("optimizer_steps", completed_step * options.policy_epochs))
         best_validation_reward = float(state.get("best_validation_reward", float("-inf")))
         last_metrics = {name: float(value) for name, value in payload.get("metrics", {}).items()}
-        check_resume_progress(completed_step, options.steps, None if agent else options.wandb_run_id, saved_wandb_run_id)
         truncate_metrics_after(artifacts.metrics, completed_step)
         restore_rng_state(payload.get("rng_state"))
         reference_identity = saved_reference_identity
@@ -208,15 +208,16 @@ def run_policy(
         }
 
     save = artifacts.checkpoint_writer(model, optimizer, scheduler, training_state)
+    boundary = TrainingStep()
     try:
         for step in range(completed_step + 1, options.steps + 1):
+            boundary.begin()
             validation_due = bool(fixed_validation) and (
                 step % options.validation_every == 0 or step == options.steps
             )
             log_due = should_log(step, options, validation_due)
             started = start_update(device) if log_due else None
             selected = [tasks[(task_cursor + index) % len(tasks)] for index in range(options.batch_size)]
-            task_cursor = (task_cursor + options.batch_size) % len(tasks)
             model.eval()
             (input_ids, attention_mask, action_mask, rewards), rollout_metrics = collect_batch(
                 model, tokenizer, selected, options, device, autocast_dtype
@@ -229,12 +230,14 @@ def run_policy(
             advantages = normalize_group_rewards(rewards, options.group_size)
             zero_variance = rewards.view(-1, options.group_size).var(dim=1, unbiased=False) < 1e-12
             current_lr = float(optimizer.param_groups[0]["lr"])
+            boundary.updating()
             update = optimize_policy_epochs(
                 model, optimizer, scheduler, input_ids=input_ids,
                 attention_mask=attention_mask, action_mask=action_mask,
                 old_log_probs=old_log_probs, reference_log_probs=reference_log_probs,
                 advantages=advantages, policy_epochs=options.policy_epochs,
                 clip_epsilon=options.clip_epsilon, beta=options.beta,
+                loss_type=options.loss_type, cispo_max_ratio=options.cispo_max_ratio,
                 grad_clip=options.grad_clip, device=device,
                 autocast_dtype=autocast_dtype, step=step,
             )
@@ -243,6 +246,7 @@ def run_policy(
             grad_norm_value = update.grad_norm
             duration = update_duration(started, device) if started is not None else None
             completed_step = step
+            task_cursor = (task_cursor + options.batch_size) % len(tasks)
             step_actions = int(action_mask.sum())
             prompts_seen += len(selected)
             rollouts_seen += len(rewards)
@@ -291,11 +295,12 @@ def run_policy(
                     "validation_reward": float(metric["validation_reward"]),
                     validation_metric: float(metric[validation_metric]),
                 })
+            boundary.complete()
             if log_due:
                 artifacts.log(metric, tracker)
             artifacts.save_periodic(save, step, last_metrics, options)
     except (KeyboardInterrupt, FloatingPointError):
-        emergency_checkpoint(artifacts, save, completed_step, last_metrics, tracker, label)
+        boundary.save_emergency(artifacts, save, completed_step, last_metrics, tracker, label)
         raise
 
     checkpoint = save(output / final_name, options.steps, last_metrics)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import Protocol
 
 from torch import Tensor
 import torch
@@ -11,28 +12,29 @@ import torch
 from dataset.rl_dataset import CalculatorTask, RLTask, filter_calculator_tools
 from model.model_miniscale import MiniScaleForCausalLM
 from model.tokenizer import Tokenizer
-from trainer.agent_env import CalculatorEnv
-from trainer.rewards import score_math_answer
-from trainer.rl_utils import AgentRLOptions, GRPOOptions
-from trainer.trainer_utils import autocast_context
+from trainer.rl.environment import CalculatorEnv
+from trainer.rl.rewards import score_math_answer
+from trainer.rl.options import AgentRLOptions, GRPOOptions
+from trainer.runtime.torch_utils import autocast_context
 
 
-def _collate_rollouts(
+def collate_rollouts(
     sequences: list[list[int]],
-    prompt_lengths: list[int],
+    action_masks: list[list[int]],
+    rewards: list[float],
     pad_token_id: int,
     device: torch.device,
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     max_length = max(map(len, sequences))
     input_ids = torch.full((len(sequences), max_length), pad_token_id, dtype=torch.long, device=device)
     attention_mask = torch.zeros_like(input_ids)
     action_mask = torch.zeros((len(sequences), max_length - 1), dtype=torch.float32, device=device)
-    for row, (sequence, prompt_length) in enumerate(zip(sequences, prompt_lengths, strict=True)):
+    for row, (sequence, actions) in enumerate(zip(sequences, action_masks, strict=True)):
         length = len(sequence)
         input_ids[row, :length] = torch.tensor(sequence, device=device)
         attention_mask[row, :length] = 1
-        action_mask[row, max(prompt_length - 1, 0) : length - 1] = 1
-    return input_ids, attention_mask, action_mask
+        action_mask[row, :length - 1] = torch.tensor(actions[1:], device=device)
+    return input_ids, attention_mask, action_mask, torch.tensor(rewards, dtype=torch.float32, device=device)
 
 
 @torch.no_grad()
@@ -46,8 +48,9 @@ def collect_rollouts(
     autocast_dtype: torch.dtype | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     sequences: list[list[int]] = []
-    prompt_lengths: list[int] = []
+    action_masks: list[list[int]] = []
     rewards: list[float] = []
+    eos_token_id = model.config.eos_token_id
     prompt_budget = model.config.max_position_embeddings - options.max_new_tokens
     if prompt_budget < 2:
         raise ValueError("max_new_tokens leaves no room for a prompt")
@@ -58,23 +61,23 @@ def collect_rollouts(
             )
             prompt_ids = tokenizer.encode(prompt, bos=True)[-prompt_budget:]
             prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-            for _ in range(options.group_size):
-                generated = model.generate(
-                    prompt_tensor,
+            group = prompt_tensor.expand(options.group_size, -1) if options.batch_rollouts else prompt_tensor
+            for _ in range(1 if options.batch_rollouts else options.group_size):
+                generated_batch = model.generate(
+                    group,
                     max_new_tokens=options.max_new_tokens,
                     temperature=options.temperature,
                     top_k=options.top_k,
-                )[0].tolist()
-                completion = tokenizer.decode(generated[len(prompt_ids) :])
-                sequences.append(generated)
-                prompt_lengths.append(len(prompt_ids))
-                rewards.append(score_math_answer(completion, task.answer).total)
-    input_ids, attention_mask, action_mask = _collate_rollouts(
-        sequences, prompt_lengths, tokenizer.pad_token_id, device
-    )
-    return input_ids, attention_mask, action_mask, torch.tensor(
-        rewards, dtype=torch.float32, device=device
-    )
+                    use_cache=options.use_cache,
+                ).tolist()
+                for generated in generated_batch:
+                    completion = generated[len(prompt_ids):]
+                    if eos_token_id in completion:
+                        completion = completion[:completion.index(eos_token_id) + 1]
+                    sequences.append(prompt_ids + completion)
+                    action_masks.append([0] * len(prompt_ids) + [1] * len(completion))
+                    rewards.append(score_math_answer(tokenizer.decode(completion), task.answer).total)
+    return collate_rollouts(sequences, action_masks, rewards, tokenizer.pad_token_id, device)
 
 
 @dataclass(slots=True)
@@ -95,12 +98,20 @@ class AgentTrajectory:
 ResponseFunction = Callable[[str, int], str]
 
 
+class AgentSamplingOptions(Protocol):
+    max_turns: int
+    max_new_tokens: int
+    temperature: float
+    top_k: int | None
+    use_cache: bool
+
+
 @torch.no_grad()
 def rollout_agent(
     model: MiniScaleForCausalLM,
     tokenizer: Tokenizer,
     task: CalculatorTask,
-    options: AgentRLOptions,
+    options: AgentSamplingOptions,
     device: torch.device,
     response_fn: ResponseFunction | None = None,
     *,
@@ -139,6 +150,7 @@ def rollout_agent(
                     max_new_tokens=min(options.max_new_tokens, remaining),
                     temperature=options.temperature,
                     top_k=options.top_k,
+                    use_cache=options.use_cache,
                 )[0].tolist()
             response_ids = generated[len(input_ids) :]
             response = tokenizer.decode(response_ids)

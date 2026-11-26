@@ -12,9 +12,9 @@ from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer
 from trainer.checkpoint import load_checkpoint
 from trainer.lm_utils import build_lm_optimizer
-from trainer.run_utils import start_update
+from trainer.runtime.run import start_update
 from trainer.train_pretrain import build_parser, main, PretrainOptions, run_pretrain_jsonl
-from trainer.trainer_utils import resolve_autocast_dtype
+from trainer.runtime.torch_utils import resolve_autocast_dtype
 
 
 class PretrainTests(unittest.TestCase):

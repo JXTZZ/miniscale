@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -9,8 +10,10 @@ from dataset.rl_dataset import RLTask, build_rl_corpus
 from model.model_miniscale import MiniScaleConfig, MiniScaleForCausalLM
 from model.tokenizer import ByteTokenizer
 from trainer.checkpoint import load_checkpoint
-from trainer.rewards import score_math_answer
-from trainer.rl_utils import GRPOOptions, grpo_objective, normalize_group_rewards
+from trainer.rl.rewards import score_math_answer
+from trainer.rl.options import GRPOOptions
+from trainer.rl.objective import grpo_objective, normalize_group_rewards
+from trainer.rl.rollout import collect_rollouts
 from trainer.train_grpo import run_grpo
 
 
@@ -18,6 +21,39 @@ class GRPOTests(unittest.TestCase):
     def test_group_advantages_are_centered(self) -> None:
         advantages = normalize_group_rewards(torch.tensor([1.0, 2.0, 4.0, 8.0]), group_size=2)
         self.assertTrue(torch.allclose(advantages.view(2, 2).mean(1), torch.zeros(2), atol=1e-5))
+
+    def test_cispo_clips_detached_weight_and_masks_prompt(self) -> None:
+        policy = torch.tensor([[-1.0, -1.0, -1.0]], requires_grad=True)
+        old = policy.detach() - torch.tensor([[1.0, 2.0, 0.0]])
+        loss, metrics = grpo_objective(
+            policy, old, policy.detach(), torch.tensor([[0, 1, 1]]), torch.tensor([1.0]),
+            clip_epsilon=0.2, beta=0.0, loss_type="cispo", cispo_max_ratio=2.0,
+        )
+        loss.backward()
+        torch.testing.assert_close(policy.grad, torch.tensor([[0.0, -1.0, -0.5]]))
+        self.assertEqual(float(metrics["clip_fraction"]), 0.5)
+
+    def test_batched_rollout_excludes_repeated_eos_padding(self) -> None:
+        tokenizer = ByteTokenizer()
+        model = MiniScaleForCausalLM(MiniScaleConfig.smoke())
+        eos = tokenizer.eos_token_id
+        answer = tokenizer.encode("5")[0]
+
+        def generate(prompts, **kwargs):
+            self.assertEqual(prompts.shape[0], 2)
+            self.assertTrue(kwargs["use_cache"])
+            return torch.cat((prompts, torch.tensor([[eos, eos], [answer, eos]])), dim=1)
+
+        with patch.object(model, "generate", side_effect=generate) as sampler:
+            _, attention, actions, rewards = collect_rollouts(
+                model, tokenizer, [RLTask("2+3", "5")],
+                GRPOOptions(group_size=2, max_new_tokens=2, batch_rollouts=True, use_cache=True),
+                torch.device("cpu"),
+            )
+        sampler.assert_called_once()
+        self.assertEqual(actions.sum(dim=1).tolist(), [1.0, 2.0])
+        self.assertEqual(int(attention[1].sum() - attention[0].sum()), 1)
+        self.assertGreater(float(rewards[1]), float(rewards[0]))
 
     def test_objective_has_gradients_and_masks_prompt(self) -> None:
         policy = torch.tensor([[0.1, 0.2, 0.3]], requires_grad=True)

@@ -15,7 +15,7 @@ import torch
 from dataset.file_utils import atomic_write_json
 from model.model_miniscale import MiniScaleForCausalLM
 from model.tokenizer import Tokenizer
-from trainer.trainer_utils import autocast_context
+from trainer.runtime.torch_utils import autocast_context
 
 
 SFT_GENERATION_PROMPTS: tuple[dict[str, str], ...] = (
